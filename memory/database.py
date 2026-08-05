@@ -10,18 +10,20 @@ class Database:
 
     def initialize(self):
 
-        self.cursor.execute(""" 
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS memories(
 
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-    content TEXT,
+                content TEXT,
 
-    memory_type TEXT,
+                memory_type TEXT,
 
-    importance INTEGER
+                importance INTEGER
 
-)
+            )
+        """)
+
         self.connection.commit()
 
     def save_memory(self, memory):

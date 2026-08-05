@@ -2,6 +2,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from memory.memory_manager import MemoryManager
+from memory.memory import Memory
 
 
 class System:
@@ -13,7 +14,13 @@ class System:
 
     def boot(self):
 
-        self.memory.remember("O David acordou pela primeira vez.")
+        memory = Memory(
+            content="O David acordou pela primeira vez.",
+            memory_type="episodic",
+            importance=10
+        )
+
+        self.memory.remember(memory)
 
         memories = self.memory.recall()
 

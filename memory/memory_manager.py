@@ -10,7 +10,7 @@ class MemoryManager:
 
     def remember(self, memory):
 
-    self.database.save_memory(memory)
+        self.database.save_memory(memory)
 
     def recall(self):
 

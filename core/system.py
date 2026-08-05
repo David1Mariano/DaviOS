@@ -1,7 +1,7 @@
 from rich.console import Console
 from rich.panel import Panel
 
-from memory.database import Database
+from memory.memory_manager import MemoryManager
 
 
 class System:
@@ -9,15 +9,13 @@ class System:
     def __init__(self):
 
         self.console = Console()
-        self.database = Database()
+        self.memory = MemoryManager()
 
     def boot(self):
 
-        self.database.initialize()
+        self.memory.remember("O David acordou pela primeira vez.")
 
-        self.database.save_memory("O David acordou pela primeira vez.")
-
-        memories = self.database.get_memories()
+        memories = self.memory.recall()
 
         self.console.print(
             Panel.fit(

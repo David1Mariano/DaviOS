@@ -8,9 +8,9 @@ class MemoryManager:
         self.database = Database()
         self.database.initialize()
 
-    def remember(self, content):
+    def remember(self, memory):
 
-        self.database.save_memory(content)
+    self.database.save_memory(memory)
 
     def recall(self):
 

@@ -10,23 +10,25 @@ class Database:
 
     def initialize(self):
 
-        self.cursor.execute("""
+        self.cursor.execute(""" 
             CREATE TABLE IF NOT EXISTS memories(
 
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-                content TEXT
+    content TEXT,
 
-            )
-        """)
+    memory_type TEXT,
 
+    importance INTEGER
+
+)
         self.connection.commit()
 
-    def save_memory(self, content):
+    def save_memory(self, memory):
 
         self.cursor.execute(
-            "INSERT INTO memories(content) VALUES (?)",
-            (content,)
+            "INSERT INTO memories(content, memory_type, importance) VALUES (?, ?, ?)",
+            (memory.content, memory.memory_type, memory.importance)
         )
 
         self.connection.commit()

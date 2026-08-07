@@ -1,5 +1,7 @@
 import sqlite3
 
+from memory.memory import Memory
+
 
 class Database:
 
@@ -35,10 +37,33 @@ class Database:
 
         self.connection.commit()
 
+    def memory_exists(self, memory):
+
+        self.cursor.execute(
+            "SELECT content, memory_type, importance FROM memories WHERE content = ?",
+            (memory.content,)
+        )
+
+        result = self.cursor.fetchone()
+
+
+        return result is not None
+
     def get_memories(self):
 
         self.cursor.execute(
             "SELECT * FROM memories"
         )
 
-        return self.cursor.fetchall()
+        rows = self.cursor.fetchall()
+
+        memories = [
+            Memory(
+                content=row[1],
+                memory_type=row[2],
+                importance=row[3]
+            )
+            for row in rows
+        ]
+
+        return memories

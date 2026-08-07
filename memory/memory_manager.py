@@ -10,7 +10,9 @@ class MemoryManager:
 
     def remember(self, memory):
 
-        self.database.save_memory(memory)
+        if not self.database.memory_exists(memory):
+
+            self.database.save_memory(memory)
 
     def recall(self):
 

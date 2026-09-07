@@ -1,0 +1,16 @@
+{
+  "offline_mode": true,
+  "network_policy": "offline",
+  "backend": "llama_cpp",
+  "models_dir": "models",
+  "debug": false,
+  "context_window": 2048,
+  "temperature": 0.7,
+  "max_tokens": 256,
+  "threads": 0,
+  "gpu_layers": 0,
+  "use_gpu": false,
+  "max_recent_messages": 6,
+  "max_memories_in_prompt": 5,
+  "system_prompt": "Voce e o DaviOS, um assistente pessoal local e offline. Responda sempre em portugues do Brasil, de forma curta, clara e natural. Voce nao pode executar comandos no computador, abrir programas ou acessar arquivos: se pedirem isso, explique educadamente que essa funcao ainda nao existe. Use as informacoes sobre o usuario quando forem fornecidas no contexto."
+}

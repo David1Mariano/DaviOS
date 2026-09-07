@@ -1,0 +1,50 @@
+{
+  "profiles": {
+    "LIGHT": {
+      "description": "Computadores com poucos recursos (<= 4 GB RAM livres, sem GPU util)",
+      "criteria": {
+        "max_ram_total_gb": 8,
+        "max_cpu_cores": 4
+      },
+      "model_tier": "light",
+      "max_model_size_gb": 1.5,
+      "generation": {
+        "context_window": 1024,
+        "max_tokens": 128,
+        "threads": 2,
+        "gpu_layers": 0
+      }
+    },
+    "BALANCED": {
+      "description": "Computadores intermediarios (8-16 GB RAM, CPU moderna)",
+      "criteria": {
+        "min_ram_total_gb": 8,
+        "max_ram_total_gb": 24
+      },
+      "model_tier": "balanced",
+      "max_model_size_gb": 4.5,
+      "generation": {
+        "context_window": 2048,
+        "max_tokens": 256,
+        "threads": 4,
+        "gpu_layers": 0
+      }
+    },
+    "PERFORMANCE": {
+      "description": "Computadores com recursos sobrando (>= 16 GB RAM e/ou GPU com >= 6 GB VRAM)",
+      "criteria": {
+        "min_ram_total_gb": 16,
+        "min_vram_gb": 6
+      },
+      "model_tier": "performance",
+      "max_model_size_gb": 8.0,
+      "generation": {
+        "context_window": 4096,
+        "max_tokens": 512,
+        "threads": 6,
+        "gpu_layers": -1
+      }
+    }
+  },
+  "selection_order": ["PERFORMANCE", "BALANCED", "LIGHT"]
+}

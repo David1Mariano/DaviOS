@@ -7,16 +7,28 @@ class EmotionAnalyzer:
 
         print(f"EMOTION TEXT: {text}")
         print(f"EMOTION CONTEXT: {context}")
-        if context.get("negation") and context.get("negated_word") == "gosto":
+        if any(word in text.split() for word in ("odeio", "detesto")):
             return {
                 "emotion": "dislike",
                 "emotional_intensity": 5,
             }
 
-        if "adoro" in text:
+        if context.get("negation_applies"):
+            return {
+                "emotion": "dislike",
+                "emotional_intensity": 5,
+            }
+
+        if any(word in text.split() for word in ("adoro", "curto")):
             return {
                 "emotion": "happiness",
                 "emotional_intensity": 8,
+            }
+
+        if any(word in text.split() for word in ("favorita", "favoritas", "favorito", "favoritos", "prefiro")):
+            return {
+                "emotion": "happiness",
+                "emotional_intensity": 6,
             }
 
         if "amo" in text:
@@ -25,7 +37,7 @@ class EmotionAnalyzer:
                 "emotional_intensity": 7,
             }
 
-        if "gosto" in text:
+        if any(word in text.split() for word in ("gosto", "goste", "gostar")):
             return {
                 "emotion": "happiness",
                 "emotional_intensity": 5,

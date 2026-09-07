@@ -9,6 +9,8 @@ class ReasoningResult:
     target_module: str
     reasoning_log: str
     memory_operation: str = "none"
+    existing_memory_id: int | None = None
+    matching_fact_id: int | None = None
 
 
 class ReasoningEngine:
@@ -43,10 +45,24 @@ class ReasoningEngine:
                 if current.target.lower() != previous.target.lower():
                     continue
 
-                if current.relation == previous.relation:
+                same_fact = (
+                    current.relation == previous.relation
+                    and current.emotion == previous.emotion
+                    and current.temporal_context == previous.temporal_context
+                    and current.negation == previous.negation
+                    and current.value == previous.value
+                )
+                if same_fact:
                     comparisons.append({
                         "target": current.target,
                         "status": "confirmation",
+                        "current": current,
+                        "previous": previous,
+                    })
+                elif current.relation == previous.relation:
+                    comparisons.append({
+                        "target": current.target,
+                        "status": "update",
                         "current": current,
                         "previous": previous,
                     })
@@ -71,6 +87,7 @@ class ReasoningEngine:
         relevant_memories=None,
         current_facts=None,
         existing_memory=None,
+        matching_fact=None,
     ) -> ReasoningResult:
         input_lower = user_input.lower()
         relevant_memories = relevant_memories or []
@@ -102,8 +119,13 @@ class ReasoningEngine:
             item for item in comparisons
             if item["status"] == "confirmation"
         ]
+        changes = [
+            item for item in comparisons
+            if item["status"] == "update"
+        ]
 
         if contradictions:
+            previous = contradictions[0]["previous"]
             return ReasoningResult(
                 intent="memory_update",
                 action="update_memory",
@@ -111,6 +133,21 @@ class ReasoningEngine:
                 target_module="Memory",
                 reasoning_log="Foi detectada contradição em uma memória existente.",
                 memory_operation="update",
+                existing_memory_id=getattr(existing_memory, "id", None),
+                matching_fact_id=getattr(previous, "id", None),
+            )
+
+        if changes:
+            previous = changes[0]["previous"]
+            return ReasoningResult(
+                intent="memory_update",
+                action="update_memory",
+                confidence=0.95,
+                target_module="Memory",
+                reasoning_log="Foi detectada alteração nos campos de um fato existente.",
+                memory_operation="update",
+                existing_memory_id=getattr(existing_memory, "id", None),
+                matching_fact_id=getattr(previous, "id", None),
             )
 
         if current_facts and existing_memory:
@@ -133,15 +170,18 @@ class ReasoningEngine:
 
             if confirmations:
                 targets = ", ".join(item["target"] for item in confirmations)
+                previous = confirmations[0]["previous"]
                 return ReasoningResult(
                     intent="memory_confirmation",
                     action="reinforce_memory",
                     confidence=0.98,
                     target_module="Memory",
                     reasoning_log=(
-                        f"A nova informação confirma memórias existentes sobre: {targets}."
+                        f"A nova informação reforça memórias existentes sobre: {targets}."
                     ),
-                    memory_operation="ignore",
+                    memory_operation="reinforce",
+                    existing_memory_id=getattr(existing_memory, "id", None),
+                    matching_fact_id=getattr(previous, "id", None),
                 )
 
             return ReasoningResult(
@@ -151,6 +191,18 @@ class ReasoningEngine:
                 target_module="Memory",
                 reasoning_log="Os fatos recebidos já existem na memória.",
                 memory_operation="ignore",
+                existing_memory_id=getattr(existing_memory, "id", None),
+                matching_fact_id=getattr(matching_fact, "id", None),
+            )
+
+        if current_facts and existing_memory is None:
+            return ReasoningResult(
+                intent="memory_storage",
+                action="create_memory",
+                confidence=0.9,
+                target_module="Memory",
+                reasoning_log="Detectado fato novo sem memoria existente; se crea.",
+                memory_operation="create",
             )
 
         if any(keyword in input_lower for keyword in (

@@ -793,6 +793,30 @@ class Database:
     def find_memory_by_fact_target(self, target: str) -> Optional[Memory]:
         memories = self.find_memories_by_target(target)
         return memories[0] if memories else None
+        return memories[0] if memories else None
+
+    def find_memory_by_semantic_key(
+        self,
+        subject: str,
+        target: str,
+        relation_family: str,
+        *,
+        include_inactive: bool = True,
+    ) -> Optional[Memory]:
+        """Localiza uma memória baseada na chave semântica.
+
+        Retorna a primeira memória que contenha um fato com
+        subject, target e relation_family correspondentes.
+        """
+        facts = self.find_facts_for_semantic_key(
+            subject,
+            target,
+            relation_family,
+            include_inactive=include_inactive,
+        )
+        if not facts:
+            return None
+        return self.get_memory(facts[0].memory_id)
 
     def update_memory_fact(
         self,
@@ -1189,8 +1213,155 @@ class Database:
         ]
         return [fact for fact in facts if fact.relation_family == relation_family]
 
-    def record_conflict(
+    def find_active_preferences(
         self,
+        subject: str = "user",
+        relation_family: str = "preference",
+    ) -> list[MemoryFact]:
+        """Busca todos os fatos ativos de uma familia semantica.
+
+        Util para perguntas genericas como 'do que eu gosto?' onde o alvo
+        nao e conhecido antecipadamente.
+        """
+        sql = """
+            SELECT * FROM memory_facts
+            WHERE LOWER(subject) = LOWER(?) AND status = 'active'
+        """
+        params: list[Any] = [subject]
+        return [
+            fact
+            for fact in (
+                self._fact_from_row(row)
+                for row in self.cursor.execute(sql, params).fetchall()
+            )
+            if fact.relation_family == relation_family
+        ]
+
+    def ensure_semantic_uniqueness_index(self) -> bool:
+        """Cria o indice unico semantico para evitar fatos ativos duplicados.
+
+        O indice e parcial (WHERE status = 'active' AND fact_type IS NOT NULL),
+        permitindo que fatos inativos/historicos coexistam sem violar a regra.
+        """
+        try:
+            self.cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_facts_semantic
+                ON memory_facts (subject, target, fact_type)
+                WHERE status = 'active' AND fact_type IS NOT NULL
+            """)
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            return False
+
+    def normalize_all_fact_targets(self, normalize_fn) -> int:
+        """Corrige targets invalidos heredados de normalizaciones antiguas.
+
+        Recorre todos los hechos y aplica ``normalize_fn`` al target,
+        persistiendo el nuevo valor cuando cambie.
+
+        Returns:
+            Cantidad de targets corregidos.
+        """
+        rows = self.cursor.execute(
+            "SELECT id, target FROM memory_facts"
+        ).fetchall()
+        fixed = 0
+        for row in rows:
+            current = row["target"] or ""
+            if not current:
+                continue
+            normalized = normalize_fn(current) if callable(normalize_fn) else current
+            if normalized and normalized != current:
+                self.cursor.execute(
+                    "UPDATE memory_facts SET target = ? WHERE id = ?",
+                    (normalized, row["id"]),
+                )
+                fixed += 1
+        if fixed:
+            self.connection.commit()
+        return fixed
+
+    def consolidate_duplicate_memories(self) -> dict[str, Any]:
+        """Consolida memorias duplicadas por concepto (chave semantica).
+
+        Agrupa hechos por (subject, target, fact_type), elige una memoria
+        canonica (la mas reciente y activa), mueve las evidencias de las
+        duplicatas al hecho canonico y marca duplicatas como inactivas.
+
+        Nunca borra: historial y evidencias se preservan.
+
+        Returns:
+            Dict con resumen de la consolidacion.
+        """
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        rows = self.cursor.execute("SELECT * FROM memory_facts").fetchall()
+        for row in rows:
+            fact = self._fact_from_row(row)
+            subject = (fact.subject or "user").strip().casefold()
+            target = (fact.target or "").strip().casefold()
+            fact_type = fact.fact_type or "episodic"
+            groups[(subject, target, fact_type)].append(fact)
+
+        total_duplicates = 0
+        total_evidence_moved = 0
+        consolidated_memories = []
+
+        for group in groups.values():
+            if len({f.memory_id for f in group if f.memory_id}) < 2:
+                continue
+
+            # Memoria canonica: hecho activo mas reciente (mayor id).
+            active = [f for f in group if f.status == "active"]
+            ordered = sorted(
+                active if active else group,
+                key=lambda f: (f.id or 0),
+                reverse=True,
+            )
+            canonical_fact = ordered[0]
+            canonical_memory_id = canonical_fact.memory_id
+
+            for fact in group:
+                if fact.id is None or fact.id == canonical_fact.id:
+                    continue
+                # Mover evidencias de la duplicata al hecho canonico
+                for ev in self.get_fact_evidence(fact.id):
+                    self._add_fact_evidence(
+                        canonical_fact.id,
+                        {
+                            "content": ev.get("content"),
+                            "source": ev.get("source"),
+                            "confidence": ev.get("confidence"),
+                            "type": ev.get("type", "statement"),
+                        },
+                        write_revision=False,
+                        commit=False,
+                    )
+                    total_evidence_moved += 1
+
+                if fact.status != "inactive":
+                    self.set_fact_status(fact.id, "inactive", reason="dup consolidada")
+                if fact.memory_id and fact.memory_id != canonical_memory_id:
+                    if fact.memory_id not in consolidated_memories:
+                        consolidated_memories.append(fact.memory_id)
+                    self.cursor.execute(
+                        "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
+                        ("inactive", self._now(), fact.memory_id),
+                    )
+                    total_duplicates += 1
+
+        self.connection.commit()
+        return {
+            "action": "consolidate",
+            "consolidated_memories": total_duplicates,
+            "evidence_moved": total_evidence_moved,
+        }
+
+    def record_conflict(
+
         fact_a_id: int,
         fact_b_id: int,
         *,
@@ -1200,32 +1371,19 @@ class Database:
         now: Optional[datetime | str] = None,
         commit: bool = True,
     ) -> int:
-        left, right = sorted((fact_a_id, fact_b_id))
         timestamp = self._now(now)
         row = self.cursor.execute(
-            """
-            SELECT id FROM memory_fact_conflicts
-            WHERE fact_a_id = ? AND fact_b_id = ?
-            """,
-            (left, right),
+            "SELECT * FROM memory_fact_conflicts WHERE fact_a_id = ? AND fact_b_id = ? AND status = 'open'",
+            (fact_a_id, fact_b_id),
         ).fetchone()
         if row is None:
             self.cursor.execute(
                 """
-                INSERT INTO memory_fact_conflicts (
-                    fact_a_id, fact_b_id, status, winner_fact_id, reason,
-                    created_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memory_fact_conflicts
+                    (fact_a_id, fact_b_id, reason, status, winner_fact_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    left,
-                    right,
-                    status,
-                    winner_fact_id,
-                    reason,
-                    timestamp,
-                    timestamp if status == "resolved" else None,
-                ),
+                (fact_a_id, fact_b_id, reason, status, winner_fact_id, timestamp),
             )
             conflict_id = self.cursor.lastrowid
         else:

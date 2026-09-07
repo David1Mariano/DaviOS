@@ -1,259 +1,129 @@
-from core.system import System
-from memory.memory import Memory
+"""DaviOS - Assistente pessoal local e offline-first."""
+
+import logging
+import os
+
+from brain.conversation_engine import ConversationEngine
+from brain.providers.local_llm_provider import (
+    LLAMA_CPP_INSTRUCTIONS,
+    LocalLLMProvider,
+)
+from config.davios_config import DaviosConfig
+from core.hardware_detector import HardwareDetector
+from core.reasoning import ReasoningEngine
+from brain.model_manager import ModelManager
+
+logging.basicConfig(
+    level=logging.INFO,
+    filename=os.path.join(os.path.dirname(__file__), "logs", "conversation.log"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("davios.main")
+
+
+def build_engine(config: DaviosConfig):
+    """Monta hardware → modelo → provider → cognitive core → engine."""
+    hardware = HardwareDetector().detect()
+    model_manager = ModelManager(config)
+    selection = model_manager.select_model(hardware)
+
+    provider = LocalLLMProvider(
+        config=config, model_manager=model_manager, selection=selection
+    )
+    provider.initialize()  # tolerante: False se backend/modelo ausentes
+
+    from brain.cognitive_core import CognitiveCore
+
+    cognitive = CognitiveCore(llm_provider=provider, config=config)
+
+    engine = ConversationEngine(cognitive_core=cognitive)
+    return engine, hardware, model_manager, selection, provider
+
+
+def print_boot_banner(hardware, model_manager, selection, provider, config):
+    profile = selection.profile
+    print("DaviOS iniciado.")
+    print()
+    if config.debug:
+        print("Hardware:")
+        for line in hardware.summary_lines():
+            print(f"  {line}")
+        print(f"  Disco livre: {hardware.disk_free_gb} GB")
+        print(f"  Backend de inferencia: {hardware.inference_backend}")
+        print()
+        print(f"Perfil de hardware: {profile}")
+        print(f"Modelo: {model_manager.status_summary(selection)}")
+        print(f"Backend ativo: {provider.health_check().get('backend', 'none')}")
+        print(
+            "Status: Modelo local carregado."
+            if provider.is_available()
+            else "Status: modo regras (sem modelo local)."
+        )
+        print()
+    elif not provider.is_available():
+        print("Hardware:")
+        for line in hardware.summary_lines():
+            print(f"  {line}")
+        print()
+        print("Status: sem modelo local; usando modo regras.")
+        print()
+    print("DaviOS: Ola! Sou o DaviOS. Como posso ajudar?")
+    print()
 
 
 def main():
+    config = DaviosConfig.load()
+    try:
+        engine, hardware, model_manager, selection, provider = build_engine(config)
+    except Exception as exc:  # boot nunca quebra silenciosamente
+        logger.exception("Falha no boot do DaviOS")
+        print("DaviOS iniciado com recursos reduzidos.")
+        if config.debug:
+            print(f"[DEBUG] {type(exc).__name__}: {exc}")
+        engine = ConversationEngine()
+        provider = None
+        hardware = None
+        selection = None
+        model_manager = None
 
-    # ============================================================
-    # 1. INICIALIZA O SISTEMA
-    # ============================================================
+    print_boot_banner(hardware, model_manager, selection, provider, config)
 
-    system = System()
+    while True:
+        try:
+            user_input = input("Voce: ")
+        except EOFError:
+            print()
+            print("DaviOS: Ate mais!")
+            break
+        except KeyboardInterrupt:
+            print()
+            print("DaviOS: Ate mais!")
+            break
 
-    memory_manager = getattr(system, "memory_manager", None)
+        if len(user_input) > 2000:
+            print("DaviOS: Essa mensagem e muito longa. Pode resumir?")
+            print()
+            continue
 
-    if not memory_manager:
-        from memory.memory_manager import MemoryManager
-        memory_manager = MemoryManager()
+        try:
+            result = engine.process(user_input)
+        except Exception as e:
+            logger.exception("Erro ao processar mensagem do usuario")
+            if config.debug:
+                print(f"[DEBUG] {type(e).__name__}: {e}")
+            print("DaviOS: Tive um problema ao processar essa mensagem.")
+            print()
+            continue
 
-    importance_analyzer = getattr(
-        system,
-        "importance_analyzer",
-        None
-    )
+        print(f"DaviOS: {result.response}")
+        print()
 
-    if not importance_analyzer:
-        from memory.ImportanceAnalyzer import ImportanceAnalyzer
-        importance_analyzer = ImportanceAnalyzer()
+        if result.should_exit:
+            break
 
-    reasoning_engine = getattr(
-        system,
-        "reasoning_engine",
-        None
-    )
-
-    if not reasoning_engine:
-        from core.reasoning import ReasoningEngine
-        reasoning_engine = ReasoningEngine()
-
-    memory_interpreter = getattr(
-        system,
-        "memory_interpreter",
-        None
-    )
-
-    if not memory_interpreter:
-        from memory.memory_interpreter import MemoryInterpreter
-        memory_interpreter = MemoryInterpreter()
-
-    # ============================================================
-    # 2. ENTRADA ATUAL
-    # ============================================================
-
-    user_input = "agora eu gosto de pizza"
-
-    # ============================================================
-    # 3. CONTEXTO E EMOÇÕES
-    # ============================================================
-
-    context = memory_manager.context_analyzer.analyze(
-        user_input
-    )
-
-    emotions = []
-
-    for part in context.get("parts", []):
-        emotion = memory_manager.emotion_analyzer.analyze(
-            part["text"],
-            part,
-        )
-
-        emotions.append(
-            {
-                "text": part["text"],
-                "emotion": emotion["emotion"],
-                "emotional_intensity": emotion["emotional_intensity"],
-                "context": part,
-            }
-        )
-    # ============================================================
-    # 4. INTERPRETA A ENTRADA
-    # ============================================================
-
-    memory_analysis = memory_interpreter.interpret(
-        user_input,
-        context,
-        emotions,
-    )
-
-    # ============================================================
-    # 5. DEFINE O TIPO DA NOVA MEMÓRIA
-    # ============================================================
-
-    memory_type = (
-        "preference"
-        if memory_analysis.get(
-            "memory_candidate",
-            False
-        )
-        else "episodic"
-    )
-
-    # ============================================================
-    # 6. CRIA A NOVA MEMÓRIA SOMENTE EM RAM
-    #
-    # IMPORTANTE:
-    # Ainda não existe nenhuma alteração no banco.
-    # ============================================================
-
-    new_memory = Memory(
-        content=user_input,
-        memory_type=memory_type,
-        importance=0.0,
-        emotion="neutral",
-        emotional_intensity=0.0,
-    )
-
-    new_memory.facts = memory_analysis.get(
-        "facts",
-        []
-    )
-
-    # ============================================================
-    # 7. CALCULA A IMPORTÂNCIA
-    # ============================================================
-
-    new_memory.importance = (
-        importance_analyzer.analyze(
-            new_memory
-        )
-    )
-
-    # ============================================================
-    # 8. PROCURA A MEMÓRIA EXISTENTE
-    #
-    # A nova memória ainda está SOMENTE EM RAM.
-    #
-    # Procuramos no banco usando os MemoryFacts.
-    # ============================================================
-
-    existing_memory = (
-        memory_manager.find_memory_for_facts(
-            new_memory.facts
-        )
-    )
-
-    # ============================================================
-    # 9. MEMÓRIAS RELEVANTES
-    #
-    # Em vez de usar recall_relevant(), utilizamos diretamente
-    # os fatos da memória encontrada.
-    # ============================================================
-
-    relevant_facts = []
-
-    if existing_memory is not None:
-        relevant_facts = [
-            fact
-            for fact in existing_memory.facts
-            if any(
-                current_fact.target.lower()
-                == fact.target.lower()
-                for current_fact in new_memory.facts
-            )
-        ]
-
-    print("=== EXISTING MEMORY ===")
-    print(existing_memory)
-
-    print("=== RELEVANT MEMORY ===")
-    print(relevant_facts)
-
-    # ============================================================
-    # 10. RACIOCÍNIO
-    # ============================================================
-
-    decision_reasoning = (
-        reasoning_engine.evaluate_input(
-            user_input,
-            memory_context=context,
-            emotions=emotions,
-            relevant_memories=relevant_facts,
-            current_facts=new_memory.facts,
-            existing_memory=existing_memory,
-        )
-    )
-
-    print("=== REASONING ===")
-
-    print(
-        f"INTENT: "
-        f"{decision_reasoning.intent}"
-    )
-
-    print(
-        f"ACTION: "
-        f"{decision_reasoning.action}"
-    )
-
-    print(
-        f"OPERATION: "
-        f"{decision_reasoning.memory_operation}"
-    )
-
-    print(
-        f"CONFIDENCE: "
-        f"{decision_reasoning.confidence}"
-    )
-
-    print(
-        f"REASONING: "
-        f"{decision_reasoning.reasoning_log}"
-    )
-
-    # ============================================================
-    # 11. MOSTRA O HISTÓRICO ANTES DA OPERAÇÃO
-    # ============================================================
-
-    if existing_memory is not None:
-
-        history = (
-            memory_manager.database
-            .get_memory_fact_history(
-                existing_memory.id
-            )
-        )
-
-        print("=== MEMORY FACT HISTORY ===")
-
-        for item in history:
-            print(item)
-
-    # ============================================================
-    # 12. EXECUTA A OPERAÇÃO DECIDIDA
-    #
-    # SOMENTE AQUI o banco pode ser alterado.
-    # ============================================================
-
-    result = (
-        memory_manager.apply_memory_operation(
-            reasoning_result=decision_reasoning,
-            new_memory=new_memory,
-            existing_memory=existing_memory,
-        )
-    )
-
-    print(
-        "=== MEMORY OPERATION RESULT ==="
-    )
-
-    print(result)
-
-    # ============================================================
-    # 13. BOOT
-    # ============================================================
-
-    system.boot()
+    if provider is not None:
+        provider.unload()
+    print("DaviOS encerrado.")
 
 
 if __name__ == "__main__":

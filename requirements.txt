@@ -1,0 +1,15 @@
+# Dependências principais do DaviOS
+# (instalar: .\.venv\Scripts\pip.exe install -r requirements.txt)
+psutil>=5.9            # RAM total/disponivel na deteccao de hardware
+
+# ---- OPCIONAL: cerebro local (LLM offline) --------------------------
+# O DaviOS funciona sem estes itens (modo regras). Para habilitar o
+# modelo local GGUF:
+#
+#   pip install llama-cpp-python
+#
+# Para aceleracao de GPU (opcional):
+#   NVIDIA : build com CUDA  (CMAKE_ARGS="-DGGML_CUDA=on")
+#   AMD    : build com Vulkan ou ROCm/HIP (Radeon RX 6600 => Vulkan)
+#
+# Modelos GGUF nao sao distribuidos no repositorio: veja models/README.md

@@ -17,3 +17,11 @@ logs/
 # Arquivos do sistema
 .DS_Store
 Thumbs.db
+# Modelos locais (GGUF) e caches de inferencia
+models/**/*.gguf
+models/**/*.bin
+models/**/cache/
+*.cache/
+
+# Backups do banco
+memory.db.backup*

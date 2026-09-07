@@ -34,6 +34,28 @@ class MemoryManager:
         "amanha",
         "sempre",
         "nunca",
+        "ontem",
+        "depois",
+        "passado",
+        "futuro",     
+    }
+    # Palavras de hedge/discourse que não pertencem a um alvo semântico.
+    # Corrigem resíduos legados como target="acho que nao pizza na real".
+    HEDGE_WORDS = {
+        "acho",
+        "acredito",
+        "que",
+        "talvez",
+        "nao",
+        "na",
+        "real",
+        "verdade",
+        "tipo",
+        "assim",
+        "sei",
+        "la",
+        "lá",
+        "bem",
     }
     HALF_LIFE_DAYS = {
         "preference": 365.0,
@@ -99,6 +121,31 @@ class MemoryManager:
         memories = self.find_memories_for_facts(facts, limit=1)
         return memories[0] if memories else None
 
+    def match_memory_for_facts(
+        self,
+        facts: Iterable[MemoryFact],
+    ) -> dict[str, Optional[MemoryFact | Memory]]:
+        facts = list(facts)
+        existing_memory = self.find_memory_for_facts(facts)
+        matching_fact = None
+        if existing_memory is not None and facts:
+            matching_fact = self._find_matching_fact_in_database(
+                existing_memory,
+                facts[0],
+            )
+        print(
+            "[MATCH] "
+            f"existing_memory_id={getattr(existing_memory, 'id', None)} "
+            f"matching_fact_id={getattr(matching_fact, 'id', None)} "
+            f"target={getattr(matching_fact or (facts[0] if facts else None), 'target', None)} "
+            f"old_relation={getattr(matching_fact, 'relation', None)} "
+            f"new_relation={getattr(facts[0], 'relation', None) if facts else None}"
+        )
+        return {
+            "existing_memory": existing_memory,
+            "matching_fact": matching_fact,
+        }
+
     def normalize_memory_facts(self, memory: Memory) -> Memory:
         """Normaliza grafia sem descartar fatos que compartilham um alvo."""
 
@@ -117,14 +164,27 @@ class MemoryManager:
         if not target:
             return ""
         words = re.findall(r"[^\W_]+", target.casefold(), flags=re.UNICODE)
-        return " ".join(word for word in words if word not in self.TEMPORAL_WORDS).strip()
+        return " ".join(
+            word
+            for word in words
+            if word not in self.TEMPORAL_WORDS and word not in self.HEDGE_WORDS
+        ).strip()
 
     @staticmethod
     def normalize_subject(subject: Optional[str]) -> str:
         return " ".join((subject or "user").casefold().split()) or "user"
 
-    def facts_are_equal(self, existing_fact: MemoryFact, new_fact: MemoryFact) -> bool:
-        """Compara duas observações completas, preservando tempo e negação."""
+    def facts_are_identical(self, existing_fact: MemoryFact, new_fact: MemoryFact) -> bool:
+        """Compara se dois fatos são **idênticos** em seu estado atual.
+        
+        Isso é diferente de `facts_are_semantically_equal`. Dois fatos são
+        idênticos se têm exatamente o mesmo subject, target, relation, negation, 
+        temporal_context, e valores.
+        
+        Duas mudanças sucessivas na MESMA memória (ex: like -> dislike -> like)
+        são mudanças, não identidades. Usamos este método apenas para evitar
+        registrar duas cópias exatas da mesma afirmação no mesmo instante.
+        """
 
         return (
             self.normalize_fact_target(existing_fact.target)
@@ -133,26 +193,445 @@ class MemoryManager:
             == self.normalize_subject(new_fact.subject)
             and (existing_fact.relation or "").casefold()
             == (new_fact.relation or "").casefold()
+            and bool(existing_fact.negation) == bool(new_fact.negation)
+            and (existing_fact.temporal_context or "unknown").casefold()
+            == (new_fact.temporal_context or "unknown").casefold()
             and (existing_fact.value or "") == (new_fact.value or "")
             and (existing_fact.emotion or "") == (new_fact.emotion or "")
             and float(existing_fact.emotional_intensity or 0)
             == float(new_fact.emotional_intensity or 0)
-            and (existing_fact.temporal_context or "unknown").casefold()
-            == (new_fact.temporal_context or "unknown").casefold()
-            and bool(existing_fact.negation) == bool(new_fact.negation)
         )
+
+    def facts_are_semantically_equal(self, existing_fact: MemoryFact, new_fact: MemoryFact) -> bool:
+        """Verifica se dois fatos tratam do mesmo conceito semântico.
+        
+        Retorna True se ambos têm subject e target iguais NA MESMA FAMÍLIA DE RELAÇÃO.
+        A relação específica (like vs dislike) pode ser diferente - isso é exatamente
+        quando devemos fazer UPDATE.
+        
+        Esta é a chave para evitar duplicação: pizza->like e pizza->dislike
+        tratam do MESMO conceito (preferência sobre pizza) e devem estar na
+        MESMA Memory.
+        """
+
+        return (
+            self.normalize_fact_target(existing_fact.target)
+            == self.normalize_fact_target(new_fact.target)
+            and self.normalize_subject(existing_fact.subject)
+            == self.normalize_subject(new_fact.subject)
+            and existing_fact.relation_family == new_fact.relation_family
+        )
+
+    # Alias para compatibilidade com código legado que comparava igualdade perfeita
+    def facts_are_equal(self, existing_fact: MemoryFact, new_fact: MemoryFact) -> bool:
+        """Alias para facts_are_identical() por compatibilidade."""
+        return self.facts_are_identical(existing_fact, new_fact)
+
+    def consolidate_memories(self) -> dict[str, Any]:
+        """Consolida memórias duplicadas/legadas em uma memória canônica por conceito.
+
+        O MemoryManager orquestra; o Database persiste. Passos:
+        1. corrige targets inválidos herdados de normalizações antigas
+           (ex.: "acho que nao pizza na real" -> "pizza");
+        2. delega a consolidação ao Database, que agrupa por
+           (subject, target normalizado, fact_type), escolhe a memória
+           canônica (ativa e mais recente), move evidências das duplicatas
+           para o fato canônico e marca as duplicatas como inativas;
+        3. garante a restrição de unicidade semântica (índice único parcial).
+
+        Nada é apagado: histórico e evidências permanecem preservados.
+        """
+        fixed_targets = self.database.normalize_all_fact_targets(
+            self.normalize_fact_target
+        )
+        result = self.database.consolidate_duplicate_memories()
+        result["fixed_targets"] = fixed_targets
+        result["unique_index"] = self.database.ensure_semantic_uniqueness_index()
+        return result
+
+    def _determine_operation(
+        self,
+        new_fact: MemoryFact,
+    ) -> tuple[str, Optional[Memory], Optional[MemoryFact]]:
+        """Determina a operação a ser realizada: create, update, reinforce ou ignore.
+        
+        Procura por uma memória existente usando a chave semântica:
+        (subject, target, relation_family)
+        
+        Returns:
+            (operation, existing_memory, matching_fact)
+            onde operation é um de: "create", "update", "reinforce", "ignore"
+        """
+
+        # Procura memória existente com a mesma chave semântica
+        existing_memory = self.database.find_memory_by_semantic_key(
+            self.normalize_subject(new_fact.subject),
+            self.normalize_fact_target(new_fact.target),
+            new_fact.relation_family,
+            include_inactive=False,
+        )
+
+        if existing_memory is None:
+            # Nenhuma memória com este conceito existe ainda
+            return ("create", None, None)
+
+        # Encontrou memória existente, procura o fato matching
+        matching_fact = self._find_matching_fact_in_database(existing_memory, new_fact)
+
+        if matching_fact is None:
+            # A memória existe, mas não tem fato exato deste subject+target
+            # (pode haver outros fatos não relacionados)
+            return ("add", existing_memory, None)
+
+        # Encontrou o matching fact
+        if self.facts_are_identical(matching_fact, new_fact):
+            # Fato é exatamente igual - reforçar
+            return ("reinforce", existing_memory, matching_fact)
+        
+        # Fato é diferente (ex: relação mudou de like para dislike) - atualizar
+        return ("update", existing_memory, matching_fact)
 
     def find_matching_fact(
         self,
         memory: Memory,
         new_fact: MemoryFact,
     ) -> Optional[MemoryFact]:
-        """Encontra somente uma confirmação exata, nunca apenas o mesmo alvo."""
+        """Encontra o fato da mesma entidade factual, mesmo se a relação mudou."""
 
         for existing_fact in memory.facts:
-            if self.facts_are_equal(existing_fact, new_fact):
+            if (
+                existing_fact.status not in {"superseded", "archived", "deleted"}
+                and self.normalize_subject(existing_fact.subject)
+                == self.normalize_subject(new_fact.subject)
+                and self.normalize_fact_target(existing_fact.target)
+                == self.normalize_fact_target(new_fact.target)
+                and existing_fact.relation_family
+                == new_fact.relation_family
+            ):
                 return existing_fact
         return None
+
+    def _find_matching_fact_in_database(
+        self,
+        existing_memory: Optional[Memory],
+        new_fact: MemoryFact,
+    ) -> Optional[MemoryFact]:
+        if existing_memory is None:
+            return None
+        matching_fact = self.find_matching_fact(existing_memory, new_fact)
+        if matching_fact is not None:
+            return matching_fact
+        candidates = self.database.find_facts_for_semantic_key(
+            self.normalize_subject(new_fact.subject),
+            self.normalize_fact_target(new_fact.target),
+            new_fact.relation_family,
+            include_inactive=False,
+        )
+        return next(
+            (
+                fact for fact in candidates
+                if fact.memory_id == existing_memory.id
+            ),
+            None,
+        )
+
+    def _flow_log(
+        self,
+        operation: str,
+        existing_memory: Optional[Memory],
+        new_fact: Optional[MemoryFact],
+        matching_fact: Optional[MemoryFact],
+        database_action: str,
+    ) -> None:
+        new_value = (
+            f"{new_fact.target}/{new_fact.relation}"
+            if new_fact is not None else "None"
+        )
+        matching_value = (
+            f"{matching_fact.target}/{matching_fact.relation}"
+            if matching_fact is not None else "None"
+        )
+        print(
+            "[MEMORY FLOW] "
+            f"operation={operation} "
+            f"existing_memory_id={getattr(existing_memory, 'id', None)} "
+            f"new_fact={new_value} "
+            f"matching_fact={matching_value} "
+            f"database_action={database_action}"
+        )
+
+    def create_memory(self, memory: Memory) -> dict[str, Any]:
+        """Cria uma nova memória OU encontra/atualiza uma existente.
+        
+        Esta função é o ponto central que evita duplicação.
+        Ela analisa os fatos da memória e determina a operação apropriada.
+        """
+        self.normalize_memory_facts(memory)
+        if not memory.facts:
+            return {"action": "ignore", "reason": "empty_memory", "facts": []}
+
+        # Processa cada fato
+        # Se todos os fatos determinam a mesma operação, executa operação única
+        operations = []
+        for fact in memory.facts:
+            operation, existing_memory, matching_fact = self._determine_operation(fact)
+            operations.append({
+                "fact": fact,
+                "operation": operation,
+                "existing_memory": existing_memory,
+                "matching_fact": matching_fact,
+            })
+
+        # Se todos apontam para a mesma operação em nível de fato, consolida
+        unique_operations = set(op["operation"] for op in operations)
+        
+        if len(unique_operations) == 1:
+            op_type = list(unique_operations)[0]
+            first_op = operations[0]
+            
+            if op_type == "create":
+                # Nova memória - cria normalmente
+                print(
+                    "[OPERATION] action=create "
+                    f"facts={len(memory.facts)}"
+                )
+                memory_id = self.database.save_memory(memory)
+                return {
+                    "action": "create" if memory_id is not None else "ignore",
+                    "memory_id": memory_id,
+                    "memory": self.database.get_memory(memory_id) if memory_id else None,
+                }
+            
+            elif op_type == "reinforce":
+                # Todos os fatos já existem idênticos - reforçar
+                existing_memory = first_op["existing_memory"]
+                matching_fact = first_op["matching_fact"]
+                print(
+                    "[OPERATION] action=reinforce "
+                    f"memory_id={existing_memory.id} "
+                    f"fact_id={matching_fact.id}"
+                )
+                return self.reinforce_memory(existing_memory, matching_fact)
+            
+            elif op_type == "update":
+                # Fatos existem mas mudaram - atualizar
+                existing_memory = first_op["existing_memory"]
+                print(
+                    "[OPERATION] action=update "
+                    f"memory_id={existing_memory.id} "
+                    f"facts={len(memory.facts)}"
+                )
+                return self.update_memory_fact(existing_memory, memory)
+            
+            elif op_type == "add":
+                # Memória existe mas fatos são novos - adicionar
+                existing_memory = first_op["existing_memory"]
+                print(
+                    "[OPERATION] action=add "
+                    f"memory_id={existing_memory.id} "
+                    f"facts={len(memory.facts)}"
+                )
+                return self.add_memory_fact(existing_memory, memory)
+        
+        # Operações mistas - processa um a um
+        # Prioriza: update > add > reinforce > create > ignore
+        priority = {"update": 0, "add": 1, "reinforce": 2, "create": 3, "ignore": 4}
+        operations.sort(key=lambda op: priority.get(op["operation"], 5))
+        first_op = operations[0]
+        
+        if first_op["operation"] == "update":
+            existing_memory = first_op["existing_memory"]
+            print(
+                "[OPERATION] action=update (mixed) "
+                f"memory_id={existing_memory.id} "
+                f"facts={len(memory.facts)}"
+            )
+            return self.update_memory_fact(existing_memory, memory)
+        
+        elif first_op["operation"] == "add":
+            existing_memory = first_op["existing_memory"]
+            print(
+                "[OPERATION] action=add (mixed) "
+                f"memory_id={existing_memory.id} "
+                f"facts={len(memory.facts)}"
+            )
+            return self.add_memory_fact(existing_memory, memory)
+        
+        elif first_op["operation"] == "create":
+            print(
+                "[OPERATION] action=create (mixed) "
+                f"facts={len(memory.facts)}"
+            )
+            memory_id = self.database.save_memory(memory)
+            return {
+                "action": "create" if memory_id is not None else "ignore",
+                "memory_id": memory_id,
+                "memory": self.database.get_memory(memory_id) if memory_id else None,
+            }
+        
+        # Fallback ignore
+        print(
+            "[OPERATION] action=ignore (mixed/fallback) "
+            f"facts={len(memory.facts)}"
+        )
+        return self.ignore_memory(memory)
+
+    def add_memory_fact(
+        self,
+        existing_memory: Optional[Memory],
+        new_memory: Memory,
+    ) -> dict[str, Any]:
+        if existing_memory is None:
+            return {"action": "error", "reason": "add_without_existing_memory"}
+        self.normalize_memory_facts(new_memory)
+        added = []
+        try:
+            for fact in new_memory.facts:
+                matching = self._find_matching_fact_in_database(existing_memory, fact)
+                self._flow_log("add", existing_memory, fact, matching, "none")
+                if matching is not None:
+                    if self.facts_are_identical(matching, fact):
+                        self.database.connection.rollback()
+                        return {"action": "ignore", "target": fact.target, "reason": "identical_fact"}
+                    self.database.connection.rollback()
+                    return {"action": "error", "reason": "add_existing_fact", "target": fact.target}
+                fact_id = self.database.add_memory_fact(
+                    memory_id=existing_memory.id,
+                    target=fact.target,
+                    relation=fact.relation,
+                    emotion=fact.emotion,
+                    emotional_intensity=fact.emotional_intensity,
+                    temporal_context=fact.temporal_context,
+                    negation=fact.negation,
+                    subject=fact.subject,
+                    value=fact.value,
+                    confidence=fact.confidence,
+                    importance=fact.importance,
+                    status=fact.status,
+                    source=fact.source,
+                    fact_type=fact.fact_type or new_memory.memory_type,
+                    evidence=fact.evidence,
+                    metadata=fact.metadata,
+                    fact_object=fact,
+                    commit=False,
+                )
+                added.append({"action": "add", "fact_id": fact_id, "target": fact.target, "relation": fact.relation})
+            self.database.connection.commit()
+        except Exception:
+            self.database.connection.rollback()
+            raise
+        existing_memory.facts = self.database.get_memory_facts(existing_memory.id)
+        self._flow_log("add", existing_memory, new_memory.facts[0], None, "add_memory_fact")
+        return {"action": "add", "memory": existing_memory, "facts": added}
+
+    def update_memory_fact(
+        self,
+        existing_memory: Optional[Memory],
+        new_memory: Memory,
+    ) -> dict[str, Any]:
+        if existing_memory is None:
+            return {"action": "error", "reason": "update_without_existing_memory"}
+        self.normalize_memory_facts(new_memory)
+        if not new_memory.facts:
+            return {"action": "error", "reason": "empty_update"}
+        updated = []
+        try:
+            for fact in new_memory.facts:
+                matching = self._find_matching_fact_in_database(existing_memory, fact)
+                self._flow_log("update", existing_memory, fact, matching, "none")
+                if matching is None:
+                    self.database.connection.rollback()
+                    return {"action": "error", "reason": "update_without_matching_fact", "target": fact.target}
+                if self.facts_are_identical(matching, fact):
+                    updated.append({"action": "ignore", "target": fact.target})
+                    continue
+                metadata = dict(matching.metadata or {})
+                metadata.update(fact.metadata or {})
+                changed = self.database.update_memory_fact(
+                    memory_id=existing_memory.id,
+                    fact_id=matching.id,
+                    target=fact.target,
+                    relation=fact.relation,
+                    emotion=fact.emotion,
+                    emotional_intensity=fact.emotional_intensity,
+                    temporal_context=fact.temporal_context or matching.temporal_context,
+                    negation=fact.negation,
+                    subject=fact.subject or matching.subject,
+                    value=fact.value,
+                    confidence=fact.confidence,
+                    importance=(
+                        matching.importance
+                        if fact.importance == 0.5
+                        and matching.importance != fact.importance
+                        else fact.importance
+                    ),
+                    status=fact.status or matching.status,
+                    source=fact.source or matching.source,
+                    fact_type=fact.fact_type or matching.fact_type,
+                    metadata=metadata,
+                    reason="Fato atualizado por nova declaração do usuário.",
+                    revision_type="updated",
+                )
+                if not changed:
+                    raise RuntimeError("database_update_memory_fact_failed")
+                print(
+                    "[DATABASE] "
+                    f"action=update memory_id={existing_memory.id} "
+                    f"fact_id={matching.id}"
+                )
+                if new_memory.content != existing_memory.content:
+                    self.database.update_memory_content(
+                        existing_memory.id,
+                        new_memory.content,
+                    )
+                updated.append({"action": "update", "fact_id": matching.id, "target": fact.target, "relation": fact.relation})
+            self.database.connection.commit()
+        except Exception:
+            self.database.connection.rollback()
+            raise
+        refreshed_memory = self.database.get_memory(existing_memory.id)
+        if refreshed_memory is not None:
+            existing_memory.__dict__.update(refreshed_memory.__dict__)
+        database_action = "update_memory_fact" if any(item["action"] == "update" for item in updated) else "none"
+        self._flow_log("update", existing_memory, new_memory.facts[0], existing_memory.facts[0], database_action)
+        return {"action": "update" if database_action != "none" else "ignore", "memory": existing_memory, "facts": updated}
+
+    def ignore_memory(self, new_memory: Optional[Memory] = None) -> dict[str, Any]:
+        target = new_memory.facts[0].target if new_memory and new_memory.facts else None
+        self._flow_log("ignore", None, new_memory.facts[0] if new_memory and new_memory.facts else None, None, "none")
+        return {"action": "ignore", "target": target}
+
+    def reinforce_memory(
+        self,
+        existing_memory: Optional[Memory],
+        matching_fact: Optional[MemoryFact],
+    ) -> dict[str, Any]:
+        if existing_memory is None or matching_fact is None:
+            raise RuntimeError(
+                "Memory pipeline inconsistency: reinforce requires existing memory and matching fact"
+            )
+        if matching_fact.status != "active":
+            self.database.update_memory_fact(
+                memory_id=existing_memory.id,
+                fact_id=matching_fact.id,
+                status="active",
+                reason="Fato corrente reativado durante reforço.",
+                revision_type="status_changed",
+            )
+            refreshed_memory = self.database.get_memory(existing_memory.id)
+            if refreshed_memory is not None:
+                existing_memory.__dict__.update(refreshed_memory.__dict__)
+        print(
+            "[DATABASE] "
+            f"action=reinforce memory_id={existing_memory.id} "
+            f"fact_id={matching_fact.id}"
+        )
+        return {
+            "action": "reinforce",
+            "memory": existing_memory,
+            "fact_id": matching_fact.id,
+            "target": matching_fact.target,
+        }
 
     # ------------------------------------------------------------------
     # Storage and evidence reinforcement
@@ -200,7 +679,7 @@ class MemoryManager:
                 include_inactive=False,
             )
             equivalent = next(
-                (candidate for candidate in candidates if self.facts_are_equal(candidate, fact)),
+                (candidate for candidate in candidates if self.facts_are_identical(candidate, fact)),
                 None,
             )
             if equivalent is None:
@@ -293,8 +772,40 @@ class MemoryManager:
 
         if new_memory is None:
             return []
-        result = self.remember(new_memory)
-        return result.get("facts", [])
+        if existing_memory is None:
+            return self.create_memory(new_memory).get("facts", [])
+        self.normalize_memory_facts(new_memory)
+        results = []
+        for fact in new_memory.facts:
+            matching = self._find_matching_fact_in_database(existing_memory, fact)
+            if matching is None:
+                result = self.add_memory_fact(
+                    existing_memory,
+                    Memory(
+                        content=new_memory.content,
+                        memory_type=new_memory.memory_type,
+                        importance=new_memory.importance,
+                        emotion=new_memory.emotion,
+                        emotional_intensity=new_memory.emotional_intensity,
+                        facts=[fact],
+                    ),
+                )
+            elif self.facts_are_identical(matching, fact):
+                result = self.reinforce_memory(existing_memory, matching)
+            else:
+                result = self.update_memory_fact(
+                    existing_memory,
+                    Memory(
+                        content=new_memory.content,
+                        memory_type=new_memory.memory_type,
+                        importance=new_memory.importance,
+                        emotion=new_memory.emotion,
+                        emotional_intensity=new_memory.emotional_intensity,
+                        facts=[fact],
+                    ),
+                )
+            results.extend(result.get("facts", [result]))
+        return results
 
     def apply_memory_operation(
         self,
@@ -305,16 +816,48 @@ class MemoryManager:
         """Executa operações antigas com a semântica não destrutiva nova."""
 
         if reasoning_result is None:
-            return "ignored"
+            return self.ignore_memory(new_memory)
         operation = getattr(reasoning_result, "memory_operation", "none")
-        if operation in {"create", "add", "update", "supersede"}:
-            result = self.remember(new_memory)
-            if operation == "create" and result["operation"] == "created":
-                return "created"
-            return result.get("facts", result["operation"])
+        print(
+            "[DECISION] "
+            f"operation={operation} "
+            f"existing_memory_id={getattr(reasoning_result, 'existing_memory_id', None)} "
+            f"matching_fact_id={getattr(reasoning_result, 'matching_fact_id', None)}"
+        )
+        matching_fact = None
+        if existing_memory is not None and new_memory.facts:
+            matching_fact = self._find_matching_fact_in_database(
+                existing_memory,
+                new_memory.facts[0],
+            )
+        expected_memory_id = getattr(reasoning_result, "existing_memory_id", None)
+        if expected_memory_id is not None and (
+            existing_memory is None or existing_memory.id != expected_memory_id
+        ):
+            raise RuntimeError(
+                "Memory pipeline inconsistency: existing_memory was not propagated"
+            )
+        if matching_fact is not None and existing_memory is None:
+            raise RuntimeError(
+                "Memory pipeline inconsistency: matching_fact exists without existing_memory"
+            )
+        if operation == "create":
+            return self.create_memory(new_memory)
+        if operation == "add":
+            return self.add_memory_fact(existing_memory, new_memory)
+        if operation in {"update", "supersede"}:
+            return self.update_memory_fact(existing_memory, new_memory)
+        if operation == "reinforce":
+            return self.reinforce_memory(existing_memory, matching_fact)
         if operation == "ignore":
-            return "ignored"
-        return "unknown"
+            if existing_memory is not None:
+                print(
+                    "[DATABASE] "
+                    f"action=ignore memory_id={existing_memory.id} "
+                    f"fact_id={getattr(matching_fact, 'id', None)}"
+                )
+            return self.ignore_memory(new_memory)
+        return {"action": "error", "reason": "unknown_memory_operation", "operation": operation}
 
     # ------------------------------------------------------------------
     # Conflict resolution

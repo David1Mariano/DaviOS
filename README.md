@@ -1,4 +1,5 @@
- # DaviOS 🧠
+# DaviOS 🧠
+>>>>>>> f99f37c60619c406d4bafcdabbd919c04890b0b3
 
 > Assistente pessoal de IA local, com memória persistente, personalidade e arquitetura preparada para agentes e ferramentas.
 

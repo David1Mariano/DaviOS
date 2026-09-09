@@ -253,14 +253,33 @@ class TestConversationEngineWithLLM:
         assert result.memory_action == "llm_context"
         assert len(provider.calls) == 1
 
-    def test_memory_query_does_not_use_llm(self, engine):
+    def test_memory_query_uses_llm(self, engine):
         engine_obj, _, provider = engine
+        result = engine_obj.process("qual e meu nome?")
+        assert len(provider.calls) == 1
+        assert result.memory_action == "llm_recall"
+
+    def test_memory_query_falls_back_to_rules(self, engine):
+        engine_obj, _, provider = engine
+        provider._available = False
         result = engine_obj.process("qual e meu nome?")
         assert len(provider.calls) == 0
         assert result.memory_action == "recall"
 
-    def test_memory_statement_does_not_use_llm(self, engine):
+    def test_memory_statement_uses_llm_after_saving(self, engine):
+        engine_obj, manager, provider = engine
+        result = engine_obj.process("eu gosto de Python")
+        # Memoria salva ANTES da geracao; LLM recebe o fato novo no prompt
+        assert result.memory_action == "create"
+        assert len(provider.calls) == 1
+        prompt = provider.calls[0].prompt
+        assert "Python" in prompt or "python" in prompt
+        facts = manager.database.find_active_preferences()
+        assert any(f.target == "python" for f in facts)
+
+    def test_memory_statement_falls_back_to_rules(self, engine):
         engine_obj, _, provider = engine
+        provider._available = False
         result = engine_obj.process("eu gosto de Python")
         assert len(provider.calls) == 0
         assert result.memory_action == "create"

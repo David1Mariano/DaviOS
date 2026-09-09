@@ -1,36 +1,31 @@
 """Downloader robusto e offline-resiliente para modelos GGUF do DaviOS.
 
 Requisitos atendidos:
-  - Download retomável (HTTP Range)
-  - Arquivo temporário .part (nunca sobrescrever completo)
+  - Download retomavel (HTTP Range)
+  - Arquivo temporario .part (nunca sobrescrever completo)
   - Verificar tamanho
-  - Verificar SHA256 quando disponível
-  - Retry automático com backoff progressivo
-  - Detectar conexão interrompida e continuar do ponto onde parou
+  - Verificar SHA256 quando disponivel
+  - Retry automatico com backoff progressivo
+  - Detectar conexao interrompida e continuar do ponto onde parou
   - Evitar downloads duplicados (lock file de processo)
-  - Detectar arquivo já completo
-  - Verificar integridade antes de considerar concluído
+  - Verificar integridade antes de considerar concluido
 
-O downloader usa curl.exe (Windows) com opções adequadas para resume e retry.
-NÃO inicia múltiplos downloads simultâneos do mesmo arquivo.
+Usa curl.exe (Windows) com opcoes de resume e retry.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
+import logging
 import os
-import re
 import subprocess
-import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-logger = __import__("logging").getLogger("davios.downloader")
+logger = logging.getLogger("davios.downloader")
 
-# Tempo máximo para uma única tentativa de curl
 _DEFAULT_CONNECT_TIMEOUT = 30
 _DEFAULT_READ_TIMEOUT = 120
 
@@ -58,12 +53,11 @@ class DownloadResult:
             "resumed": self.resumed,
         }
 
-
 class DownloadLock:
-    """Lock file simples para impedir downloads duplicados de um mesmo arquivo.
+    """Lock file para impedir downloads duplicados de um mesmo arquivo.
 
-    Usa um arquivo .lock com o PID do processo. Se o processo que criou o
-    lock não existir mais, o lock é considerado óbvio (stale) e é reclamado.
+    Usa .lock com o PID do processo. Se o processo que criou o lock
+    nao existir mais, o lock e considerado obsoleto (stale) e e reclaim.
     """
 
     def __init__(self, lock_path: Path):
@@ -71,19 +65,28 @@ class DownloadLock:
         self._acquired = False
 
     def acquire(self) -> bool:
-        """Tenta adquirir o lock. Retorna False se outro processo já está baixando."""
+        """Tenta adquirir o lock. False se outro processo ja esta baixando."""
         if self.lock_path.exists():
             try:
                 pid_str = self.lock_path.read_text().strip()
                 pid = int(pid_str)
                 try:
-                    os.kill(pid, 0)  # signal 0 = check existence
-                    logger.info("Download já em andamento (PID %d).", pid)
+                    os.kill(pid, 0)  # signal 0 = checa existencia
+                    logger.info("Download ja em andamento (PID %d).", pid)
                     return False
                 except (OSError, ProcessLookupError):
                     logger.info("Lock stale (PID %d morto). Reclamando.", pid)
+                    # Remove o lock stale antes de tentar criar novo
+                    try:
+                        self.lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
             except (ValueError, IOError):
-                pass  # lock file corrompido
+                # Conteudo invalido no lock: remove e tenta criar novo
+                try:
+                    self.lock_path.unlink()
+                except FileNotFoundError:
+                    pass
 
         try:
             fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -105,17 +108,17 @@ class DownloadLock:
     def __enter__(self):
         if not self.acquire():
             raise FileExistsError(
-                f"Download já em andamento para {self.lock_path.stem}. "
+                f"Download ja em andamento para {self.lock_path.stem}. "
                 "Aguarde o processo anterior terminar."
             )
         return self
 
-        def __exit__(self, *args):
+    def __exit__(self, *args):
         self.release()
 
 
 class ModelDownloader:
-    """Downloader resumable para arquivos GGUF.
+    """Downloader retomavel para arquivos GGUF.
 
     Uso:
         dl = ModelDownloader()
@@ -123,7 +126,7 @@ class ModelDownloader:
             url="https://huggingface.co/.../model.gguf",
             dest_path=Path("models/balanced/model.gguf"),
             expected_size=2_600_000_000,
-            sha256="abc123...",
+            sha256="...",
         )
     """
 
@@ -141,8 +144,6 @@ class ModelDownloader:
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
 
-    # ------------------------------------------------------------------
-
     def download(
         self,
         url: str,
@@ -153,13 +154,12 @@ class ModelDownloader:
     ) -> DownloadResult:
         """Baixa um arquivo com resume automatico.
 
-        Se o arquivo destino ja existe e e completo (tamanho + sha256 OK),
+        Se o arquivo destino ja existe e esta completo (tamanho + sha256 OK),
         retorna sucesso imediatamente sem download.
         """
         dest_path = Path(dest_path)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 1. Checar se arquivo ja esta completo
         if dest_path.exists() and dest_path.is_file():
             if self._verify_complete(dest_path, expected_size, sha256):
                 logger.info("Download ja concluido: %s", dest_path)
@@ -172,9 +172,8 @@ class ModelDownloader:
                     resumed=False,
                 )
 
-        # 2. Lock para evitar downloads duplicados
         lock_path = dest_path.with_suffix(dest_path.suffix + ".lock")
-        with DownloadLock(lock_path) as lock:
+        with DownloadLock(lock_path):
             part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
             total_bytes = 0
@@ -194,19 +193,19 @@ class ModelDownloader:
                 if result.success:
                     self._finalize(part_path, dest_path)
                     if self._verify_complete(dest_path, expected_size, sha256):
-                        final_size = dest_path.stat().st_size
-                        final_sha = self._compute_sha256(dest_path) if sha256 else None
                         return DownloadResult(
                             success=True,
                             file_path=str(dest_path),
-                            size_bytes=final_size,
-                            sha256=final_sha,
+                            size_bytes=dest_path.stat().st_size,
+                            sha256=(
+                                self._compute_sha256(dest_path) if sha256 else None
+                            ),
                             attempts=attempt,
                             resumed=resumed,
                             error="",
                         )
                     else:
-                        logger.warning("Arquivo corrompido. Reinicando download.")
+                        logger.warning("Arquivo corrompido. Reiniciando download.")
                         try:
                             dest_path.unlink()
                         except FileNotFoundError:
@@ -216,7 +215,6 @@ class ModelDownloader:
                         resumed = False
                         continue
 
-                # Download falhou — verifica se pode retomar
                 if part_path.exists():
                     total_bytes = part_path.stat().st_size
                     if total_bytes > 0:
@@ -229,12 +227,14 @@ class ModelDownloader:
                     total_bytes = 0
 
                 if attempt < self.max_retries:
-                    backoff = min(self.base_backoff * (2 ** (attempt - 1)), self.max_backoff)
-                    sleep_time = backoff + 0.1 * backoff * 0.5
+                    backoff = min(
+                        self.base_backoff * (2 ** (attempt - 1)), self.max_backoff
+                    )
+                    sleep_time = backoff + (0.1 * backoff * 0.5)
                     logger.info("Retry em %.1fs...", sleep_time)
                     time.sleep(sleep_time)
 
-                        return DownloadResult(
+            return DownloadResult(
                 success=False,
                 file_path=str(dest_path),
                 size_bytes=total_bytes,
@@ -242,8 +242,6 @@ class ModelDownloader:
                 attempts=attempt,
                 resumed=resumed,
             )
-
-    # ------------------------------------------------------------------
 
     def _curl_download(
         self,
@@ -255,7 +253,6 @@ class ModelDownloader:
         resume_bytes: int,
     ) -> DownloadResult:
         """Um unico attempt de download via curl.exe."""
-
         resume = resume_bytes > 0 and part_path.exists()
 
         cmd = [
@@ -284,21 +281,24 @@ class ModelDownloader:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd,
+                capture_output=True,
+                text=True,
                 timeout=self.read_timeout + self.connect_timeout + 10,
             )
         except subprocess.TimeoutExpired:
-            return DownloadResult(success=False, file_path=str(part_path), error="Timeout")
+            return DownloadResult(
+                success=False, file_path=str(part_path), error="Timeout"
+            )
         except FileNotFoundError:
             logger.error("curl.exe nao encontrado. Usando fallback urllib.")
             return self._urllib_download(url, part_path, resume, resume_bytes)
 
         if result.returncode == 0:
             return DownloadResult(success=True, file_path=str(part_path))
-        else:
-            stderr = result.stderr.strip()
-            logger.warning("curl falhou (exit %d): %s", result.returncode, stderr[:200])
-            return DownloadResult(success=False, file_path=str(part_path), error=stderr)
+        stderr = result.stderr.strip()
+        logger.warning("curl falhou (exit %d): %s", result.returncode, stderr[:200])
+        return DownloadResult(success=False, file_path=str(part_path), error=stderr)
 
     def _urllib_download(self, url, part_path, resume, resume_bytes):
         """Fallback usando urllib se curl nao estiver disponivel."""
@@ -322,8 +322,6 @@ class ModelDownloader:
             return DownloadResult(success=True, file_path=str(part_path))
         except Exception as e:
             return DownloadResult(success=False, file_path=str(part_path), error=str(e))
-
-    # ------------------------------------------------------------------
 
     def _finalize(self, part_path: Path, dest_path: Path) -> None:
         """Move .part para o destino final."""

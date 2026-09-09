@@ -1,4 +1,11 @@
+from __future__ import annotations
+
+import logging
+import re
+
 from memory.memory_fact import MemoryFact
+
+logger = logging.getLogger("davios.memory.interpreter")
 
 
 class MemoryInterpreter:
@@ -16,6 +23,12 @@ class MemoryInterpreter:
         "comidas", "coisas", "coisa", "que", "eu",
         "mais", "nao", "não", "algo", "agora", "hoje", "atualmente", "antes",
         "antigamente",
+    }
+    STOP_TARGET_WORDS = {
+        "eu", "meu", "minha", "meus", "minhas", "voce", "muito", "mais",
+        "que", "e", "é", "uma", "um", "o", "a", "os", "as", "de", "do", "da",
+        "no", "na", "em", "com", "para", "por", "tambem", "agora", "hoje",
+        "mas", "porem", "entao", "muito", "bem", "nao", "não",
     }
 
     def interpret(self, text, context, emotions):
@@ -57,10 +70,15 @@ class MemoryInterpreter:
 
         facts = []
 
-        # Detect "meu nome e X" pattern
+        # Detect "meu nome e X" / "me chamo X" patterns
         name_fact = self._extract_name_fact(text_lower)
         if name_fact:
             facts.append(name_fact)
+            personal_relevance = max(personal_relevance, 0.6)
+
+        # Fatos estruturados declarativos (trabalho, estudo, residencia, posse)
+        for statement_fact in self._extract_statement_facts(text_lower):
+            facts.append(statement_fact)
             personal_relevance = max(personal_relevance, 0.6)
 
         for emotion_data in emotions or []:
@@ -99,9 +117,7 @@ class MemoryInterpreter:
                 )
             )
 
-        print("=== INTERPRETED FACTS ===")
-        for fact in facts:
-            print(fact)
+        logger.debug("[MEMORY] interpreted facts=%d", len(facts))
 
         return {
             "memory_candidate": personal_relevance >= 0.4,
@@ -112,8 +128,9 @@ class MemoryInterpreter:
 
     def _extract_name_fact(self, text_lower: str):
         """Detecta padroes como 'meu nome e X' e cria um fato de identidade."""
-        import re
-        match = re.search(r"meu nome e\s+(\w+)", text_lower)
+        match = re.search(r"meu nome (?:e|é)\s+(\w+)", text_lower)
+        if not match:
+            match = re.search(r"me chamo\s+(\w+)", text_lower)
         if not match:
             return None
         name = match.group(1)
@@ -130,6 +147,69 @@ class MemoryInterpreter:
             source="user_statement",
             fact_type="identity",
         )
+
+    # ------------------------------------------------------------------
+    # Fatos estruturados declarativos
+    # ------------------------------------------------------------------
+
+    # (regex do verbo, relacao) — ordem importa: mais especifico primeiro
+    STATEMENT_PATTERNS = (
+        (r"(?:estou|to)\s+trabalhando\s+(?:no|na|em|numa|num)\s+([a-z0-9][\w \-]*)", "working_on"),
+        (r"trabalho\s+(?:no|na|em|numa|num)\s+([a-z0-9][\w \-]*)", "working_on"),
+        (r"meu\s+(?:projeto|trabalho)\s+(?:se\s+chama|e|é)\s+([a-z0-9][\w \-]*)", "working_on"),
+        (r"(?:estou|to)\s+fazendo\s+(?:um\s+)?(?:projeto|app|aplicativo|sistema)\s+(?:chamado|chamada|do|da)?\s*([a-z0-9][\w \-]*)", "working_on"),
+        (r"estou\s+desenvolvendo\s+(?:o|a|um|uma)?\s*([a-z0-9][\w \-]*)", "working_on"),
+        (r"estou\s+estudando\s+([a-z0-9][\w \-]*)", "studies"),
+        (r"eu\s+estudo\s+([a-z0-9][\w \-]*)", "studies"),
+        (r"moro\s+em\s+([a-z0-9][\w \-]*)", "lives_in"),
+        (r"eu\s+tenho\s+(?:um|uma|um(a)?)?\s*([a-z0-9][\w \-]*)", "has"),
+    )
+
+    def _extract_statement_facts(self, text_lower: str) -> list[MemoryFact]:
+        """Extrai fatos declarativos (working_on, studies, lives_in, has).
+
+        Complementa a extracao por emocao: cobre frases sem palavra de
+        preferencia, como 'Estou trabalhando no NetOptimizer'.
+        """
+        facts: list[MemoryFact] = []
+        negation = bool(
+            re.search(r"\b(nao|não|nunca|jamais)\b", text_lower)
+        )
+        for pattern, relation in self.STATEMENT_PATTERNS:
+            match = re.search(pattern, text_lower)
+            if not match:
+                continue
+            target = self._clean_target(match.group(1))
+            if not target:
+                continue
+            facts.append(
+                MemoryFact(
+                    target=target,
+                    relation=relation,
+                    emotion="neutral",
+                    emotional_intensity=0.0,
+                    temporal_context="current",
+                    negation=negation,
+                    confidence=0.75,
+                    subject="user",
+                    source="user_statement",
+                    fact_type="statement",
+                )
+            )
+        return facts
+
+    def _clean_target(self, raw: str) -> str:
+        """Remove conectivos finais e palavras vazias do alvo extraido."""
+        words = raw.strip().split()
+        cleaned: list[str] = []
+        for word in words:
+            if word in self.STOP_TARGET_WORDS:
+                break
+            cleaned.append(word)
+        while cleaned and cleaned[-1] in self.TRAILING_DISCOURSE:
+            cleaned.pop()
+        target = " ".join(cleaned).strip(" .,!?")
+        return target or ""
 
     def extract_emotion_target(self, text, emotion):
         import re

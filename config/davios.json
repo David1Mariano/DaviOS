@@ -1,7 +1,7 @@
 {
   "offline_mode": true,
   "network_policy": "offline",
-  "backend": "llama_cpp",
+  "backend": "llama_cpp_standalone",
   "models_dir": "models",
   "debug": false,
   "context_window": 2048,

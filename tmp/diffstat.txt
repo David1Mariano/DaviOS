@@ -1,0 +1,16 @@
+﻿ .gitignore                                  |   3 +
+ README.md                                   | 595 +++++++++++++++++++++++++++-
+ brain/providers/__init__.py                 |  11 +-
+ brain/providers/local_llama_cpp_provider.py | 314 +++++++++++++++
+ config/davios.json                          |   2 +-
+ config/model_profiles.json                  |   4 +-
+ core/hardware_detector.py                   |  19 +-
+ main.py                                     |  27 +-
+ memory/__pycache__/database.cpython-314.pyc | Bin 74441 -> 74441 bytes
+ models/README.md                            |  71 ++--
+ requirements.txt                            |  20 +-
+ scripts/setup_llama.py                      |   6 +-
+ tests/test_hardware_and_models.py           |   8 +-
+ utils/llama_binary_downloader.py            | 168 ++++----
+ utils/model_downloader.py                   | 104 +++--
+ 15 files changed, 1180 insertions(+), 172 deletions(-)

@@ -1,0 +1,254 @@
+
+=================================== ERRORS ====================================
+________________ ERROR collecting tests/test_cognitive_core.py ________________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_cognitive_core.py:11: in <module>
+    from brain.cognitive_core import CognitiveCore
+brain\__init__.py:1: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult, ConversationContext
+brain\conversation_engine.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+____________ ERROR collecting tests/test_cognitive_integration.py _____________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_cognitive_integration.py:14: in <module>
+    from brain.cognitive_core import CognitiveCore
+brain\__init__.py:1: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult, ConversationContext
+brain\conversation_engine.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+_____________ ERROR collecting tests/test_conversation_engine.py ______________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_conversation_engine.py:8: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult
+brain\__init__.py:1: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult, ConversationContext
+brain\conversation_engine.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+_____________ ERROR collecting tests/test_hardware_and_models.py ______________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_hardware_and_models.py:14: in <module>
+    from brain.model_manager import ModelInfo, ModelManager
+brain\__init__.py:1: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult, ConversationContext
+brain\conversation_engine.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+_____________ ERROR collecting tests/test_memory_consolidation.py _____________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_memory_consolidation.py:19: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+____________ ERROR collecting tests/test_memory_duplication_fix.py ____________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_memory_duplication_fix.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+______________ ERROR collecting tests/test_memory_operations.py _______________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_memory_operations.py:12: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+_______________ ERROR collecting tests/test_offline_backend.py ________________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_offline_backend.py:13: in <module>
+    from brain.llm_provider import LLMProvider, LLMRequest, LLMResponse
+brain\__init__.py:1: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult, ConversationContext
+brain\conversation_engine.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+___________________ ERROR collecting tests/test_provider.py ___________________
+.venv\Lib\site-packages\_pytest\python.py:508: in importtestmodule
+    mod = import_path(
+.venv\Lib\site-packages\_pytest\pathlib.py:596: in import_path
+    importlib.import_module(module_name)
+..\AppData\Local\Python\pythoncore-3.14-64\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<frozen importlib._bootstrap>:1406: in _gcd_import
+    ???
+<frozen importlib._bootstrap>:1371: in _find_and_load
+    ???
+<frozen importlib._bootstrap>:1342: in _find_and_load_unlocked
+    ???
+<frozen importlib._bootstrap>:938: in _load_unlocked
+    ???
+.venv\Lib\site-packages\_pytest\assertion\rewrite.py:188: in exec_module
+    exec(co, module.__dict__)
+tests\test_provider.py:15: in <module>
+    from brain.llm_provider import LLMRequest
+brain\__init__.py:1: in <module>
+    from brain.conversation_engine import ConversationEngine, ConversationResult, ConversationContext
+brain\conversation_engine.py:11: in <module>
+    from memory.memory_manager import MemoryManager
+E     File "C:\Users\Davi\DaviOS\memory\memory_manager.py", line 839
+E       logger.debug(
+E       ^^^^^^
+E   IndentationError: expected an indented block after 'if' statement on line 838
+=========================== short test summary info ===========================
+ERROR tests/test_cognitive_core.py
+ERROR tests/test_cognitive_integration.py
+ERROR tests/test_conversation_engine.py
+ERROR tests/test_hardware_and_models.py
+ERROR tests/test_memory_consolidation.py
+ERROR tests/test_memory_duplication_fix.py
+ERROR tests/test_memory_operations.py
+ERROR tests/test_offline_backend.py
+ERROR tests/test_provider.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 9 errors during collection !!!!!!!!!!!!!!!!!!!
+9 errors in 0.82s

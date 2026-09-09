@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from datetime import datetime, timezone
@@ -12,6 +13,14 @@ from memory.database import Database
 from memory.emotion_analyzer import EmotionAnalyzer
 from memory.memory import Memory
 from memory.memory_fact import MemoryFact
+
+logger = logging.getLogger("davios.memory.manager")
+
+# Import lazy para evitar circular import: brain/__init__.py → conversation_engine
+# → memory_manager → brain/style_profile antes do pacote brain estar inicializado.
+def _import_style_profile():
+    from brain.style_profile import StyleProfile, apply_style_substitutions
+    return StyleProfile, apply_style_substitutions
 
 
 class MemoryManager:
@@ -79,6 +88,44 @@ class MemoryManager:
         )
         self.emotion_analyzer = EmotionAnalyzer()
         self.context_analyzer = ContextAnalyzer()
+        self._style_profile: Optional[StyleProfile] = None
+
+    # ------------------------------------------------------------------
+    # Style Profile
+    # ------------------------------------------------------------------
+
+    @property
+    def style_profile(self) -> "StyleProfile":
+        """Carrega (ou cria) o perfil de estilo do usuario."""
+        if self._style_profile is None:
+            StyleProfile, _ = _import_style_profile()
+            raw = self.database.load_style_profile()
+            if raw:
+                import json
+
+                try:
+                    self._style_profile = StyleProfile.from_dict(json.loads(raw))
+                except Exception:
+                    self._style_profile = StyleProfile()
+            else:
+                self._style_profile = StyleProfile()
+        return self._style_profile
+
+    def update_style_profile(self, message: str) -> None:
+        """Atualiza o perfil com uma mensagem nova e persiste."""
+        StyleProfile, _ = _import_style_profile()
+        profile = self.style_profile
+        profile.update(message)
+        import json
+
+        self.database.save_style_profile(json.dumps(profile.to_dict()))
+        logger.debug("[STYLE] profile updated: messages=%d", profile.total_messages)
+
+    def apply_style(self, text: str) -> str:
+        """Aplica substituíções de estilo ao texto de resposta."""
+        from brain.style_profile import apply_style_substitutions
+
+        return apply_style_substitutions(text, self.style_profile)
 
     # ------------------------------------------------------------------
     # Backwards-compatible discovery helpers
@@ -133,13 +180,13 @@ class MemoryManager:
                 existing_memory,
                 facts[0],
             )
-        print(
-            "[MATCH] "
-            f"existing_memory_id={getattr(existing_memory, 'id', None)} "
-            f"matching_fact_id={getattr(matching_fact, 'id', None)} "
-            f"target={getattr(matching_fact or (facts[0] if facts else None), 'target', None)} "
-            f"old_relation={getattr(matching_fact, 'relation', None)} "
-            f"new_relation={getattr(facts[0], 'relation', None) if facts else None}"
+        logger.debug(
+            "[MATCH] existing_memory_id=%s matching_fact_id=%s target=%s old_relation=%s new_relation=%s",
+            getattr(existing_memory, "id", None),
+            getattr(matching_fact, "id", None),
+            getattr(matching_fact or (facts[0] if facts else None), "target", None),
+            getattr(matching_fact, "relation", None),
+            getattr(facts[0], "relation", None) if facts else None,
         )
         return {
             "existing_memory": existing_memory,
@@ -351,13 +398,10 @@ class MemoryManager:
             f"{matching_fact.target}/{matching_fact.relation}"
             if matching_fact is not None else "None"
         )
-        print(
+        logger.debug(
             "[MEMORY FLOW] "
-            f"operation={operation} "
-            f"existing_memory_id={getattr(existing_memory, 'id', None)} "
-            f"new_fact={new_value} "
-            f"matching_fact={matching_value} "
-            f"database_action={database_action}"
+            "operation=%s existing_memory_id=%s new_fact=%s matching_fact=%s database_action=%s",
+            operation, getattr(existing_memory, 'id', None), new_value, matching_value, database_action,
         )
 
     def create_memory(self, memory: Memory) -> dict[str, Any]:
@@ -391,10 +435,7 @@ class MemoryManager:
             
             if op_type == "create":
                 # Nova memória - cria normalmente
-                print(
-                    "[OPERATION] action=create "
-                    f"facts={len(memory.facts)}"
-                )
+                logger.debug("[OPERATION] action=create facts=%d", len(memory.facts))
                 memory_id = self.database.save_memory(memory)
                 return {
                     "action": "create" if memory_id is not None else "ignore",
@@ -406,30 +447,27 @@ class MemoryManager:
                 # Todos os fatos já existem idênticos - reforçar
                 existing_memory = first_op["existing_memory"]
                 matching_fact = first_op["matching_fact"]
-                print(
-                    "[OPERATION] action=reinforce "
-                    f"memory_id={existing_memory.id} "
-                    f"fact_id={matching_fact.id}"
+                logger.debug(
+                    "[OPERATION] action=reinforce memory_id=%s fact_id=%s",
+                    existing_memory.id, matching_fact.id,
                 )
                 return self.reinforce_memory(existing_memory, matching_fact)
             
             elif op_type == "update":
                 # Fatos existem mas mudaram - atualizar
                 existing_memory = first_op["existing_memory"]
-                print(
-                    "[OPERATION] action=update "
-                    f"memory_id={existing_memory.id} "
-                    f"facts={len(memory.facts)}"
+                logger.debug(
+                    "[OPERATION] action=update memory_id=%s facts=%d",
+                    existing_memory.id, len(memory.facts),
                 )
                 return self.update_memory_fact(existing_memory, memory)
             
             elif op_type == "add":
                 # Memória existe mas fatos são novos - adicionar
                 existing_memory = first_op["existing_memory"]
-                print(
-                    "[OPERATION] action=add "
-                    f"memory_id={existing_memory.id} "
-                    f"facts={len(memory.facts)}"
+                logger.debug(
+                    "[OPERATION] action=add memory_id=%s facts=%d",
+                    existing_memory.id, len(memory.facts),
                 )
                 return self.add_memory_fact(existing_memory, memory)
         
@@ -441,27 +479,22 @@ class MemoryManager:
         
         if first_op["operation"] == "update":
             existing_memory = first_op["existing_memory"]
-            print(
-                "[OPERATION] action=update (mixed) "
-                f"memory_id={existing_memory.id} "
-                f"facts={len(memory.facts)}"
+            logger.debug(
+                "[OPERATION] action=update (mixed) memory_id=%s facts=%d",
+                existing_memory.id, len(memory.facts),
             )
             return self.update_memory_fact(existing_memory, memory)
         
         elif first_op["operation"] == "add":
             existing_memory = first_op["existing_memory"]
-            print(
-                "[OPERATION] action=add (mixed) "
-                f"memory_id={existing_memory.id} "
-                f"facts={len(memory.facts)}"
+            logger.debug(
+                "[OPERATION] action=add (mixed) memory_id=%s facts=%d",
+                existing_memory.id, len(memory.facts),
             )
             return self.add_memory_fact(existing_memory, memory)
         
         elif first_op["operation"] == "create":
-            print(
-                "[OPERATION] action=create (mixed) "
-                f"facts={len(memory.facts)}"
-            )
+            logger.debug("[OPERATION] action=create (mixed) facts=%d", len(memory.facts))
             memory_id = self.database.save_memory(memory)
             return {
                 "action": "create" if memory_id is not None else "ignore",
@@ -470,10 +503,7 @@ class MemoryManager:
             }
         
         # Fallback ignore
-        print(
-            "[OPERATION] action=ignore (mixed/fallback) "
-            f"facts={len(memory.facts)}"
-        )
+        logger.debug("[OPERATION] action=ignore (mixed/fallback) facts=%d", len(memory.facts))
         return self.ignore_memory(memory)
 
     def add_memory_fact(
@@ -574,10 +604,9 @@ class MemoryManager:
                 )
                 if not changed:
                     raise RuntimeError("database_update_memory_fact_failed")
-                print(
-                    "[DATABASE] "
-                    f"action=update memory_id={existing_memory.id} "
-                    f"fact_id={matching.id}"
+                logger.debug(
+                    "[DATABASE] action=update memory_id=%s fact_id=%s",
+                    existing_memory.id, matching.id,
                 )
                 if new_memory.content != existing_memory.content:
                     self.database.update_memory_content(
@@ -621,10 +650,10 @@ class MemoryManager:
             refreshed_memory = self.database.get_memory(existing_memory.id)
             if refreshed_memory is not None:
                 existing_memory.__dict__.update(refreshed_memory.__dict__)
-        print(
-            "[DATABASE] "
-            f"action=reinforce memory_id={existing_memory.id} "
-            f"fact_id={matching_fact.id}"
+        logger.debug(
+            "[DATABASE] action=reinforce memory_id=%s fact_id=%s",
+            existing_memory.id,
+            matching_fact.id,
         )
         return {
             "action": "reinforce",
@@ -818,11 +847,11 @@ class MemoryManager:
         if reasoning_result is None:
             return self.ignore_memory(new_memory)
         operation = getattr(reasoning_result, "memory_operation", "none")
-        print(
-            "[DECISION] "
-            f"operation={operation} "
-            f"existing_memory_id={getattr(reasoning_result, 'existing_memory_id', None)} "
-            f"matching_fact_id={getattr(reasoning_result, 'matching_fact_id', None)}"
+        logger.debug(
+            "[DECISION] operation=%s existing_memory_id=%s matching_fact_id=%s",
+            operation,
+            getattr(reasoning_result, "existing_memory_id", None),
+            getattr(reasoning_result, "matching_fact_id", None),
         )
         matching_fact = None
         if existing_memory is not None and new_memory.facts:
@@ -851,10 +880,10 @@ class MemoryManager:
             return self.reinforce_memory(existing_memory, matching_fact)
         if operation == "ignore":
             if existing_memory is not None:
-                print(
-                    "[DATABASE] "
-                    f"action=ignore memory_id={existing_memory.id} "
-                    f"fact_id={getattr(matching_fact, 'id', None)}"
+                logger.debug(
+                    "[DATABASE] action=ignore memory_id=%s fact_id=%s",
+                    existing_memory.id,
+                    getattr(matching_fact, "id", None),
                 )
             return self.ignore_memory(new_memory)
         return {"action": "error", "reason": "unknown_memory_operation", "operation": operation}

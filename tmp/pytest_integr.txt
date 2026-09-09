@@ -1,0 +1,92 @@
+.FFFF..F.F....F                                                          [100%]
+================================== FAILURES ===================================
+___________ TestBackendDetection.test_server_already_running_reused ___________
+tests\test_cognitive_integration.py:96: in test_server_already_running_reused
+    assert provider.initialize() is True
+E   assert False is True
+E    +  where False = initialize()
+E    +    where initialize = <brain.providers.local_llama_cpp_provider.LocalLlamaCppProvider object at 0x0000027E3C935BD0>.initialize
+_____________ TestBackendDetection.test_server_started_by_davios ______________
+tests\test_cognitive_integration.py:105: in test_server_started_by_davios
+    assert provider.initialize() is True
+E   assert False is True
+E    +  where False = initialize()
+E    +    where initialize = <brain.providers.local_llama_cpp_provider.LocalLlamaCppProvider object at 0x0000027E3C86F9D0>.initialize
+___________ TestBackendDetection.test_health_failing_reports_cause ____________
+tests\test_cognitive_integration.py:116: in test_health_failing_reports_cause
+    assert "nao respondeu" in provider.diagnostics["[HEALTH]"]
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   KeyError: '[HEALTH]'
+_____________ TestMemoryPipeline.test_memory_saved_and_recovered ______________
+tests\test_cognitive_integration.py:126: in test_memory_saved_and_recovered
+    assert "Davi" in result.response
+E   AssertionError: assert 'Davi' in 'Resposta fake.'
+E    +  where 'Resposta fake.' = ConversationResult(response='Resposta fake.', intent='question', memory_action='llm_recall', memories_used=[MemoryFact...esponse': 'Resposta fake.', 'current_topic': 'nome', 'last_intent': 'question', 'message_count': 2}, should_exit=False).response
+---------------------------- Captured stdout call -----------------------------
+EMOTION TEXT: meu nome e davi
+EMOTION CONTEXT: {'text': 'meu nome e davi', 'negation': False, 'negation_applies': False, 'negated_word': None, 'uncertain': False, 'temporal_words': []}
+[MATCH] existing_memory_id=None matching_fact_id=None target=nome old_relation=None new_relation=identity
+[DECISION] operation=create existing_memory_id=None matching_fact_id=None
+[OPERATION] action=create facts=1
+_____________ TestMemoryPipeline.test_working_on_statement_saved ______________
+tests\test_cognitive_integration.py:151: in test_working_on_statement_saved
+    facts = manager.database.find_active_preferences(family="working_on")
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: Database.find_active_preferences() got an unexpected keyword argument 'family'
+---------------------------- Captured stdout call -----------------------------
+EMOTION TEXT: estou trabalhando no netoptimizer
+EMOTION CONTEXT: {'text': 'estou trabalhando no netoptimizer', 'negation': False, 'negation_applies': False, 'negated_word': None, 'uncertain': False, 'temporal_words': []}
+[MATCH] existing_memory_id=None matching_fact_id=None target=netoptimizer old_relation=None new_relation=working_on
+[DECISION] operation=create existing_memory_id=None matching_fact_id=None
+[OPERATION] action=create facts=1
+____________ TestPromptIntegration.test_irrelevant_memory_excluded ____________
+tests\test_cognitive_integration.py:174: in test_irrelevant_memory_excluded
+    assert "pizza" not in prompt.lower()
+E   AssertionError: assert 'pizza' not in 'informacoes...fotossintese'
+E     
+E     'pizza' is contained here:
+E        gosta de pizza
+E     ?           +++++
+E       
+E       conversa recente:
+E       usuario: eu gosto de pizza...
+E     
+E     ...Full output truncated (5 lines hidden), use '-vv' to show
+---------------------------- Captured stdout call -----------------------------
+EMOTION TEXT: eu gosto de pizza
+EMOTION CONTEXT: {'text': 'eu gosto de pizza', 'negation': False, 'negation_applies': False, 'negated_word': None, 'uncertain': False, 'temporal_words': []}
+[MATCH] existing_memory_id=None matching_fact_id=None target=pizza old_relation=None new_relation=like
+[DECISION] operation=create existing_memory_id=None matching_fact_id=None
+[OPERATION] action=create facts=1
+_______ TestFallbackAndPersistence.test_memory_persists_across_restart ________
+tests\test_cognitive_integration.py:224: in test_memory_persists_across_restart
+    assert "Davi" in result.response
+E   AssertionError: assert 'Davi' in 'Resposta fake.'
+E    +  where 'Resposta fake.' = ConversationResult(response='Resposta fake.', intent='question', memory_action='llm_recall', memories_used=[MemoryFact...st_response': 'Resposta fake.', 'current_topic': '', 'last_intent': 'question', 'message_count': 1}, should_exit=False).response
+---------------------------- Captured stdout call -----------------------------
+EMOTION TEXT: meu nome e davi
+EMOTION CONTEXT: {'text': 'meu nome e davi', 'negation': False, 'negation_applies': False, 'negated_word': None, 'uncertain': False, 'temporal_words': []}
+[MATCH] existing_memory_id=None matching_fact_id=None target=nome old_relation=None new_relation=identity
+[DECISION] operation=create existing_memory_id=None matching_fact_id=None
+[OPERATION] action=create facts=1
+EMOTION TEXT: eu gosto de python
+EMOTION CONTEXT: {'text': 'eu gosto de python', 'negation': False, 'negation_applies': False, 'negated_word': None, 'uncertain': False, 'temporal_words': []}
+[MATCH] existing_memory_id=1 matching_fact_id=None target=python old_relation=None new_relation=like
+[DECISION] operation=add existing_memory_id=None matching_fact_id=None
+[MEMORY FLOW] operation=add existing_memory_id=1 new_fact=python/like matching_fact=None database_action=none
+[MEMORY FLOW] operation=add existing_memory_id=1 new_fact=python/like matching_fact=None database_action=add_memory_fact
+EMOTION TEXT: estou trabalhando no netoptimizer
+EMOTION CONTEXT: {'text': 'estou trabalhando no netoptimizer', 'negation': False, 'negation_applies': False, 'negated_word': None, 'uncertain': False, 'temporal_words': []}
+[MATCH] existing_memory_id=1 matching_fact_id=None target=netoptimizer old_relation=None new_relation=working_on
+[DECISION] operation=add existing_memory_id=None matching_fact_id=None
+[MEMORY FLOW] operation=add existing_memory_id=1 new_fact=netoptimizer/working_on matching_fact=None database_action=none
+[MEMORY FLOW] operation=add existing_memory_id=1 new_fact=netoptimizer/working_on matching_fact=None database_action=add_memory_fact
+=========================== short test summary info ===========================
+FAILED tests/test_cognitive_integration.py::TestBackendDetection::test_server_already_running_reused
+FAILED tests/test_cognitive_integration.py::TestBackendDetection::test_server_started_by_davios
+FAILED tests/test_cognitive_integration.py::TestBackendDetection::test_health_failing_reports_cause
+FAILED tests/test_cognitive_integration.py::TestMemoryPipeline::test_memory_saved_and_recovered
+FAILED tests/test_cognitive_integration.py::TestMemoryPipeline::test_working_on_statement_saved
+FAILED tests/test_cognitive_integration.py::TestPromptIntegration::test_irrelevant_memory_excluded
+FAILED tests/test_cognitive_integration.py::TestFallbackAndPersistence::test_memory_persists_across_restart
+7 failed, 8 passed in 0.85s

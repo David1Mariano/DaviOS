@@ -16,7 +16,7 @@
       }
     },
     "BALANCED": {
-      "description": "Computadores intermediarios (8-16 GB RAM, CPU moderna)",
+      "description": "Computadores intermediarios (8-16 GB RAM, CPU moderna). Default recomendado: Qwen3-4B Q4_K_M",
       "criteria": {
         "min_ram_total_gb": 8,
         "max_ram_total_gb": 24
@@ -26,7 +26,7 @@
       "generation": {
         "context_window": 2048,
         "max_tokens": 256,
-        "threads": 4,
+        "threads": 6,
         "gpu_layers": 0
       }
     },

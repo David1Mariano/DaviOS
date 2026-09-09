@@ -3,13 +3,19 @@
 psutil>=5.9            # RAM total/disponivel na deteccao de hardware
 
 # ---- OPCIONAL: cerebro local (LLM offline) --------------------------
-# O DaviOS funciona sem estes itens (modo regras). Para habilitar o
-# modelo local GGUF:
+# O DaviOS funciona sem estes itens (modo regras).
 #
-#   pip install llama-cpp-python
+# Backend PREFERIDO: llama.cpp standalone (binario pre-compilado).
+#   - NAO requer llama-cpp-python nem compilacao local.
+#   - Instale com: .venv\Scripts\python.exe scripts\setup_llama.py
+#   - Builds: Windows x64 CPU e Vulkan (AMD Radeon RX 6600).
+#   - O DaviOS conversa com llama-server.exe em 127.0.0.1 (IPC local).
 #
-# Para aceleracao de GPU (opcional):
-#   NVIDIA : build com CUDA  (CMAKE_ARGS="-DGGML_CUDA=on")
-#   AMD    : build com Vulkan ou ROCm/HIP (Radeon RX 6600 => Vulkan)
+# Backend ALTERNATIVO (fallback): llama-cpp-python (in-process).
+#   - Requer compilacao no Python 3.14 (pode ser problematica).
+#   - NVIDIA : build com CUDA (CMAKE_ARGS="-DGGML_CUDA=on")
+#   - AMD    : build com Vulkan ou ROCm/HIP
 #
-# Modelos GGUF nao sao distribuidos no repositorio: veja models/README.md
+# Modelos GGUF nao sao distribuidos no repositorio:
+#   - Baixe: .venv\Scripts\python.exe scripts\download_model.py
+#   - ou manualmente de Qwen/Qwen3-4B-GGUF -> models/balanced/

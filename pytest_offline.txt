@@ -1,0 +1,27 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.5, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\Davi\DaviOS\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Davi\DaviOS
+collecting ... collected 21 items
+
+tests/test_offline_backend.py::TestLlamaCppStandaloneProvider::test_name PASSED [  4%]
+tests/test_offline_backend.py::TestLlamaCppStandaloneProvider::test_backend_ausente_reports_false PASSED [  9%]
+tests/test_offline_backend.py::TestLlamaCppStandaloneProvider::test_modelo_ausente_false PASSED [ 14%]
+tests/test_offline_backend.py::TestLlamaCppStandaloneProvider::test_fake_provider_returns_text PASSED [ 19%]
+tests/test_offline_backend.py::TestLlamaCppStandaloneProvider::test_fake_provider_unload PASSED [ 23%]
+tests/test_offline_backend.py::TestLlamaCppStandaloneProvider::test_health_check_shape PASSED [ 28%]
+tests/test_offline_backend.py::TestLlamaBinaryDownloader::test_get_llama_bin_dir PASSED [ 33%]
+tests/test_offline_backend.py::TestLlamaBinaryDownloader::test_is_installed_false_when_missing PASSED [ 38%]
+tests/test_offline_backend.py::TestLlamaBinaryDownloader::test_is_installed_true_when_server_exists PASSED [ 42%]
+tests/test_offline_backend.py::TestLlamaBinaryDownloader::test_scan_binaries_detects_executables PASSED [ 47%]
+tests/test_offline_backend.py::TestLlamaBinaryDownloader::test_expected_binaries_defined PASSED [ 52%]
+tests/test_offline_backend.py::TestModelDownloaderOffline::test_downloader_detects_existing_complete PASSED [ 57%]
+tests/test_offline_backend.py::TestModelDownloaderOffline::test_downloader_detects_corrupted_size PASSED [ 61%]
+tests/test_offline_backend.py::TestModelDownloaderOffline::test_download_fails_offline_gracefully PASSED [ 66%]
+tests/test_offline_backend.py::TestModelDownloaderOffline::test_lock_prevents_duplicate_download PASSED [ 71%]
+tests/test_offline_backend.py::TestModelDownloaderOffline::test_lock_stale_is_reclaimed 
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+C:\Users\Davi\AppData\Local\Python\pythoncore-3.14-64\Lib\pathlib\__init__.py:442: KeyboardInterrupt
+(to show a full traceback on KeyboardInterrupt use --full-trace)
+============================= 15 passed in 0.42s ==============================

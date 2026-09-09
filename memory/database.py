@@ -110,6 +110,37 @@ class Database:
             )
             """
         )
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS style_profile (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                profile_json TEXT NOT NULL,
+                updated_at TEXT
+            )
+            """
+        )
+
+    def save_style_profile(self, profile_json: str, now: Optional[datetime | str] = None) -> None:
+        """Persiste o perfil de estilo (single-row upsert)."""
+        timestamp = self._now(now)
+        self.cursor.execute(
+            """
+            INSERT INTO style_profile (id, profile_json, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                profile_json = excluded.profile_json,
+                updated_at = excluded.updated_at
+            """,
+            (profile_json, timestamp),
+        )
+        self.connection.commit()
+
+    def load_style_profile(self) -> Optional[str]:
+        """Carrega o JSON do perfil de estilo persistido (ou None)."""
+        row = self.cursor.execute(
+            "SELECT profile_json FROM style_profile WHERE id = 1"
+        ).fetchone()
+        return row["profile_json"] if row else None
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {

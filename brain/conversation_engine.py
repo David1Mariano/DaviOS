@@ -82,6 +82,13 @@ class ConversationEngine:
         self.cognitive_core = cognitive_core
         self.classifier = IntentClassifier()
         self.context = ConversationContext()
+        # Garante que o nucleo cognitivo compartilhe o mesmo sistema de
+        # memoria: sem isso o CognitiveCore nunca recupera fatos.
+        if (
+            self.cognitive_core is not None
+            and getattr(self.cognitive_core, "memory_manager", None) is None
+        ):
+            self.cognitive_core.memory_manager = self.memory_manager
 
     def process(self, user_input: str) -> ConversationResult:
         """Processa uma mensagem do usuario."""
@@ -93,6 +100,10 @@ class ConversationEngine:
             )
 
         normalized = text.lower().rstrip("!.?")
+
+        # Atualiza o perfil de estilo com cada mensagem do usuario,
+        # antes de qualquer roteamento. Falhas sao silenciosas.
+        self._update_style_profile(text)
 
         if self._is_exit_command(normalized):
             return ConversationResult(
@@ -157,6 +168,27 @@ class ConversationEngine:
         return first_word in starters
 
     def _handle_question(self, text: str) -> ConversationResult:
+        """Perguntas de memoria: LLM com fatos recuperados; regras como fallback."""
+        if self.cognitive_core is not None and self._llm_ready():
+            try:
+                outcome = self.cognitive_core.generate_response(
+                    text, context=self.context, intent=Intent.MEMORY_QUERY
+                )
+                response = self._apply_style(outcome["text"])
+                self.context.add_message(text, response, "question")
+                return ConversationResult(
+                    response=response,
+                    intent="question",
+                    memory_action="llm_recall",
+                    memories_used=outcome.get("memories_used", []),
+                    context=self.context.to_dict(),
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("davios.conversation").warning(
+                    "[LLM] falha ao responder pergunta; usando regras", exc_info=True
+                )
         response, memories_used = self.response_generator.answer_question(
             text, self.memory_manager, self.context
         )
@@ -176,7 +208,7 @@ class ConversationEngine:
                 outcome = self.cognitive_core.generate_response(
                     text, context=self.context, intent=intent
                 )
-                response = outcome["text"]
+                response = self._apply_style(outcome["text"])
                 memories_used = outcome.get("memories_used", [])
                 self.context.add_message(text, response, intent.value)
                 return ConversationResult(
@@ -224,6 +256,26 @@ class ConversationEngine:
         except Exception:
             return False
 
+    def _apply_style(self, text: str) -> str:
+        """Aplica substituicoes de estilo apos a geracao do LLM.
+
+        Qualquer falha no manager nunca quebra a resposta.
+        """
+        try:
+            return self.memory_manager.apply_style(text)
+        except Exception:
+            return text
+
+    def _update_style_profile(self, text: str) -> None:
+        """Atualiza e persiste o perfil de estilo com a mensagem do usuario.
+
+        Falhas sao silenciosas para nao interromper a conversa.
+        """
+        try:
+            self.memory_manager.update_style_profile(text)
+        except Exception:
+            pass
+
 
     def _handle_statement(self, text: str) -> ConversationResult:
         intent = self.classifier.classify(text)
@@ -238,7 +290,7 @@ class ConversationEngine:
                     outcome = self.cognitive_core.generate_response(
                         text, context=self.context, intent=intent
                     )
-                    response = outcome["text"]
+                    response = self._apply_style(outcome["text"])
                     self.context.add_message(text, response, intent.value)
                     return ConversationResult(
                         response=response,
@@ -258,6 +310,8 @@ class ConversationEngine:
                 context=self.context.to_dict(),
             )
 
+        # A memoria e salva ANTES de gerar a resposta: assim o modelo pode
+        # usar a informacao recem-fornecida via bloco de fatos novos.
         memory = Memory(
             content=text,
             memory_type="preference" if interpretation.get("memory_candidate") else "episodic",
@@ -283,6 +337,34 @@ class ConversationEngine:
             new_memory=memory,
             existing_memory=match["existing_memory"],
         )
+
+        # Resposta natural via LLM usando os fatos recem-salvos; o gerador
+        # por regras permanece como fallback deterministico.
+        if self.cognitive_core is not None and self._llm_ready():
+            try:
+                outcome = self.cognitive_core.generate_response(
+                    text,
+                    context=self.context,
+                    intent=decision.intent,
+                    new_facts=memory.facts,
+                )
+                response = self._apply_style(outcome["text"])
+                self.context.add_message(text, response, decision.intent)
+                if memory.facts:
+                    self.context.current_topic = memory.facts[0].target
+                return ConversationResult(
+                    response=response,
+                    intent=decision.intent,
+                    memory_action=result.get("action", "none"),
+                    memories_used=outcome.get("memories_used", []),
+                    context=self.context.to_dict(),
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("davios.conversation").warning(
+                    "[LLM] falha apos salvar memoria; usando regras", exc_info=True
+                )
 
         response = self.response_generator.generate_from_memory_result(
             result, decision, text, self.context

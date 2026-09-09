@@ -1,0 +1,29 @@
+........................................................................ [ 56%]
+..............................................F..
+================================== FAILURES ===================================
+______ TestModelDownloaderOffline.test_downloader_detects_corrupted_size ______
+
+self = <tests.test_offline_backend.TestModelDownloaderOffline object at 0x0000017761009590>
+tmp_path = WindowsPath('C:/Users/Davi/AppData/Local/Temp/pytest-of-Davi/pytest-8/test_downloader_detects_corrup0')
+
+    def test_downloader_detects_corrupted_size(self, tmp_path):
+        dl = ModelDownloader(max_retries=1)
+        dest = tmp_path / "model.gguf"
+        self._make_file(dest, 50)
+        result = dl.download(
+            url="http://127.0.0.1:1/nonexistent.gguf",
+            dest_path=dest,
+            expected_size=100,
+        )
+        # Tamanho errado -> tenta baixar -> falha (sem rede)
+>       assert result.success is False
+E       AssertionError: assert True is False
+E        +  where True = DownloadResult(success=True, file_path='C:\\Users\\Davi\\AppData\\Local\\Temp\\pytest-of-Davi\\pytest-8\\test_downloader_detects_corrup0\\model.gguf', size_bytes=50, sha256=None, error='', attempts=0, resumed=False).success
+
+tests\test_offline_backend.py:159: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_offline_backend.py::TestModelDownloaderOffline::test_downloader_detects_corrupted_size
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+C:\Users\Davi\AppData\Local\Python\pythoncore-3.14-64\Lib\pathlib\__init__.py:442: KeyboardInterrupt
+(to show a full traceback on KeyboardInterrupt use --full-trace)
+1 failed, 120 passed in 19.76s

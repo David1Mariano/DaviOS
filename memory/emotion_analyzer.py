@@ -1,3 +1,8 @@
+import logging
+
+logger = logging.getLogger("davios.memory.emotion")
+
+
 class EmotionAnalyzer:
 
     def analyze(self, text, context):
@@ -5,8 +10,7 @@ class EmotionAnalyzer:
         text = text.lower()
         context = context or {}
 
-        print(f"EMOTION TEXT: {text}")
-        print(f"EMOTION CONTEXT: {context}")
+        logger.debug("[EMOTION] text=%s context=%s", text, context)
         if any(word in text.split() for word in ("odeio", "detesto")):
             return {
                 "emotion": "dislike",

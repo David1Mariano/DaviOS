@@ -1,0 +1,11 @@
+﻿.venv\Scripts\python.exe : Traceback (most recent call last):
+No linha:1 caractere:26
++ ... avi\DaviOS; .venv\Scripts\python.exe scripts/test_e2e_qwen.py 2>&1 |  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteExceptio 
+   n
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\Davi\DaviOS\scripts\test_e2e_qwen.py", line 13, in <module>
+    from config.davios_config import DaviosConfig
+ModuleNotFoundError: No module named 'config'

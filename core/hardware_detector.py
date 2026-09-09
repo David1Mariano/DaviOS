@@ -103,12 +103,23 @@ def _run_command(cmd: list[str], timeout: float = 5.0) -> Optional[str]:
 
 
 def detect_inference_backend() -> str:
-    """Descobre se existe backend de inferência local instalado.
+    """Descobre se existe backend de inferencia local instalado.
 
-    llama_cpp (GGUF) roda in-process, funciona em CPU e aceita offload de
-    GPU opcional. Retorna "none" quando nada está instalado — o DaviOS
-    continua funcionando em modo regras.
+    Prioriza o backend standalone do llama.cpp (llama-server.exe em
+    bin/llama.cpp/). Se nao, verifica llama-cpp-python (in-process).
+    Retorna "none" quando nada esta instalado — o DaviOS continua em
+    modo regras.
     """
+    # 1. llama.cpp standalone (bin/llama.cpp/llama-server.exe)
+    try:
+        from utils.llama_binary_downloader import get_llama_bin_dir
+
+        if (get_llama_bin_dir() / "llama-server.exe").exists():
+            return "llama_cpp_standalone"
+    except Exception:
+        pass
+
+    # 2. llama-cpp-python (in-process)
     try:
         import llama_cpp  # type: ignore  # noqa: F401
 

@@ -69,7 +69,10 @@ class TestHardwareDetector:
 def _write_gguf(directory, name, size_mb=10):
     path = os.path.join(directory, name)
     with open(path, "wb") as f:
-        f.write(b"\0" * (size_mb * 1024 * 1024))
+        # Escreve em chunks de 1 MB para evitar MemoryError
+        chunk = b"\0" * (1024 * 1024)
+        for _ in range(size_mb):
+            f.write(chunk)
     return path
 
 
@@ -147,7 +150,8 @@ class TestModelSelection:
         assert selection.model.tier == "light"
 
     def test_incompatible_model_rejected(self, config_with_models, models_tree):
-        _write_gguf(models_tree / "balanced", "huge-Q4_K_M.gguf", size_mb=4600)
+        # Modelo de 800 MB e incompativel com 1 GB RAM disponivel (precisa ~1.1 GB)
+        _write_gguf(models_tree / "balanced", "huge-Q4_K_M.gguf", size_mb=800)
         hardware = HardwareProfile(ram_total_gb=8.0, ram_available_gb=1.0, cpu_cores=4)
         selection = ModelManager(config_with_models).select_model(hardware)
         assert selection.model is None

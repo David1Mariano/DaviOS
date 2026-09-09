@@ -17,6 +17,17 @@ class DaviosConfig:
     offline_mode: bool = True
     network_policy: str = "offline"
     backend: str = "llama_cpp"
+    # --- Parte B: capacidades opt-in (todas deshabilitadas por defecto) ---
+    # actions: permitir ejecutar comandos de una allowlist explicita.
+    # web_enabled: permitir solicitudes HTTP salientes (requiere offline_mode=False).
+    # agent_server_enabled: levantar socket local para orquestar agentes externos.
+    actions_enabled: bool = False
+    web_enabled: bool = False
+    agent_server_enabled: bool = False
+    web_timeout_seconds: float = 5.0
+    web_max_content_bytes: int = 200_000
+    agent_server_host: str = "127.0.0.1"
+    agent_server_port: int = 8765
     models_dir: str = "models"
     profiles_file: str = "model_profiles.json"
     profile_override: Optional[str] = None  # LIGHT/BALANCED/PERFORMANCE

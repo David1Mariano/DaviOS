@@ -1,0 +1,5 @@
+...............
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+C:\Users\Davi\AppData\Local\Python\pythoncore-3.14-64\Lib\pathlib\__init__.py:442: KeyboardInterrupt
+(to show a full traceback on KeyboardInterrupt use --full-trace)
+15 passed in 4.52s

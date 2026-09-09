@@ -1,10 +1,10 @@
 """Script: baixa e instala o llama.cpp standalone.
 
 Uso:
-    .venv\Scripts\python.exe scripts\setup_llama.py [--cpu]
+    .venv\\Scripts\\python.exe scripts\\setup_llama.py [--cpu]
 
-O binário é instalado em bin/llama.cpp/.
-Se já instalado, não faz nada.
+O binario e instalado em bin/llama.cpp/.
+Se ja instalado, nao faz nada.
 """
 
 from __future__ import annotations

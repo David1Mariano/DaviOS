@@ -22,6 +22,9 @@ models/**/*.gguf
 models/**/*.bin
 models/**/cache/
 *.cache/
+*.part
+*.lock
+bin/
 
 # Backups do banco
 memory.db.backup*

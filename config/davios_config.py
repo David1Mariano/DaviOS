@@ -24,6 +24,10 @@ class DaviosConfig:
     actions_enabled: bool = False
     web_enabled: bool = False
     agent_server_enabled: bool = False
+    # C3: o LLM SABE que ferramentas existem (listagem informativa no prompt).
+    # NÃO significa que ele possa EXECUTÁ-LAS — para isso veja actions_enabled
+    # e web_enabled. Nenhum mecanismo de chamada existe nesta etapa.
+    tools_visible_to_llm: bool = False
     web_timeout_seconds: float = 5.0
     web_max_content_bytes: int = 200_000
     agent_server_host: str = "127.0.0.1"

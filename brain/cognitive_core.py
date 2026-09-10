@@ -18,6 +18,8 @@ from typing import Any, Optional
 from brain.intent_classifier import Intent, IntentClassifier
 from brain.llm_provider import LLMProvider, LLMRequest, LLMUnavailableError
 from brain.prompt_builder import PromptBuilder
+from brain.tool_execution_flow import ToolExecutionOrchestrator
+from brain.tool_registry import ToolRouter
 from config.davios_config import DaviosConfig
 from personality.personality import DEFAULT_PERSONALITY
 
@@ -41,6 +43,7 @@ class CognitiveCore:
         config: Optional[DaviosConfig] = None,
         prompt_builder: Optional[PromptBuilder] = None,
         memory_manager=None,
+        tool_router: Optional[ToolRouter] = None,
     ):
         self.config = config or DaviosConfig.load()
         self.llm_provider = llm_provider
@@ -49,6 +52,11 @@ class CognitiveCore:
         )
         self.memory_manager = memory_manager
         self.classifier = IntentClassifier()
+        # C5: loop de ferramentas. Inerte quando tools_visible_to_llm=False
+        # (padrão) ou sem router injetado — o fluxo é idêntico ao pré-C5.
+        self.tool_flow = ToolExecutionOrchestrator(
+            self.config, tool_router=tool_router
+        )
 
     # ------------------------------------------------------------------
 
@@ -110,12 +118,46 @@ class CognitiveCore:
         logger.info("[LLM] generation_started provider=%s", self.llm_provider.name)
         response = self.llm_provider.generate(request)
         logger.info("[LLM] generation_completed backend=%s", response.backend)
+
+        # C5: fechamento do loop de ferramentas — apenas quando
+        # tools_visible_to_llm=True E router injetado. Com a flag off o
+        # fluxo é idêntico ao pré-C5 (uma única chamada ao LLM).
+        if self.tool_flow.is_enabled():
+            outcome = self.tool_flow.handle_first_response(
+                response.text,
+                original_prompt=built.prompt,
+                original_system=built.system,
+                run_llm=self._run_followup_llm,
+            )
+            return {
+                "text": outcome.final_text,
+                "intent": intent_value,
+                "memories_used": memories,
+                "llm": response.to_dict(),
+                "tool_flow": outcome.to_dict(),
+            }
+
         return {
             "text": response.text,
             "intent": intent_value,
             "memories_used": memories,
             "llm": response.to_dict(),
         }
+
+    def _run_followup_llm(self, prompt: str, system: str) -> str:
+        """Segunda chamada ao LLM dentro do ciclo de ferramentas (C5).
+
+        Pode lançar LLMUnavailableError — o orquestrador degrada
+        graciosamente nesse caso (não derruba a conversa).
+        """
+        request = LLMRequest(
+            prompt=prompt,
+            system=system,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
+        )
+        response = self.llm_provider.generate(request)
+        return response.text
 
     # ------------------------------------------------------------------
     # Recuperação de memórias relevantes (simples, extensível a RAG)

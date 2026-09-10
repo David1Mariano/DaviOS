@@ -67,7 +67,26 @@ def build_engine(config: DaviosConfig):
 
     from brain.cognitive_core import CognitiveCore
 
-    cognitive = CognitiveCore(llm_provider=provider, config=config)
+    # C5 (mudança mínima): registry + router das ferramentas, respeitando as
+    # flags já existentes. O loop de execução só fica ativo quando
+    # config.tools_visible_to_llm=True; com o padrão (False) o comportamento
+    # é exatamente o de antes. O registro em si não habilita execução — a
+    # REGRA DE OURO checa actions_enabled/web_enabled por categoria.
+    from brain.action_manager import ActionManager
+    from brain.tool_adapters import register_default_tools
+    from brain.tool_registry import ToolRegistry, ToolRouter
+    from brain.web_access import WebAccess
+
+    tools_registry = ToolRegistry()
+    register_default_tools(
+        tools_registry,
+        action_manager=ActionManager(enabled=config.actions_enabled),
+        web_access=WebAccess(enabled=config.web_enabled),
+    )
+
+    cognitive = CognitiveCore(
+        llm_provider=provider, config=config, tool_router=ToolRouter(tools_registry)
+    )
 
     # O MemoryManager do engine e compartilhado com o CognitiveCore no
     # construtor do engine — memória persistente disponível ao LLM.

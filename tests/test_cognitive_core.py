@@ -13,6 +13,7 @@ from brain.intent_classifier import Intent, IntentClassifier
 from brain.llm_provider import LLMProvider, LLMRequest, LLMResponse
 from brain.prompt_builder import PromptBuilder
 from brain.providers.local_llm_provider import LocalLLMProvider
+from brain.tool_registry import Tool, ToolRegistry, ToolRouter
 from config.davios_config import DaviosConfig
 from memory.memory_manager import MemoryManager
 
@@ -108,7 +109,9 @@ class TestIntentClassifier:
 
 class TestPromptBuilder:
     def test_system_includes_personality_and_rules(self):
-        built = PromptBuilder().build("oi", memories=[])
+        # Usa DaviosConfig() (defaults) em vez de .load() (que lê davios.json)
+        # para não depender do estado do arquivo de config do usuário.
+        built = PromptBuilder(DaviosConfig()).build("oi", memories=[])
         assert "DaviOS" in built.system
         assert "nao pode executar comandos" in built.system or "comandos" in built.system
 
@@ -118,7 +121,7 @@ class TestPromptBuilder:
             relation = "dislike"
             negation = True
 
-        built = PromptBuilder().build("o que eu gosto?", memories=[Fact()])
+        built = PromptBuilder(DaviosConfig()).build("o que eu gosto?", memories=[Fact()])
         assert "pizza" in built.prompt
 
     def test_name_memory_formatted(self):
@@ -128,7 +131,7 @@ class TestPromptBuilder:
             value = "Davi"
             negation = False
 
-        built = PromptBuilder().build("qual e meu nome?", memories=[Fact()])
+        built = PromptBuilder(DaviosConfig()).build("qual e meu nome?", memories=[Fact()])
         assert "Davi" in built.prompt
 
     def test_history_included(self):
@@ -136,7 +139,7 @@ class TestPromptBuilder:
 
         context = ConversationContext()
         context.add_message("estou estudando Python", "Legal!", "conversation")
-        built = PromptBuilder().build("interfaces", context=context)
+        built = PromptBuilder(DaviosConfig()).build("interfaces", context=context)
         assert "estudando Python" in built.prompt
         assert "interfaces" in built.prompt
 
@@ -324,5 +327,83 @@ class TestOfflineMode:
         outcome = core.generate_response("converse comigo")
         assert outcome["text"] == "ok offline"
         manager.database.close()
+
+
+# ---------------------------------------------------------------------------
+# C5 + Correção: tools_registry chega ao PromptBuilder no fluxo real
+# ---------------------------------------------------------------------------
+
+
+class TestToolsRegistryReachesPromptBuilder:
+    """Testes de integração que confirmam que o tools_registry populado
+    no main.py chega de fato ao PromptBuilder.build() via CognitiveCore."""
+
+    def test_flag_off_prompt_has_no_tools_section(self, temp_db):
+        """Flag off → prompt final NÃO contém seção de ferramentas (regressão)."""
+        config = DaviosConfig.load()
+        config.tools_visible_to_llm = False
+        provider = FakeLLMProvider("Resposta normal.")
+        reg = ToolRegistry()
+        reg.register(Tool(name="echo", description="Repete texto.", arguments=["args"]))
+        router = ToolRouter(reg)
+        core = CognitiveCore(llm_provider=provider, config=config, tool_router=router)
+        core.memory_manager = MemoryManager(db_path=temp_db)
+        outcome = core.generate_response("oi")
+        assert "FERRAMENTAS DISPONIVEIS" not in outcome["text"]
+        assert outcome["text"] == "Resposta normal."
+        core.memory_manager.database.close()
+
+    def test_flag_on_prompt_contains_tools_section(self, temp_db):
+        """Flag on + registry configurado → prompt final CONTÉM a seção."""
+        config = DaviosConfig.load()
+        config.tools_visible_to_llm = True
+        provider = FakeLLMProvider("Resposta com ferramentas.")
+        reg = ToolRegistry()
+        reg.register(Tool(name="echo", description="Repete texto.", arguments=["args"]))
+        reg.register(Tool(name="time", description="Mostra a hora."))
+        router = ToolRouter(reg)
+        core = CognitiveCore(llm_provider=provider, config=config, tool_router=router)
+        core.memory_manager = MemoryManager(db_path=temp_db)
+        outcome = core.generate_response("que horas sao?")
+        # A seção de ferramentas deve estar no prompt enviado ao LLM
+        prompt_enviado = provider.calls[0].prompt
+        assert "FERRAMENTAS DISPONIVEIS" in prompt_enviado
+        assert "- echo: Repete texto. (argumentos: args)" in prompt_enviado
+        assert "- time: Mostra a hora. (sem argumentos)" in prompt_enviado
+        core.memory_manager.database.close()
+
+    def test_no_router_means_no_tools_section_safe_degradation(self, temp_db):
+        """Sem tool_router (ex: testes antigos) → não quebra, sem seção."""
+        config = DaviosConfig.load()
+        config.tools_visible_to_llm = True
+        provider = FakeLLMProvider("Resposta sem tools.")
+        core = CognitiveCore(llm_provider=provider, config=config)
+        core.memory_manager = MemoryManager(db_path=temp_db)
+        outcome = core.generate_response("oi")
+        # Sem router, tools_registry é None → seção não aparece, mas não quebra
+        prompt_enviado = provider.calls[0].prompt
+        assert "FERRAMENTAS DISPONIVEIS" not in prompt_enviado
+        assert outcome["text"] == "Resposta sem tools."
+        core.memory_manager.database.close()
+
+    def test_same_registry_instance_used_by_router_and_prompt_builder(self, temp_db):
+        """O MESMO objeto ToolRegistry usado pelo ToolRouter é o que chega
+        ao PromptBuilder — não há instâncias divergentes."""
+        config = DaviosConfig.load()
+        config.tools_visible_to_llm = True
+        provider = FakeLLMProvider("Resposta.")
+        reg = ToolRegistry()
+        reg.register(Tool(name="echo", description="Repete texto.", arguments=["args"]))
+        router = ToolRouter(reg)
+        core = CognitiveCore(llm_provider=provider, config=config, tool_router=router)
+        core.memory_manager = MemoryManager(db_path=temp_db)
+        # Confirma que o registry do CognitiveCore é o mesmo objeto do router
+        assert core.tools_registry is router.registry
+        assert core.tools_registry is reg
+        core.generate_response("oi")
+        # E que o prompt_builder recém-instanciado recebeu o registry
+        prompt_enviado = provider.calls[0].prompt
+        assert "FERRAMENTAS DISPONIVEIS" in prompt_enviado
+        core.memory_manager.database.close()
 
 

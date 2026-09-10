@@ -57,6 +57,10 @@ class CognitiveCore:
         self.tool_flow = ToolExecutionOrchestrator(
             self.config, tool_router=tool_router
         )
+        # Reaproveita o MESMO registry usado pelo ToolRouter (sem duplicar).
+        # Com tool_router=None (ex: testes antigos), registry fica None e a
+        # seção de ferramentas simplesmente não aparece — degrada com segurança.
+        self.tools_registry = tool_router.registry if tool_router else None
 
     # ------------------------------------------------------------------
 
@@ -101,6 +105,12 @@ class CognitiveCore:
             resolved_context=resolved_context,
             new_facts=new_facts,
             style_profile=self._current_style_profile(),
+            tools_registry=self.tools_registry,
+        )
+        logger.info(
+            "[LLM] prompt_has_tools_section=%s prompt_len=%d",
+            "FERRAMENTAS DISPONIVEIS" in built.prompt,
+            len(built.prompt),
         )
         logger.info(
             "[CONTEXT] recent_messages=%d memories=%d new_facts=%d",
@@ -118,6 +128,7 @@ class CognitiveCore:
         logger.info("[LLM] generation_started provider=%s", self.llm_provider.name)
         response = self.llm_provider.generate(request)
         logger.info("[LLM] generation_completed backend=%s", response.backend)
+        logger.info("[LLM] raw_response text=%r", response.text)
 
         # C5: fechamento do loop de ferramentas — apenas quando
         # tools_visible_to_llm=True E router injetado. Com a flag off o

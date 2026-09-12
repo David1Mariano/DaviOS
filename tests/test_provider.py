@@ -26,6 +26,8 @@ def mock_config():
     config.context_window = 2048
     config.gpu_layers = 0
     config.temperature = 0.7
+    config.repeat_penalty = 1.3
+    config.repeat_last_n = 256
     config.models_dir = str(ROOT / "models")
     return config
 
@@ -112,6 +114,123 @@ class TestGenerate:
             assert response.text == "Ola! Sou o DaviOS."
             assert response.provider == "local_llama_cpp"
             assert response.tokens_generated == 10
+
+    def test_generate_payload_includes_repeat_defaults(
+        self, mock_config, mock_selection
+    ):
+        """Payload inclui os sampling defaults do config quando o request nao
+        os especifica: repeat_penalty=1.3 e repeat_last_n=256."""
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(
+                config=mock_config,
+                selection=mock_selection,
+            )
+        provider._initialized = True
+        provider._available = True
+        provider._backend_used = "cpu"
+
+        mock_response = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 1},
+        }
+
+        with patch("brain.providers.local_llama_cpp_provider.url_request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_response).encode()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            request = LLMRequest(prompt="Ola!", max_tokens=64)
+            provider.generate(request)
+
+        sent_request = mock_urlopen.call_args[0][0]
+        payload = json.loads(sent_request.data.decode("utf-8"))
+        assert payload["repeat_penalty"] == 1.3
+        assert payload["repeat_last_n"] == 256
+
+    def test_generate_repeat_params_explicit_overrides_config(
+        self, mock_config, mock_selection
+    ):
+        """Valores explicitos em LLMRequest sobrepoem os defaults do config."""
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(
+                config=mock_config,
+                selection=mock_selection,
+            )
+        provider._initialized = True
+        provider._available = True
+        provider._backend_used = "cpu"
+
+        mock_response = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 1},
+        }
+
+        with patch("brain.providers.local_llama_cpp_provider.url_request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_response).encode()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            request = LLMRequest(
+                prompt="Ola!", max_tokens=64,
+                repeat_penalty=1.5, repeat_last_n=512,
+            )
+            provider.generate(request)
+
+        sent_request = mock_urlopen.call_args[0][0]
+        payload = json.loads(sent_request.data.decode("utf-8"))
+        assert payload["repeat_penalty"] == 1.5
+        assert payload["repeat_last_n"] == 512
+
+    def test_external_server_reports_real_loaded_model(
+        self, mock_config, mock_selection
+    ):
+        """Com servidor ja ativo, o nome do modelo exibido vem da consulta
+        real ao servidor, nao da selecao teorica (que aponta p/ qwen2.5)."""
+        mock_selection.model.name = "qwen2.5-1.5b-instruct-q4_k_m"
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(
+                config=mock_config,
+                selection=mock_selection,
+            )
+        real_path = r"C:\Users\Davi\DaviOS\models\balanced\Qwen3-4B-Q4_K_M.gguf"
+        with patch.object(
+                provider, "_find_server_exe",
+                return_value=Path("bin/llama.cpp/llama-server.exe")), \
+                patch.object(provider, "_check_existing_server",
+                             return_value=True), \
+                patch.object(provider, "_query_loaded_model",
+                             return_value=real_path):
+            assert provider.initialize() is True
+        assert provider.diagnostics["[MODEL]"] == (
+            "Qwen3-4B-Q4_K_M.gguf (carregado no servidor externo)."
+        )
+        assert provider.health_check()["model"] == "Qwen3-4B-Q4_K_M.gguf"
+
+    def test_external_server_unknown_model_does_not_guess(
+        self, mock_config, mock_selection
+    ):
+        """Se nao for possivel obter o nome real, loga aviso explicito e nao
+        exibe um nome teorico como se fosse certeza."""
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(
+                config=mock_config,
+                selection=mock_selection,
+            )
+        with patch.object(
+                provider, "_find_server_exe",
+                return_value=Path("bin/llama.cpp/llama-server.exe")), \
+                patch.object(provider, "_check_existing_server",
+                             return_value=True), \
+                patch.object(provider, "_query_loaded_model",
+                             return_value=None):
+            assert provider.initialize() is True
+        assert "desconocido" in provider.diagnostics["[MODEL]"]
+        assert "nao verificado" in provider.diagnostics["[MODEL]"]
+        assert provider.health_check()["model"] == "test-model"
 
     def test_generate_timeout(self, mock_config, mock_selection):
         """Testa timeout na geracao."""

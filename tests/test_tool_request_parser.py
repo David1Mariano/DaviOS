@@ -26,6 +26,7 @@ from brain.tool_request_parser import (
     ToolRequestParseResult,
     extract_all_requests,
     parse_tool_request,
+    sanitize_response_text,
 )
 
 
@@ -349,3 +350,167 @@ def test_marker_case_sensitive_uppercase_only():
     result = parse_tool_request(text)
     assert result.found is False
     assert result.error == ""
+
+
+# ---------------------------------------------------------------------------
+# C6 — Sanitização de blocos residuais
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_no_block_returns_unchanged():
+    """Texto sem nenhum bloco → retorna inalterado."""
+    text = "Oi, tudo bem? Esta é uma resposta normal."
+    assert sanitize_response_text(text) == text
+
+
+def test_sanitize_removes_complete_block_in_middle():
+    """Texto com bloco completo no meio → bloco removido, texto ao redor preservado."""
+    text = (
+        "Vou verificar.\n"
+        "<<<TOOL_REQUEST>>>\n"
+        '{"tool": "time", "arguments": {}}\n'
+        "<<<END_TOOL_REQUEST>>>\n"
+        "Pronto, verifiquei."
+    )
+    result = sanitize_response_text(text)
+    assert "<<<TOOL_REQUEST>>>" not in result
+    assert "<<<END_TOOL_REQUEST>>>" not in result
+    assert "Vou verificar." in result
+    assert "Pronto, verifiquei." in result
+
+
+def test_sanitize_only_block_returns_fallback():
+    """Texto que é SÓ o bloco → fallback aplicado."""
+    text = (
+        "<<<TOOL_REQUEST>>>\n"
+        '{"tool": "echo", "arguments": {"args": "oi"}}\n'
+        "<<<END_TOOL_REQUEST>>>"
+    )
+    result = sanitize_response_text(text)
+    assert result == "Desculpe, nao consegui formular uma resposta."
+
+
+def test_sanitize_malformed_block_opening_without_closing():
+    """Bloco malformado (sem fechamento): remove do START_MARKER em diante."""
+    text = (
+        "Texto antes.\n"
+        "<<<TOOL_REQUEST>>>\n"
+        '{"tool": "echo"'
+    )
+    result = sanitize_response_text(text)
+    assert "<<<TOOL_REQUEST>>>" not in result
+    assert "Texto antes." in result
+    # O texto após o marker foi removido (comportamento defensivo).
+    assert '{"tool": "echo"' not in result
+
+
+def test_sanitize_preserves_surrounding_text():
+    """Texto ao redor do bloco é preservado integralmente."""
+    text = (
+        "Início da resposta.\n\n"
+        "<<<TOOL_REQUEST>>>\n"
+        '{"tool": "datetime", "arguments": {}}\n'
+        "<<<END_TOOL_REQUEST>>>\n\n"
+        "Fim da resposta."
+    )
+    result = sanitize_response_text(text)
+    assert result == "Início da resposta.\n\nFim da resposta."
+
+
+def test_sanitize_tolerates_absurd_inputs():
+    """Nunca lança exceção, mesmo com entradas absurdas."""
+    assert sanitize_response_text(None) == "Desculpe, nao consegui formular uma resposta."
+    assert sanitize_response_text(12345) == "Desculpe, nao consegui formular uma resposta."
+    assert sanitize_response_text(b"bytes validos") == "bytes validos"
+    assert sanitize_response_text("") == "Desculpe, nao consegui formular uma resposta."
+
+
+def test_sanitize_multiple_blocks_all_removed():
+    """Múltiplos blocos no mesmo texto → todos removidos."""
+    text = (
+        "Antes.\n"
+        "<<<TOOL_REQUEST>>>{\"tool\": \"a\"}<<<END_TOOL_REQUEST>>>\n"
+        "Meio.\n"
+        "<<<TOOL_REQUEST>>>{\"tool\": \"b\"}<<<END_TOOL_REQUEST>>>\n"
+        "Depois."
+    )
+    result = sanitize_response_text(text)
+    assert "<<<TOOL_REQUEST>>>" not in result
+    assert "<<<END_TOOL_REQUEST>>>" not in result
+    assert "Antes." in result
+    assert "Meio." in result
+    result = sanitize_response_text(text)
+    assert "<<<TOOL_REQUEST>>>" not in result
+    assert "<<<END_TOOL_REQUEST>>>" not in result
+    assert "Antes." in result
+    assert "Meio." in result
+    assert "Depois." in result
+
+
+# =====================================================================
+# Variante invertida do marcador (bug real do Qwen3: ">>>TOOL_REQUEST>>>")
+# =====================================================================
+
+
+def test_inverted_opening_marker_parsed():
+    """Qwen3 emitiu '>>>TOOL_REQUEST>>>' (abertura invertida): o parser deve
+    reconhecer como tentativa de tool (a intencao e inequivoca)."""
+    text = '>>>TOOL_REQUEST>>>\n{"tool": "time"}\n<<<END_TOOL_REQUEST>>>'
+    parsed = parse_tool_request(text)
+    assert parsed.found is True
+    assert parsed.tool_name == "time"
+    assert parsed.error == ""
+
+
+def test_inverted_marker_with_text_around_parsed():
+    """Variante invertida com texto ao redor tambem e reconhecida."""
+    text = (
+        "Vou verificar as horas.\n"
+        '>>>TOOL_REQUEST>>>\n{"tool": "time"}\n<<<END_TOOL_REQUEST>>>\n'
+        "Um momento."
+    )
+    parsed = parse_tool_request(text)
+    assert parsed.found is True
+    assert parsed.tool_name == "time"
+
+
+def test_sanitize_removes_inverted_block():
+    """Bloco com marcador de abertura invertido tambem e removido — nunca
+    chega cru ao usuario."""
+    text = (
+        "Antes.\n"
+        '>>>TOOL_REQUEST>>>\n{"tool": "time"}\n<<<END_TOOL_REQUEST>>>\n'
+        "Depois."
+    )
+    result = sanitize_response_text(text)
+    assert "TOOL_REQUEST" not in result
+    assert '"tool"' not in result
+    assert "Antes." in result
+    assert "Depois." in result
+
+
+def test_sanitize_blocks_malformed_tool_like_text():
+    """Texto TOOL_REQUEST-like malformado (abertura invertida, sem fechamento)
+    e removido — nada cru de protocolo chega ao usuario."""
+    text = "oi >>>TOOL_REQUEST>>> lixo sem fechamento"
+    result = sanitize_response_text(text)
+    assert "TOOL_REQUEST" not in result
+    assert "lixo" not in result
+
+
+def test_inverted_block_invalid_json_is_denied_not_raw():
+    """Variante invertida com JSON quebrado: found=True com erro — nunca
+    texto cru; a execucao vira denial."""
+    text = '>>>TOOL_REQUEST>>>\n{"tool": "time"\n<<<END_TOOL_REQUEST>>>'
+    parsed = parse_tool_request(text)
+    # Bloco reconhecido como tentativa (com erro de JSON) ou, no minimo,
+    # removido da resposta final pelo sanitize:
+    assert parsed.found is True or "TOOL_REQUEST" not in sanitize_response_text(text)
+
+
+def test_normal_block_still_parsed_after_tolerance_change():
+    """Regressao: a forma canonica continua sendo reconhecida."""
+    text = '<<<TOOL_REQUEST>>>\n{"tool": "time"}\n<<<END_TOOL_REQUEST>>>'
+    parsed = parse_tool_request(text)
+    assert parsed.found is True
+    assert parsed.tool_name == "time"

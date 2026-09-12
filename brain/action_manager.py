@@ -55,6 +55,7 @@ class AllowedCommand:
     destructive: bool = False
     args_pattern: str = r"^[a-zA-Z0-9_\-\s.,/\\]+$"
     max_args_length: int = 80
+    handler: Optional[Callable[[str], str]] = None
 
     def validate_args(self, args: str) -> Optional[str]:
         """Valida os parametros do usuario. Retorna erro ou None."""
@@ -65,6 +66,41 @@ class AllowedCommand:
         if not re.match(self.args_pattern, args):
             return "Parametros contem caracteres nao permitidos."
         return None
+
+
+
+def _read_file_handler(path: str, max_bytes: int = 200_000) -> str:
+    """Le um arquivo de texto com validacoes de seguranca."""
+    from pathlib import Path
+
+    if not path:
+        raise ValueError("Caminho do arquivo nao informado.")
+
+    file_path = Path(path)
+
+    try:
+        abs_path = file_path.resolve()
+    except OSError as e:
+        raise ValueError(f"Caminho invalido: {e}")
+
+    project_root = Path(__file__).resolve().parent.parent
+    try:
+        abs_path.relative_to(project_root)
+    except ValueError:
+        raise PermissionError(f"Acesso negado: fora do diretorio permitido.")
+
+    if not abs_path.exists():
+        raise FileNotFoundError(f"Arquivo nao encontrado: '{path}'")
+
+    if not abs_path.is_file():
+        raise ValueError(f"O caminho nao e um arquivo: '{path}'")
+
+    file_size = abs_path.stat().st_size
+    if file_size > max_bytes:
+        content = abs_path.read_bytes()[:max_bytes].decode('utf-8', errors='replace')
+        return f"{content}\n\n[AVISO: arquivo truncado em {max_bytes} bytes de {file_size} bytes totais]"
+
+    return abs_path.read_text(encoding='utf-8', errors='replace')
 
 
 class ActionManager:
@@ -84,6 +120,7 @@ class ActionManager:
         for cmd in extra_commands or []:
             self.register(cmd)
 
+
     def _register_builtins(self) -> None:
         self.register(
             AllowedCommand(
@@ -101,10 +138,45 @@ class ActionManager:
         )
         self.register(
             AllowedCommand(
+                name="read_file",
+                argv=[],
+                description="Le o conteudo de um arquivo de texto (somente leitura).",
+                args_pattern=r"^[a-zA-Z0-9_.\\\-/]+$",
+                max_args_length=200,
+                handler=lambda args: _read_file_handler(args),
+            )
+        )
+        self.register(
+            AllowedCommand(
                 name="echo",
                 argv=["cmd", "/c", "echo", "{args}"],
-                description="Repete o texto informado.",
+                description=(
+                    "Repete exatamente o texto informado. Use APENAS quando o usuario "
+                    "pedir explicitamente para repetir, ecoar ou devolver um texto "
+                    "especifico — nunca como resposta padrao a mensagens casuais, "
+                    "agradecimentos ou reacoes."
+                ),
                 args_pattern=r"^[a-zA-Z0-9_\s.,!?\"'áéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ\-]+$",
+            )
+        )
+        self.register(
+            AllowedCommand(
+                name="read_file",
+                argv=[],
+                description="Le o conteudo de um arquivo de texto (somente leitura).",
+                args_pattern=r"^[a-zA-Z0-9_.\\\-/]+$",
+                max_args_length=200,
+                handler=lambda args: _read_file_handler(args),
+            )
+        )
+        self.register(
+            AllowedCommand(
+                name="read_file",
+                argv=[],
+                description="Le o conteudo de um arquivo de texto (somente leitura).",
+                args_pattern=r"^[a-zA-Z0-9_.\\\-/]+$",
+                max_args_length=200,
+                handler=lambda args: _read_file_handler(args),
             )
         )
         self.register(
@@ -184,6 +256,13 @@ class ActionManager:
         error = cmd.validate_args(args)
         if error:
             return ActionResult(ok=False, message=error, command=name)
+
+        if cmd.handler is not None:
+            try:
+                result_text = cmd.handler(args)
+                return ActionResult(ok=True, message=result_text, command=name, stdout=result_text)
+            except Exception as e:
+                return ActionResult(ok=False, message=f"Erro ao executar '{name}': {e}", command=name)
 
         parts = [p.replace("{args}", args) if "{args}" in p else p for p in cmd.argv]
         parts = [p for p in parts if p != ""]

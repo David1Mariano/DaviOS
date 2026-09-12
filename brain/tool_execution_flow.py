@@ -134,6 +134,20 @@ class ToolExecutionOrchestrator:
         parsed = parse_tool_request(llm_text)
 
         if not parsed.found:
+            if "TOOL_REQUEST" in llm_text:
+                # Variante de marcador ainda malformada apos a normalizacao
+                # (ex: "<<TOOL_REQUEST>>"): o bloco NUNCA segue como conversa
+                # — degrada com denial; o sanitizer final garante que o
+                # usuario nao veja nada cru.
+                logger.warning(
+                    "[TOOLFLOW] bloco TOOL_REQUEST-like malformado; "
+                    "bloqueado (sem execucao)"
+                )
+                return ToolFlowOutcome(
+                    final_text="",
+                    request_found=True,
+                    denial_reason="bloco de ferramenta malformado",
+                )
             # Texto normal do Qwen: fluxo normal, sem segunda chamada.
             return ToolFlowOutcome(final_text=llm_text)
 
@@ -204,22 +218,12 @@ class ToolExecutionOrchestrator:
 
         if result.success:
             result_text = self._format_result(result.output)
-            followup_prompt = (
-                f"{original_prompt}\n\n"
-                f"Resultado da execucao da ferramenta '{parsed.tool_name}':\n"
-                f"{result_text}\n\n"
-                "Use o resultado acima para responder ao usuario. "
-                "Nao solicite outra ferramenta."
-            )
         else:
             result_text = result.error
-            followup_prompt = (
-                f"{original_prompt}\n\n"
-                f"A execucao da ferramenta '{parsed.tool_name}' falhou: "
-                f"{result.error}\n"
-                "Informe isso ao usuario de forma clara. "
-                "Nao solicite outra ferramenta."
-            )
+
+        followup_prompt = self._build_followup_prompt(
+            original_prompt, parsed.tool_name, result_text, result.success
+        )
 
         outcome.final_text = self._run_second_llm(
             run_llm, followup_prompt, original_system,
@@ -255,10 +259,17 @@ class ToolExecutionOrchestrator:
         original_system: str,
         run_llm: Callable[[str, str], str],
     ) -> ToolFlowOutcome:
-        """Negação: mensagem GENÉRICA ao Qwen (sem vazar configuração)."""
+        """Negação: mensagem GENÉRICA ao Qwen (sem vazar configuração).
+
+        O followup NÃO inclui a seção de ferramentas (mesma correção do bug
+        'bloco cru aparece + resultado atrasado')."""
         denial = DENIAL_MESSAGE_TEMPLATE.format(name=parsed.tool_name)
+        # Extrai apenas a mensagem original do usuário (sem ferramentas)
+        user_message = ""
+        if "Mensagem do usuario:" in original_prompt:
+            user_message = original_prompt.split("Mensagem do usuario:")[-1].strip()
         followup_prompt = (
-            f"{original_prompt}\n\n"
+            f"Mensagem original do usuario: {user_message}\n\n"
             f"{denial} Responda ao usuario de forma clara, sem usar ferramentas."
         )
         outcome = ToolFlowOutcome(
@@ -274,6 +285,45 @@ class ToolExecutionOrchestrator:
             fallback=denial, outcome=outcome,
         )
         return outcome
+
+    @staticmethod
+    def _build_followup_prompt(
+        original_prompt: str,
+        tool_name: str,
+        result_text: str,
+        success: bool,
+    ) -> str:
+        """Monta o followup para a 2ª chamada ao LLM SEM a seção de ferramentas.
+
+        O followup NÃO deve conter a seção "### FERRAMENTAS DISPONIVEIS"
+        nem as instruções/exemplos do protocolo <<<TOOL_REQUEST>>> — o
+        segundo LLM não deve ter como pedir outra ferramenta. Extrai
+        apenas a mensagem original do usuário do prompt e reconstrói
+        um followup limpo com o resultado da execução.
+        """
+        # Extrai a mensagem original do usuário (última seção do prompt)
+        user_message = ""
+        if "Mensagem do usuario:" in original_prompt:
+            user_message = original_prompt.split("Mensagem do usuario:")[-1].strip()
+
+        if success:
+            resultado_bloco = (
+                f"Resultado da execucao da ferramenta '{tool_name}':\n"
+                f"{result_text}"
+            )
+        else:
+            resultado_bloco = (
+                f"A execucao da ferramenta '{tool_name}' falhou: "
+                f"{result_text}"
+            )
+
+        followup = (
+            f"Mensagem original do usuario: {user_message}\n\n"
+            f"{resultado_bloco}\n\n"
+            "Responda ao usuario de forma natural usando o resultado acima. "
+            "NAO peca nenhuma ferramenta nesta resposta."
+        )
+        return followup
 
     def _run_second_llm(
         self,

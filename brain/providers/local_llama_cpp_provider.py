@@ -68,6 +68,9 @@ class LocalLlamaCppProvider(LLMProvider):
         self._base_url = f"http://127.0.0.1:{server_port}"
         # Diagnostico de boot: preenchido a cada etapa do initialize().
         self.diagnostics: dict[str, Any] = {}
+        # Nome REAL do modelo cargado no servidor (queried ao reutilizar un
+        # servidor externo; setado ao iniciar uno nuevo). None = desconhecido.
+        self._loaded_model: Optional[str] = None
 
     def initialize(self) -> bool:
         """Inicia llama-server.exe se ainda nao rodando. Nunca lanca excecao.
@@ -91,9 +94,10 @@ class LocalLlamaCppProvider(LLMProvider):
             return False
         self.diagnostics["[LLAMA_SERVER]"] = f"encontrado: {server_exe}"
 
-        # 1. Reutiliza um servidor ja rodando externamente (o modelo ja foi
-        #    carregado por ele). Isso elimina a necessidade de abrir outro
-        #    terminal: se o servidor responde em /health, estamos prontos.
+        # 1. Reutiliza um servidor ja rodando externamente. O nome do modelo
+        #    EXHIBIDO vem da CONSULTA real ao servidor (_query_loaded_model),
+        #    nunca da seleccion teorica por RAM — assim o banner mostra o
+        #    modelo de verdade cargado, nao um nome possivelmente errado.
         if self._check_existing_server():
             logger.info("[LLM] Usando llama-server ja rodando em %s", self._base_url)
             self._initialized = True
@@ -104,10 +108,34 @@ class LocalLlamaCppProvider(LLMProvider):
             )
             self.diagnostics["[PROVIDER]"] = "ativo (servidor externo)."
             self.diagnostics["[BACKEND]"] = "llama.cpp standalone (externo)."
-            if self.selection and self.selection.model:
+            real_model_path = self._query_loaded_model()
+            if real_model_path:
+                real_name = Path(real_model_path).name
+                self._loaded_model = real_name
                 self.diagnostics["[MODEL]"] = (
-                    f"{self.selection.model.name} "
-                    f"({self.selection.model.size_gb} GB) (carregado no servidor)."
+                    f"{real_name} (carregado no servidor externo)."
+                )
+                selected = (
+                    self.selection.model.name
+                    if self.selection and self.selection.model
+                    else None
+                )
+                if selected and selected != real_name:
+                    logger.warning(
+                        "[LLM] Servidor externo ativo com modelo '%s'; "
+                        "selecao teorica era '%s'. Usando o modelo real do "
+                        "servidor para exibicion.",
+                        real_name, selected,
+                    )
+            else:
+                self._loaded_model = None
+                self.diagnostics["[MODEL]"] = (
+                    "servidor ativo com modelo desconocido, "
+                    "nao verificado contra a seleccao atual."
+                )
+                logger.warning(
+                    "[LLM] servidor ja ativo com modelo desconocido, "
+                    "nao verificado contra a seleccion actual."
                 )
             return True
 
@@ -229,6 +257,7 @@ class LocalLlamaCppProvider(LLMProvider):
             self._initialized = True
             self._available = True
             self._backend_used = backend
+            self._loaded_model = model_path.name
             logger.info(
                 "[LLM] llama-server pronto (%s) porta %d",
                 backend, self._server_port,
@@ -272,6 +301,39 @@ class LocalLlamaCppProvider(LLMProvider):
 
         return None
 
+    def _query_loaded_model(self) -> Optional[str]:
+        """Consulta o servidor ativo para descobrir o modelo REAL cargado.
+
+        Formato confirmado no backend real em uso (llama-server do projeto):
+        - GET /v1/models -> {"data": [{"id": "<caminho-al-modelo>", ...}]}
+          (esta versión tambien expone "models": [{"name": "<caminho>"}])
+        - GET /props    -> {"model_path": "<caminho-al-modelo>", ...}
+
+        Retorna o identificador (caminho) do modelo, o None se nao e
+        posible confirmarlo.
+        """
+        try:
+            req = url_request.Request(f"{self._base_url}/v1/models")
+            with url_request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            entries = data.get("data") or data.get("models") or []
+            if entries:
+                ident = entries[0].get("id") or entries[0].get("name")
+                if ident:
+                    return str(ident)
+        except Exception:
+            pass
+        try:
+            req = url_request.Request(f"{self._base_url}/props")
+            with url_request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            path = data.get("model_path")
+            if path:
+                return str(path)
+        except Exception:
+            pass
+        return None
+
     def is_available(self) -> bool:
         """True se o servidor esta rodando e responde ao health check."""
         if not self._initialized:
@@ -311,6 +373,24 @@ class LocalLlamaCppProvider(LLMProvider):
                 request.temperature
                 if request.temperature is not None
                 else self.config.temperature
+            ),
+            # Penalidade de repeticao no nivel de sampling (logits): reprime
+            # loops de repeticion; o llama-server aceita este campo no
+            # endpoint OpenAI-compatible /v1/chat/completions (confirmado nos
+            # strings do proprio llama-server-impl.dll em uso).
+            "repeat_penalty": (
+                request.repeat_penalty
+                if request.repeat_penalty is not None
+                else self.config.repeat_penalty
+            ),
+            # repeat_last_n: cuantos tokens recientes considera la penalidad
+            # de repeticion (default llama.cpp 64 es corto para cubrir el
+            # historico de conversacion en el prompt). Campo aceptado por el
+            # backend real: confirmado con POST 200 a /v1/chat/completions.
+            "repeat_last_n": (
+                request.repeat_last_n
+                if request.repeat_last_n is not None
+                else self.config.repeat_last_n
             ),
             # Qwen3: desativa o modo thinking para o texto util sair direto
             # em 'content' (evita vazamento de raciocinio na resposta).
@@ -419,9 +499,12 @@ class LocalLlamaCppProvider(LLMProvider):
             {
                 "backend": f"llama_cpp:{self._backend_used}" if self._available else "none",
                 "model": (
-                    self.selection.model.name
-                    if self.selection and self.selection.model
-                    else None
+                    self._loaded_model
+                    or (
+                        self.selection.model.name
+                        if self.selection and self.selection.model
+                        else None
+                    )
                 ),
                 "gpu_failed": self._gpu_failed,
                 "server_port": self._server_port,

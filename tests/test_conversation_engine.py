@@ -151,6 +151,32 @@ class TestContext:
         assert engine.context.current_topic == "programacao"
 
 
+class TestTopicNotPollutedByCasualFacts:
+    """Fatos episodicos/casuais (te amo, kkk, interjeicoes) NAO podem virar
+    topico global — o topico so muda com working_on/studies/preference."""
+
+    def test_te_amo_does_not_change_topic(self, engine):
+        engine.process("eu gosto de programacao")
+        assert engine.context.current_topic == "programacao"
+        engine.process("te amo")
+        assert engine.context.current_topic == "programacao"
+
+    def test_kkk_does_not_change_topic(self, engine):
+        engine.process("eu gosto de programacao")
+        engine.process("kkkk")
+        assert engine.context.current_topic == "programacao"
+
+    def test_boa_does_not_change_topic(self, engine):
+        engine.process("eu gosto de programacao")
+        engine.process("boa")
+        assert engine.context.current_topic == "programacao"
+
+    def test_casual_input_on_empty_topic_leaves_topic_empty(self, engine):
+        engine.process("kkkk")
+        engine.process("te amo")
+        assert engine.context.current_topic == ""
+
+
 class TestReinforcement:
     def test_reinforce_does_not_create_duplicate(self, engine):
         engine.process("eu gosto de pizza")

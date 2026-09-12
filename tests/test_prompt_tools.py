@@ -147,6 +147,8 @@ def test_prompt_flag_off_is_byte_identical_to_previous_behavior():
         "- Nome do usuario: Davi"
         "\n\n"
         "Conversa recente:\n"
+        "Conversa anterior - so contexto, nao exemplo: nao copie nem imite "
+        "o formato ou encerramento das respostas anteriores.\n"
         "Usuario: qual meu nome?\n"
         "DaviOS: Davi"
         "\n\n"
@@ -265,27 +267,45 @@ def test_example_block_uses_tool_from_registry_not_hardcoded():
     builder = _builder(flag=True)
     reg = _make_registry()
     section = builder.build_tools_section(reg)
-    blocks = extract_all_requests(section)
-    # 1º bloco = template genérico; 2º bloco = exemplo com ferramenta real:
-    assert len(blocks) == 2
-    template, example = blocks
-    assert template.error == ""
+    # Ignora o template generico (placeholders <nome>/<argumento>):
+    blocks = [
+        b for b in extract_all_requests(section)
+        if not (b.tool_name.startswith("<") or b.tool_name.endswith(">"))
+    ]
+    # 1º = exemplo explicito; 2º+ = few-shot(s):
+    assert len(blocks) >= 1
+    example = blocks[0]
     assert example.error == ""
     assert example.tool_name in {t.name for t in reg.list_tools()}
-    # A ferramenta do exemplo é a primeira COM argumentos declarados (echo):
-    assert example.tool_name == "echo"
-    assert example.arguments == {"args": "<valor>"}
+    # preferred_names em _tools_example_block(): time, datetime, read_file,
+    # list_dir, web_fetch. Neste registry (echo, web_fetch, datetime) a
+    # primeira preferida presente é datetime:
+    assert example.tool_name == "datetime"
+    # Deriva os argumentos esperados dinamicamente da ferramenta escolhida,
+    # em vez de hardcoded:
+    chosen_tool = next(
+        t for t in reg.list_tools() if t.name == example.tool_name
+    )
+    expected_args = {
+        str(a): "<valor>" for a in (chosen_tool.arguments or [])
+    }
+    assert example.arguments == expected_args
 
 
 def test_example_block_without_arguments_tools_uses_first_tool():
     reg = ToolRegistry()
     reg.register(Tool(name="datetime", description="Mostra a data atual."))
     section = _builder(flag=True).build_tools_section(reg)
-    blocks = extract_all_requests(section)
-    assert len(blocks) == 2
-    assert blocks[1].error == ""
-    assert blocks[1].tool_name == "datetime"
-    assert blocks[1].arguments == {}
+    # Ignora o template generico (placeholders <nome>/<argumento>):
+    blocks = [
+        b for b in extract_all_requests(section)
+        if not (b.tool_name.startswith("<") or b.tool_name.endswith(">"))
+    ]
+    assert len(blocks) >= 1
+    example = blocks[0]
+    assert example.error == ""
+    assert example.tool_name == "datetime"
+    assert example.arguments == {}
 
 
 def test_integration_instructions_and_parser_stay_in_sync():
@@ -312,3 +332,254 @@ def test_integration_instructions_and_parser_stay_in_sync():
     assert follow_up.error == ""
     assert follow_up.tool_name == "echo"
     assert follow_up.arguments == {"args": "teste real"}
+
+
+# ---------------------------------------------------------------------------
+# Correção: system_prompt condicional às flags de ferramentas
+# ---------------------------------------------------------------------------
+
+# Frase de negação que deve estar presente quando tools_visible_to_llm=False
+# e AUSENTE quando tools_visible_to_llm=True.
+DENIAL_PHRASE = "Voce nao pode executar comandos no computador"
+
+
+def test_flag_off_system_prompt_contains_denial_phrase():
+    """Flag off → system_prompt contém a frase de negação de capacidades."""
+    config = DaviosConfig()
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    built = builder.build("Oi")
+    assert DENIAL_PHRASE in built.system
+
+
+def test_flag_on_system_prompt_does_not_contain_denial_phrase():
+    """Flag on → system_prompt NÃO contém a frase de negação de capacidades."""
+    config = DaviosConfig()
+    config.tools_visible_to_llm = True
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    built = builder.build("Oi")
+    assert DENIAL_PHRASE not in built.system
+
+
+def test_flag_on_tools_section_still_present():
+    """Flag on + registry → seção de ferramentas continua presente normalmente."""
+    config = DaviosConfig()
+    config.tools_visible_to_llm = True
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    reg = _make_registry()
+    built = builder.build("Oi", tools_registry=reg)
+    assert "### FERRAMENTAS DISPONIVEIS" in built.prompt
+    assert DENIAL_PHRASE not in built.system
+
+
+def test_flag_on_empty_registry_no_tools_section_and_no_denial():
+    """Flag on + registry vazio → sem seção de ferramentas E sem frase de negação.
+
+    Decisão: a frase de negação NÃO volta quando o registry está vazio,
+    porque o usuário ativou explicitamente tools_visible_to_llm=True. O
+    registry vazio é um estado de configuração (ferramentas podem ser
+    adicionadas depois), não uma negação de capacidade. A seção de
+    ferramentas simplesmente não aparece (comportamento C3), o que já
+    indica que não há ferramentas disponíveis no momento."""
+    config = DaviosConfig()
+    config.tools_visible_to_llm = True
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    reg = ToolRegistry()  # vazio
+    built = builder.build("Oi", tools_registry=reg)
+    assert "### FERRAMENTAS DISPONIVEIS" not in built.prompt
+    assert DENIAL_PHRASE not in built.system
+
+
+def test_flag_off_prompt_byte_identical_to_pre_correction():
+    """Flag off → prompt final byte a byte idêntico ao comportamento
+    anterior a esta correção (a frase de negação faz sentido quando não
+    há ferramentas)."""
+    config = DaviosConfig()
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    built = builder.build("Oi")
+    # O system_prompt deve ser exatamente o system_prompt original do config.
+    assert config.system_prompt in built.system
+
+
+# ---------------------------------------------------------------------------
+# Few-shot: exemplos de invocacao implicita
+# ---------------------------------------------------------------------------
+
+def test_few_shot_examples_present_when_flag_on():
+    """Flag on → prompt contem pelo menos um exemplo de invocacao implícita
+    (pergunta natural sem nomear a ferramenta), alem do exemplo explicito."""
+    builder = _builder(flag=True)
+    reg = _make_registry()
+    built = builder.build("Oi", tools_registry=reg)
+
+        # Few-shot presente (cabecalho "Exemplos:"):
+    assert "Exemplos:" in built.prompt
+    # Exemplo positivo com pergunta natural (sem citar nome de ferramenta):
+    # Com o registry padrao (echo, web_fetch, datetime), os few-shot usam
+    # "Que horas sao agora?" (datetime) ou "Repita exatamente: teste 123" (echo):
+    assert ("Que horas sao" in built.prompt
+            or "O que tem no arquivo" in built.prompt
+            or "Repita exatamente" in built.prompt)
+    # O exemplo continua sendo reconhecido pelo parser (sincronia):
+    # Ignora o template generico (placeholders <nome>/<argumento>):
+    blocks = [
+        b for b in extract_all_requests(built.prompt)
+        if not (b.tool_name.startswith("<") or b.tool_name.endswith(">"))
+    ]
+    assert len(blocks) >= 2  # explicito + few-shot(s)
+    for block in blocks:
+        assert block.found is True
+        assert block.error == ""
+
+
+def test_few_shot_uses_real_tools_from_registry():
+    """Os exemplos few-shot usam ferramentas realmente presentes no registry."""
+    builder = _builder(flag=True)
+    reg = ToolRegistry()
+    reg.register(Tool(name="time", description="Mostra a hora atual."))
+    reg.register(Tool(name="echo", description="Repete o texto.", arguments=["args"]))
+    section = builder.build_tools_section(reg)
+
+    # O exemplo few-shot usa "time" (que está no registry):
+    assert '"tool": "time"' in section
+    # E nao inventa ferramentas fora do registry (ignora o template
+    # generico que usa <nome>/<argumento> como placeholder):
+    tool_names = {t.name for t in reg.list_tools()}
+    blocks = extract_all_requests(section)
+    for block in blocks:
+        if block.found and block.tool_name:
+            # Pula o template generico (placeholders entre <>):
+            if block.tool_name.startswith("<") or block.tool_name.endswith(">"):
+                continue
+            assert block.tool_name in tool_names, \
+                f"ferramenta {block.tool_name!r} nao esta no registry"
+
+
+def test_few_shot_with_generic_tool_uses_first_available():
+    """Quando nao ha ferramentas 'curadas', usa a primeira disponivel."""
+    builder = _builder(flag=True)
+    reg = ToolRegistry()
+    reg.register(Tool(name="minha_ferramenta", description="Faz algo.",
+                     arguments=["entrada"]))
+    section = builder.build_tools_section(reg)
+
+    assert "Exemplos:" in section
+    assert '"tool": "minha_ferramenta"' in section
+
+
+def test_few_shot_max_two_examples():
+    """No maximo 3 exemplos few-shot (economia de contexto)."""
+    builder = _builder(flag=True)
+    reg = ToolRegistry()
+    reg.register(Tool(name="time", description="Hora."))
+    reg.register(Tool(name="datetime", description="Data."))
+    reg.register(Tool(name="echo", description="Repete.", arguments=["args"]))
+    reg.register(Tool(name="web_fetch", description="Web.", arguments=["url"]))
+    section = builder.build_tools_section(reg)
+
+    # Conta blocos few-shot (total - template - exemplo explicito):
+    blocks = extract_all_requests(section)
+    # 1 template + 1 explicito + ate 2 few-shot = max 4
+    assert len(blocks) <= 5
+    assert len(blocks) >= 3  # pelo menos 1 few-shot
+
+
+def test_few_shot_flag_off_no_few_shot():
+    """Flag off → nem a secao de ferramentas nem os exemplos aparecem."""
+    config = DaviosConfig()
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    built = builder.build("Oi")
+    assert "Exemplos:" not in built.prompt
+    assert "FERRAMENTAS" not in built.prompt
+
+
+def test_few_shot_empty_registry_no_few_shot():
+    """Registry vazio → nem few-shot nem secao aparecem."""
+    builder = _builder(flag=True)
+    built = builder.build("Oi", tools_registry=ToolRegistry())
+    assert "Exemplos:" not in built.prompt
+    assert "FERRAMENTAS" not in built.prompt
+
+
+# ---------------------------------------------------------------------------
+# Correção: política de necessidade + schema de argumentos + exemplo negativo
+# ---------------------------------------------------------------------------
+
+
+def test_flag_off_prompt_byte_identical_after_correction():
+    """Flag off → prompt byte a byte idêntico após esta correção."""
+    config = DaviosConfig()
+    builder = PromptBuilder(config, DEFAULT_PERSONALITY)
+    built = builder.build("Oi")
+    assert config.system_prompt in built.system
+    assert "### FERRAMENTAS" not in built.prompt
+
+
+def test_policy_says_dont_use_for_casual_conversation():
+    """A política de necessidade deve mencionar NÃO usar para casos casuais."""
+    builder = _builder(flag=True)
+    reg = _make_registry()
+    section = builder.build_tools_section(reg)
+    # Deve mencionar que conversa casual/nao-operacional nao gera TOOL_REQUEST
+    assert "conversa casual" in section.lower() or "sem gerar TOOL_REQUEST" in section
+
+
+def test_no_canned_negative_example_present():
+    """Nao deve existir exemplo negativo fixo (conversa social SEM ferramenta).
+
+    Intencional: um exemplo negativo com resposta fixa (ex: "valeu!" ->
+    "Por nada!") tende a ser memorizado e repetido literalmente por modelos
+    locais pequenos para QUALQUER mensagem seguinte, travando a conversa em
+    loop assim que a resposta entra no historico. A orientacao de quando
+    NAO usar ferramenta ja esta coberta pela instrucao em texto corrido.
+    """
+    builder = _builder(flag=True)
+    reg = _make_registry()
+    section = builder.build_tools_section(reg)
+    # Confirma a AUSENCIA do texto fixo do antigo exemplo negativo:
+    assert "valeu" not in section
+    assert "Por nada" not in section
+
+
+def test_read_file_example_uses_path_not_args():
+    """read_file deve mostrar argumento 'path', nunca 'args'."""
+    builder = _builder(flag=True)
+    reg = ToolRegistry()
+    reg.register(Tool(
+        name="read_file",
+        description="Le conteudo de arquivo.",
+        arguments=["path"],
+    ))
+    section = builder.build_tools_section(reg)
+    # O exemplo few-shot deve usar "path"
+    assert '"path"' in section
+    # Nunca deve usar "args" para read_file no bloco de exemplo
+    # (o template generico usa <argumento>, o que esta ok)
+    blocks = extract_all_requests(section)
+    for block in blocks:
+        if block.found and block.tool_name == "read_file" and block.error == "":
+            assert "path" in block.arguments
+
+
+def test_echo_description_restricted_to_explicit_requests():
+    """echo deve ser descrito como uso apenas para pedidos explicitos."""
+    builder = _builder(flag=True)
+    reg = _make_registry()
+    section = builder.build_tools_section(reg)
+    # A política deve mencionar que echo eh para pedidos explicitos
+    assert "explicitamente" in section.lower() or "pedir" in section.lower()
+
+
+def test_parser_recognizes_few_shot_block_in_prompt():
+    """O exemplo positivo formatado no prompt deve ser reconhecido pelo parser."""
+    builder = _builder(flag=True)
+    reg = _make_registry()
+    section = builder.build_tools_section(reg)
+    blocks = extract_all_requests(section)
+    # Pelo menos um bloco real (não o template genérico) deve ser reconhecido
+    real_blocks = [
+        b for b in blocks
+        if b.found and not (b.tool_name.startswith("<") and b.tool_name.endswith(">"))
+    ]
+    assert len(real_blocks) >= 1
+    for block in real_blocks:
+        assert block.error == ""

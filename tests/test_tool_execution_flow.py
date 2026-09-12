@@ -109,7 +109,7 @@ def _block(tool: str, args_json: str = '{"args": "oi"}') -> str:
 
 def test_flag_off_identical_behavior_even_with_tool_request_in_text():
     block = _block("echo", '{"args": "oi"}')
-    provider = ScriptedProvider([block])  # até um pedido no texto passa cru
+    provider = ScriptedProvider([block])  # bloco no texto do Qwen
     config = _config(tools_visible_to_llm=False, actions_enabled=True)
     reg, echo_calls, _ = _make_registry()
     core = _core(provider, config, reg)
@@ -117,7 +117,9 @@ def test_flag_off_identical_behavior_even_with_tool_request_in_text():
     out = core.generate_response("repita oi")
 
     assert len(provider.calls) == 1  # UMA chamada ao LLM, como antes
-    assert out["text"] == block      # texto cru, intocado
+    # C6: sanitização remove o bloco residual mesmo com flag off (rede de segurança).
+    assert "<<<TOOL_REQUEST>>>" not in out["text"]
+    assert "<<<END_TOOL_REQUEST>>>" not in out["text"]
     assert "tool_flow" not in out    # sem metadata do fluxo
     assert echo_calls == []          # nada executado
 
@@ -182,6 +184,88 @@ def test_valid_web_request_result_dict_serialized_in_followup():
     assert "Resultado da execucao da ferramenta 'web_fetch'" in followup_prompt
     assert '"text": "pagina"' in followup_prompt  # dict serializado
     assert out["text"] == "A pagina diz: pagina."
+
+
+# ---------------------------------------------------------------------------
+# 3b. Followup_prompt NÃO contém seção de ferramentas (correção do bug
+#     "bloco cru aparece + resultado atrasado")
+# ---------------------------------------------------------------------------
+
+
+def test_followup_prompt_does_not_contain_tools_section():
+    """O followup_prompt NÃO deve conter a seção de ferramentas, para não
+    induzir o segundo LLM a pedir outra ferramenta."""
+    first = _block("echo", '{"args": "teste"}')
+    provider = ScriptedProvider([first, "O resultado foi: teste."])
+    config = _config(tools_visible_to_llm=True, actions_enabled=True)
+    reg, _, _ = _make_registry()
+    core = _core(provider, config, reg)
+
+    core.generate_response("repita teste")
+
+    followup_prompt = provider.calls[1].prompt
+    assert "FERRAMENTAS DISPONIVEIS" not in followup_prompt
+    assert "<<<TOOL_REQUEST>>>" not in followup_prompt
+    assert "<<<END_TOOL_REQUEST>>>" not in followup_prompt
+
+
+def test_followup_prompt_contains_tool_result():
+    """O followup_prompt DEVE conter o resultado da execução da ferramenta."""
+    first = _block("echo", '{"args": "teste"}')
+    provider = ScriptedProvider([first, "O resultado foi: teste."])
+    config = _config(tools_visible_to_llm=True, actions_enabled=True)
+    reg, _, _ = _make_registry()
+    core = _core(provider, config, reg)
+
+    core.generate_response("repita teste")
+
+    followup_prompt = provider.calls[1].prompt
+    assert "Resultado da execucao da ferramenta 'echo'" in followup_prompt
+    assert "ECO: <args>" in followup_prompt
+
+
+def test_followup_prompt_contains_no_tool_request_instruction():
+    """O followup_prompt DEVE conter instrução explícita de NÃO pedir outra ferramenta."""
+    first = _block("echo", '{"args": "teste"}')
+    provider = ScriptedProvider([first, "O resultado foi: teste."])
+    config = _config(tools_visible_to_llm=True, actions_enabled=True)
+    reg, _, _ = _make_registry()
+    core = _core(provider, config, reg)
+
+    core.generate_response("repita teste")
+
+    followup_prompt = provider.calls[1].prompt
+    assert "NAO peca nenhuma ferramenta" in followup_prompt
+
+
+def test_followup_prompt_contains_user_message():
+    """O followup_prompt DEVE conter a mensagem original do usuário para contexto."""
+    first = _block("echo", '{"args": "teste"}')
+    provider = ScriptedProvider([first, "O resultado foi: teste."])
+    config = _config(tools_visible_to_llm=True, actions_enabled=True)
+    reg, _, _ = _make_registry()
+    core = _core(provider, config, reg)
+
+    core.generate_response("repita teste")
+
+    followup_prompt = provider.calls[1].prompt
+    assert "Mensagem original do usuario: repita teste" in followup_prompt
+
+
+def test_followup_for_denied_request_also_has_no_tools_section():
+    """Followup de negação (ferramenta inexistente) também NÃO deve conter
+    a seção de ferramentas."""
+    first = _block("ferramenta_fantasma", '{"x": 1}')
+    provider = ScriptedProvider([first, "Essa funcao nao existe."])
+    config = _config(tools_visible_to_llm=True, actions_enabled=True)
+    reg, _, _ = _make_registry()
+    core = _core(provider, config, reg)
+
+    core.generate_response("use ferramenta fantasma")
+
+    followup_prompt = provider.calls[1].prompt
+    assert "FERRAMENTAS DISPONIVEIS" not in followup_prompt
+    assert "<<<TOOL_REQUEST>>>" not in followup_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +354,10 @@ def test_malformed_request_raw_text_unchanged_no_second_call():
     out = core.generate_response("repita oi")
 
     assert len(provider.calls) == 1  # SEM segunda chamada ao LLM
-    assert out["text"] == first      # texto cru do Qwen, inalterado
+    # C6: sanitização remove o bloco malformado residual (comportamento defensivo).
+    assert "<<<TOOL_REQUEST>>>" not in out["text"]
+    assert "<<<END_TOOL_REQUEST>>>" not in out["text"]
+    assert "Fim da resposta." in out["text"]
     assert echo_calls == []
     assert out["tool_flow"]["request_found"] is True   # tentativa reconhecida
     assert out["tool_flow"]["tool_executed"] is False

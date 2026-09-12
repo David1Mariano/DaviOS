@@ -131,6 +131,35 @@ class TestModelManager:
         assert selection.model is None
         assert "Nenhum modelo" in selection.reason
 
+    def test_corrupt_small_model_rejected(self, config_with_models, models_tree):
+        """Um GGUF com parametros declarados (1.5B Q4_K_M) mas tamanho
+        ridiculamente pequeno (~10 MB vs ~918 MB esperados) e excluido dos
+        candidatos, com razao clara na selecao."""
+        _write_gguf(
+            models_tree / "balanced", "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+        )
+        hardware = HardwareProfile(
+            ram_total_gb=16.0, ram_available_gb=8.0, cpu_cores=8
+        )
+        selection = ModelManager(config_with_models).select_model(hardware)
+        assert selection.model is None
+        assert "corrompido/incompleto" in selection.reason
+
+    def test_plausible_size_model_accepted(self, config_with_models, models_tree):
+        """Um GGUF do tamanho esperado (>=60% de ~918 MB para 1.5B Q4_K_M)
+        e selecionado normalmente."""
+        _write_gguf(
+            models_tree / "balanced", "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+            size_mb=600,
+        )
+        hardware = HardwareProfile(
+            ram_total_gb=16.0, ram_available_gb=8.0, cpu_cores=8
+        )
+        selection = ModelManager(config_with_models).select_model(hardware)
+        assert selection.model is not None
+        assert selection.model.quantization == "Q4_K_M"
+        assert selection.compatible is True
+
 
 class TestModelSelection:
     def test_select_model_prefers_tier(self, config_with_models, models_tree):

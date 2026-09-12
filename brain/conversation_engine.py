@@ -350,8 +350,9 @@ class ConversationEngine:
                 )
                 response = self._apply_style(outcome["text"])
                 self.context.add_message(text, response, decision.intent)
-                if memory.facts:
-                    self.context.current_topic = memory.facts[0].target
+                topic = self._topic_from_facts(memory.facts)
+                if topic:
+                    self.context.current_topic = topic
                 return ConversationResult(
                     response=response,
                     intent=decision.intent,
@@ -371,8 +372,9 @@ class ConversationEngine:
         )
 
         self.context.add_message(text, response, decision.intent)
-        if memory.facts:
-            self.context.current_topic = memory.facts[0].target
+        topic = self._topic_from_facts(memory.facts)
+        if topic:
+            self.context.current_topic = topic
 
         return ConversationResult(
             response=response,
@@ -381,6 +383,25 @@ class ConversationEngine:
             memories_used=[match["existing_memory"]] if match["existing_memory"] else [],
             context=self.context.to_dict(),
         )
+
+    # Relacoes cujo alvo pode virar topico global da conversa. Fatos
+    # episodicos/casuais NUNCA definem o topico — so working_on, studies,
+    # preferencias reais, identidade etc.
+    _TOPIC_RELATIONS = frozenset({
+        "working_on", "studies", "like", "dislike", "love", "hate",
+        "identity", "name", "possession", "lives", "work", "preference",
+    })
+
+    @classmethod
+    def _topic_from_facts(cls, facts) -> str:
+        """Primeiro alvo semanticamente adequado para current_topic
+        ('' se nenhum fato for adequado)."""
+        for fact in facts or []:
+            relation = str(getattr(fact, "relation", "") or "").strip()
+            target = str(getattr(fact, "target", "") or "").strip()
+            if relation in cls._TOPIC_RELATIONS and target:
+                return target
+        return ""
 
     def _build_emotions(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         emotions = []

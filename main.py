@@ -2,6 +2,16 @@
 
 import logging
 import os
+import sys
+
+# UTF-8 de ponta a ponta no Windows: sem isso o console usa codepage
+# 437/850 e acentos como "ç" e "ã" corrompem no print()/input() (mojibake).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 from brain.conversation_engine import ConversationEngine
 from brain.providers.local_llm_provider import (

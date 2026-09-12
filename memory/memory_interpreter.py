@@ -88,7 +88,10 @@ class MemoryInterpreter:
                 emotion_data["emotion"]
             )
 
-            if not target:
+            if not target or not self._is_valid_fact_target(target):
+                # Alvos sem conteudo semantico (pronomes como "te"/"me",
+                # interjeicoes como "kkk") NUNCA viram fatos — ex: "te amo"
+                # nao pode gerar like(target="te").
                 continue
 
             relation = self.determine_relation(
@@ -180,7 +183,7 @@ class MemoryInterpreter:
             if not match:
                 continue
             target = self._clean_target(match.group(1))
-            if not target:
+            if not target or not self._is_valid_fact_target(target):
                 continue
             facts.append(
                 MemoryFact(
@@ -197,6 +200,30 @@ class MemoryInterpreter:
                 )
             )
         return facts
+
+    # Alvos de fato precisam ter conteudo semantico. Pronomes e
+    # interjeicoes nunca viram fatos (evita like(target="te") de "te amo").
+    _FACT_TARGET_PRONOUNS = frozenset({
+        "te", "me", "nos", "lhe", "voce", "vc", "isso", "isto", "aquilo",
+        "ele", "ela", "eles", "elas", "mim", "ti", "si", "nada", "tudo",
+        "algo", "alguem", "nao", "ai", "aqui", "la",
+    })
+
+    _FACT_TARGET_NOISE = frozenset({
+        "kkk", "kkkk", "kkkkk", "kkkkkk", "rs", "rsrs", "haha", "hahaha",
+        "lol", "kkkl", "muito", "mais", "bem", "agora", "hoje",
+    })
+
+    @classmethod
+    def _is_valid_fact_target(cls, target) -> bool:
+        """Alvo de fato exige >= 3 caracteres, nao-pronome e
+        nao-interjeicao. Nunca rejeita preferencias reais (pizza, python)."""
+        t = " ".join(str(target or "").split()).casefold()
+        if len(t) < 3:
+            return False
+        if t in cls._FACT_TARGET_PRONOUNS or t in cls._FACT_TARGET_NOISE:
+            return False
+        return True
 
     def _clean_target(self, raw: str) -> str:
         """Remove conectivos finais e palavras vazias do alvo extraido."""

@@ -54,6 +54,22 @@ _BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# O Qwen ocasionalmente INVERTE a abertura do bloco (">>>TOOL_REQUEST>>>"
+# em vez de "<<<TOOL_REQUEST>>>" — observado em producao). A intencao e
+# inequivoca (corpo JSON + "<<<END_TOOL_REQUEST>>>"), entao NORMALIZAMOS
+# a variante antes do parse/sanitizacao: ferramentas validas com marcador
+# invertido passam a funcionar, e o bloco cru jamais chega ao usuario.
+_ALT_START_MARKER = ">>>TOOL_REQUEST>>>"
+
+
+def _normalize_markers(text: str) -> str:
+    """Tolerancia: abertura invertida + '>' sobrando no fechamento."""
+    if _ALT_START_MARKER in text:
+        text = text.replace(_ALT_START_MARKER, START_MARKER)
+    # "<<<END_TOOL_REQUEST>>>>" (com '>' extra) conta como fechado.
+    text = re.sub(re.escape(END_MARKER) + r">{1,2}", END_MARKER, text)
+    return text
+
 
 @dataclass
 class ToolRequestParseResult:
@@ -93,6 +109,7 @@ def parse_tool_request(text: Any) -> ToolRequestParseResult:
     if not isinstance(text, str):
         return ToolRequestParseResult(found=False)
 
+    text = _normalize_markers(text)
     match = _BLOCK_RE.search(text)
     if match is None:
         # Marcador de abertura sem fechamento = tentativa reconhecida.
@@ -192,3 +209,65 @@ def extract_all_requests(text: Any) -> list[ToolRequestParseResult]:
     if not isinstance(text, str):
         return []
     return [_parse_block(m.group(1)) for m in _BLOCK_RE.finditer(text)]
+
+
+# Constante de fallback — usada quando a sanitização remove tudo.
+_SANITIZE_FALLBACK = "Desculpe, nao consegui formular uma resposta."
+
+
+def sanitize_response_text(text: Any) -> str:
+    """Remove blocos residuais ``<<<TOOL_REQUEST>>>`` de qualquer texto.
+
+    Rede de segurança final (C6): garante que o usuário NUNCA veja o
+    bloco do protocolo cru na resposta — mesmo que o Qwen o ecoe/vaze
+    por qualquer motivo (primeira ou segunda chamada ao LLM).
+
+    Comportamento:
+        - Blocos completos (abertura + fechamento) são removidos, junto
+          com os marcadores. Texto ao redor preservado.
+        - Bloco malformado (abertura sem fechamento): remove do
+          ``START_MARKER`` até o FINAL do texto (não sabemos onde ele
+          "deveria" terminar; ser defensivo aqui é seguro porque o
+          parser já tratou esse caso antes desta função ser chamada).
+        - Se o resultado fica vazio/só espaços, retorna um fallback
+          documentado em ``_SANITIZE_FALLBACK``.
+        - Entradas não-string (None, bytes, etc.) são toleradas: bytes
+          decodificam como UTF-8; outros tipos retornam o fallback.
+
+    Nunca lança exceção.
+    """
+    if text is None:
+        return _SANITIZE_FALLBACK
+    if isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8", errors="replace")
+        except Exception:
+            return _SANITIZE_FALLBACK
+    if not isinstance(text, str):
+        return _SANITIZE_FALLBACK
+
+    # 0. Normaliza variantes do marcador (ex: abertura invertida do Qwen)
+    #    ANTES de remover — sem isso o bloco cru vazaria para o usuario.
+    text = _normalize_markers(text)
+
+    # 1. Remove blocos completos (abertura + fechamento).
+    cleaned = _BLOCK_RE.sub("", text)
+
+    # 2. Bloco malformado: abertura sem fechamento → corta do marker em diante.
+    if START_MARKER in cleaned:
+        idx = cleaned.index(START_MARKER)
+        cleaned = cleaned[:idx]
+
+    # 3. Normaliza quebras de linha consecutivas (3+ → 2) e limpa bordas.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+
+    # 4. Remove prefixo 'DaviOS:' do início (caso o Qwen o gere).
+    #    Só remove no início, preserva menções no meio do texto.
+    cleaned = re.sub(r"^DaviOS\s*:\s*", "", cleaned, count=1)
+
+    # 5. Fallback se sobrou nada de útil.
+    if not cleaned:
+        return _SANITIZE_FALLBACK
+
+    return cleaned

@@ -164,10 +164,8 @@ def resolve_context_reference(text: str, context) -> Optional[str]:
     topic = extract_topic_from_previous(context)
     if not topic:
         return None
-    last_response = getattr(context, "last_response", "") or ""
     parts = [
         f"Mensagem atual do usuario: {text}",
         f"Assunto recente da conversa: {topic}",
-        f"Sua ultima resposta: {last_response}",
     ]
     return "\n".join(parts)

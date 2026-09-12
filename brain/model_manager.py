@@ -7,6 +7,7 @@ o hardware e seleciona o modelo adequado ao perfil. NÃO executa inferência.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,11 +16,34 @@ from typing import Any, Optional
 from config.davios_config import DaviosConfig
 from core.hardware_detector import HardwareProfile
 
+logger = logging.getLogger("davios.models")
+
 KNOWN_QUANTS = (
     "IQ1_S", "IQ2_XXS", "IQ3_XXS", "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L",
     "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_0", "Q5_1", "Q5_K_S",
     "Q5_K_M", "Q6_K", "Q8_0", "F16", "BF16", "F32",
 )
+
+# Bytes aproximados por parametro segun cuantizacion (llama.cpp). Se usam
+# para estimar el tamano esperado de un GGUF real y detectar archivos
+# truncados/corrompidos (ej: um "1.5B Q4_K_M" real ocupa ~0.92 GB, no 11 MB).
+BYTES_PER_PARAM: dict[str, float] = {
+    "IQ1_S": 0.19, "IQ2_XXS": 0.21, "IQ3_XXS": 0.32, "IQ3_XS": 0.35,
+    "Q2_K": 0.332,
+    "Q3_K_S": 0.429, "Q3_K_M": 0.457, "Q3_K_L": 0.479,
+    "Q4_0": 0.568, "Q4_1": 0.728,
+    "Q4_K_S": 0.561, "Q4_K_M": 0.612,
+    "Q5_0": 0.675, "Q5_1": 0.836,
+    "Q5_K_S": 0.626, "Q5_K_M": 0.663,
+    "Q6_K": 0.714,
+    "Q8_0": 1.102,
+    "BF16": 2.0, "F16": 2.0, "F32": 4.0,
+}
+DEFAULT_BYTES_PER_PARAM = 0.61
+# Margen para aceptar um GGUF real: al menos el 60% del tamano estimado.
+# Separa archivos truncados/incompletos de modelos legitimos. Nunca se
+# borra el archivo — solo se deja de seleccionarlo.
+PLAUSIBLE_SIZE_RATIO = 0.6
 
 TIERS = ("light", "balanced", "performance")
 
@@ -34,6 +58,9 @@ class ModelInfo:
     size_gb: float = 0.0
     quantization: Optional[str] = None
     params_hint: Optional[str] = None
+    # Razón de exclusión durante la selección (archivo corrompido/incompleto),
+    # rellenada por _file_is_plausible(). "" = sin problema detectado.
+    invalid_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +139,52 @@ class ModelManager:
             quantization=quant, params_hint=params,
         )
 
+    @staticmethod
+    def _expected_size_mb(model: ModelInfo) -> Optional[float]:
+        """Tamaño aproximado esperado de un GGUF real (MB).
+
+        Se estima desde parámetros declarados en el nombre (ej "1.5B") y la
+        cuantización (bytes/parámetro conocido de llama.cpp). None si no hay
+        parámetros en el nombre para poder estimar.
+        """
+        if not model.params_hint:
+            return None
+        try:
+            params_b = float(model.params_hint[:-1])
+        except (ValueError, AttributeError):
+            return None
+        bytes_per = BYTES_PER_PARAM.get(
+            model.quantization or "", DEFAULT_BYTES_PER_PARAM
+        )
+        # params_b * bytes/param * 1e9 bytes per GB, expressado em MB (1e6)
+        return params_b * bytes_per * 1000.0
+
+    def _file_is_plausible(self, model: ModelInfo) -> bool:
+        """Descarta modelos cuyo archivo está truncado/corrompido.
+
+        Criterio: si el nombre declara parámetros y cuantización, el archivo
+        debe tener al menos 60% del tamaño esperado para ser un GGUF real.
+        Sin parámetros declarados no hay cómo estimar → se acepta. El archivo
+        NUNCA se borra: solo se excluye de la selección y se loguea el aviso.
+        """
+        expected_mb = self._expected_size_mb(model)
+        if expected_mb is None:
+            return True
+        try:
+            actual_mb = model.path.stat().st_size / (1024**2)
+        except OSError:
+            model.invalid_reason = "archivo inaccesible o inexistente"
+            return False
+        min_mb = expected_mb * PLAUSIBLE_SIZE_RATIO
+        if actual_mb < min_mb:
+            model.invalid_reason = (
+                "archivo parece corrompido/incompleto "
+                f"({actual_mb:.0f} MB, esperado ~{expected_mb:.0f} MB)"
+            )
+            logger.warning("Modelo %s ignorado: %s", model.name, model.invalid_reason)
+            return False
+        return True
+
     def select_profile(self, hardware: HardwareProfile) -> str:
         """Escolhe LIGHT/BALANCED/PERFORMANCE conforme hardware + config."""
         override = self.config.profile_override
@@ -167,12 +240,22 @@ class ModelManager:
 
         usable = [m for m in candidates if self._is_compatible(m, max_size, hardware)]
         if not usable:
-            return ModelSelection(
-                profile=profile_name,
-                reason=(
+            invalid = [
+                m.invalid_reason for m in candidates if m.invalid_reason
+            ]
+            if invalid:
+                reason = (
+                    "Modelos encontrados parecen invalidos: "
+                    + "; ".join(sorted(set(invalid)))
+                )
+            else:
+                reason = (
                     "Modelos encontrados excedem os recursos do perfil "
                     f"{profile_name}."
-                ),
+                )
+            return ModelSelection(
+                profile=profile_name,
+                reason=reason,
                 generation=profile.get("generation", {}),
             )
 
@@ -194,6 +277,8 @@ class ModelManager:
         max_size_gb: Optional[float],
         hardware: HardwareProfile,
     ) -> bool:
+        if not self._file_is_plausible(model):
+            return False
         if max_size_gb is not None and model.size_gb > max_size_gb:
             return False
         available = hardware.ram_available_gb

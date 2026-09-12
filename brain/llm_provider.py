@@ -30,6 +30,8 @@ class LLMRequest:
     system: str = ""
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
+    repeat_penalty: Optional[float] = None
+    repeat_last_n: Optional[int] = None
     stop: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -38,6 +40,8 @@ class LLMRequest:
             "system": self.system,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "repeat_penalty": self.repeat_penalty,
+            "repeat_last_n": self.repeat_last_n,
             "stop": list(self.stop),
         }
 

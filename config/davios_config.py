@@ -38,12 +38,17 @@ class DaviosConfig:
     debug: bool = False
     context_window: int = 2048
     temperature: float = 0.7
+    repeat_penalty: float = 1.3
+    repeat_last_n: int = 256
     max_tokens: int = 256
     threads: int = 0  # 0 = automático (usa cores físicos)
     gpu_layers: int = 0  # 0 = CPU; >0 = offload se o backend suportar
     use_gpu: bool = False
     max_recent_messages: int = 6
     max_memories_in_prompt: int = 5
+    # system_prompt usado quando tools_visible_to_llm=False (padrao). Contem
+    # a frase que nega categoricamente a capacidade de executar comandos,
+    # abrir programas ou acessar arquivos — so e contraditoria se tools_visible_to_llm=True.
     system_prompt: str = (
         "Voce e o DaviOS, um assistente pessoal local e offline. "
         "Responda sempre em portugues do Brasil, de forma curta, clara e natural. "
@@ -51,6 +56,15 @@ class DaviosConfig:
         "acessar arquivos: se pedirem isso, explique educadamente que essa "
         "funcao ainda nao existe. Use as informacoes sobre o usuario quando "
         "forem fornecidas no contexto."
+    )
+    # system_prompt usado quando tools_visible_to_llm=True. Contem a mesma
+    # identidade/idioma/tom, mas SEM a frase de negação de capacidades (que
+    # conflitaria com a seção de ferramentas). O PromptBuilder escolhe
+    # automaticamente entre system_prompt e system_prompt_tools_enabled.
+    system_prompt_tools_enabled: str = (
+        "Voce e o DaviOS, um assistente pessoal local e offline. "
+        "Responda sempre em portugues do Brasil, de forma curta, clara e natural. "
+        "Use as informacoes sobre o usuario quando forem fornecidas no contexto."
     )
 
     @classmethod

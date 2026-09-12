@@ -407,3 +407,348 @@ class TestToolsRegistryReachesPromptBuilder:
         core.memory_manager.database.close()
 
 
+# ---------------------------------------------------------------------------
+# Proteção anti-repetição: respostas novas não podem reutilizar uma resposta
+# recente praticamente idêntica (camada de segurança — não substituye a causa
+# raíz, sólo la detecta y regenera sin histórico).
+# ---------------------------------------------------------------------------
+
+
+class SequencedProvider(LLMProvider):
+    """Provider falso que retorna respostas en orden determinístico."""
+
+    name = "sequenced"
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls: list[LLMRequest] = []
+        self._available = True
+
+    def initialize(self) -> bool:
+        return self._available
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def generate(self, request: LLMRequest) -> LLMResponse:
+        self.calls.append(request)
+        text = self.responses.pop(0) if self.responses else "esgotado"
+        return LLMResponse(text=text, provider="sequenced", model="fake")
+
+    def unload(self) -> None:
+        pass
+
+
+class TestAntiRepetitionProtection:
+    """A resposta nova não pode reutilizar una resposta anterior casi idéntica."""
+
+    def test_duplicate_response_triggers_regeneration_without_history(self, temp_db):
+        from brain.conversation_engine import ConversationContext
+
+        config = DaviosConfig.load()
+        provider = SequencedProvider(
+            [
+                "Ah, entendi! Vou me manter mais atento e evitar as repetições. "
+                "Que tal? ✨",
+                "Claro! Em que posso ajudarte agora?",
+            ]
+        )
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        ctx = ConversationContext()
+        ctx.add_message(
+            "nao repita mano",
+            "Ah, entendi! Vou me manter mais atento e evitar as repetições. "
+            "Que tal? ✨",
+            "conversation",
+        )
+        outcome = cognitive.generate_response("kkkkkk", context=ctx)
+        # Duplicada detectada → segunda generación sin historico
+        assert len(provider.calls) == 2
+        assert outcome["text"] == "Claro! Em que posso ajudarte agora?"
+        # El retry NO lleva "Conversa recente" en el prompt
+        assert "Conversa recente" not in provider.calls[1].prompt
+        cognitive.memory_manager.database.close()
+
+    def test_non_duplicate_response_no_regeneration(self, temp_db):
+        from brain.conversation_engine import ConversationContext
+
+        config = DaviosConfig.load()
+        provider = SequencedProvider(["Respuesta completamente nueva."])
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        ctx = ConversationContext()
+        ctx.add_message("hola", "Otra respuesta anterior distinta.", "conversation")
+        outcome = cognitive.generate_response("hola de nuevo", context=ctx)
+        assert len(provider.calls) == 1
+        assert outcome["text"] == "Respuesta completamente nueva."
+        cognitive.memory_manager.database.close()
+
+    def test_short_responses_never_flagged_as_duplicate(self):
+        # Textos curtos no se marcan para evitar falsos positivos en
+        # conversas naturales ("Ola", "jaja", "ok").
+        assert CognitiveCore._is_duplicate_response("Ola", ["Ola"]) is False
+
+    def test_is_duplicate_response_exact_and_near(self):
+        resp = ("Ah, entendi! Vou me manter mais atento e evitar as "
+                "repetições. Que tal?")
+        assert CognitiveCore._is_duplicate_response(resp, [resp]) is True
+        # Misma resp con algunos acentos/espacios distintos
+        near = resp.replace("repetições", "repetiones").replace("?", " ?")
+        assert CognitiveCore._is_duplicate_response(near, [resp]) is True
+        # Resp claramente distinta NO es duplicada
+        assert CognitiveCore._is_duplicate_response(
+            "El agua hierve a 100 grados.", [resp]
+        ) is False
+
+
+class TestClosingPatternProtection:
+    """Segunda capa: encerramentos repetidos entre respostas diferentes."""
+
+    def test_repeated_closing_detected(self):
+        # Respostas con cuerpos distintos pero el mismo cierre final.
+        r1 = "Boa! Entendi. Como posso te ajudar hoje?"
+        r2 = "KKKK, saquei. Como posso te ajudar hoje?"
+        r3 = "Fechou! Como posso te ajudar hoje?"
+        assert CognitiveCore._repeated_closing(r2, [r1]) is not None
+        assert CognitiveCore._repeated_closing(r3, [r1, r2]) is not None
+
+    def test_different_closings_not_detected(self):
+        # Cierres distintos aunque cortos: no hay falso positivo.
+        r1 = "Boa, isso explica o problema."
+        r2 = "Fechou. Vamos nessa."
+        assert CognitiveCore._repeated_closing(r2, [r1]) is None
+
+    def test_short_closings_ignored(self):
+        # "beleza", "ok", "certo" son too cortos (< 12 chars) -> nunca padron.
+        assert CognitiveCore._repeated_closing("Beleza.", ["Entendi, beleza."]) is None
+        assert CognitiveCore._repeated_closing("Ok.", ["Certo."]) is None
+
+    def test_legitimate_question_allowed(self):
+        # Una pregunta real y distinta no se confunde con el cierre repetido.
+        assert CognitiveCore._repeated_closing(
+            "Qual versão do Python você está usando?",
+            ["Como posso te ajudar hoje?"],
+        ) is None
+
+    def test_response_without_question_allowed(self):
+        # Una respuesta puede terminar sin pergunta y sin falso positivo.
+        assert CognitiveCore._repeated_closing(
+            "KKKK, agora entendi.",
+            ["Boa, isso explica o problema."],
+        ) is None
+
+    def test_regeneration_keeps_context_and_adds_instruction(self, temp_db):
+        from brain.conversation_engine import ConversationContext
+
+        config = DaviosConfig.load()
+        provider = SequencedProvider(
+            [
+                "KKKK, saquei. Como posso te ajudar hoje?",
+                "Fechou, vamos nessa.",
+            ]
+        )
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        ctx = ConversationContext()
+        ctx.add_message(
+            "que horas são?",
+            "São 14:30. Como posso te ajudar hoje?",
+            "question",
+        )
+        outcome = cognitive.generate_response("kkkkkk", context=ctx)
+        assert len(provider.calls) == 2
+        assert outcome["text"] == "Fechou, vamos nessa."
+        retry_prompt = provider.calls[1].prompt
+        # O retry MANTIENE o historico e a mensagem atual...
+        assert "Conversa recente" in retry_prompt
+        assert "Mensagem do usuario: kkkkkk" in retry_prompt
+        # ...e adiciona a instrucao explicita: PRESERVAR conteudo/intencao,
+        # responder a mensagem atual e terminar naturalmente (sem pergunta).
+        assert "MANTENDO o mesmo conteudo" in retry_prompt
+        assert "pode simplesmente terminar" in retry_prompt
+        cognitive.memory_manager.database.close()
+
+    def test_no_infinite_loop_retries_bounded(self, temp_db):
+        # chain completa: duplicado total → nuevo con mismo cierre → final.
+        from brain.conversation_engine import ConversationContext
+
+        config = DaviosConfig.load()
+        provider = SequencedProvider(
+            [
+                "Ah, entendi! Vou manter atento. Como posso te ajudar hoje?",
+                "Maravilloso. Como posso te ajudar hoje?",
+                "Fechou, vamos nessa.",
+            ]
+        )
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        ctx = ConversationContext()
+        ctx.add_message(
+            "nao repita",
+            "Ah, entendi! Vou manter atento. Como posso te ajudar hoje?",
+            "conversation",
+        )
+        outcome = cognitive.generate_response("kkkk", context=ctx)
+        # Máximo: 1 llamada original + 2 retries = 3. Nunca màs.
+        assert len(provider.calls) == 3
+        assert outcome["text"] == "Fechou, vamos nessa."
+        cognitive.memory_manager.database.close()
+
+    def test_works_without_history(self, temp_db):
+        # Sin historico previo: una respuesta con cierre único no reintenta.
+        config = DaviosConfig.load()
+        provider = SequencedProvider(["Fechou, vamos nessa."])
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        outcome = cognitive.generate_response("hola", context=None)
+        assert len(provider.calls) == 1
+        assert outcome["text"] == "Fechou, vamos nessa."
+        cognitive.memory_manager.database.close()
+
+    # ------------------------------------------------------------------
+    # Casos A-F da investigacao de encerramentos repetidos (com emoji).
+    # ------------------------------------------------------------------
+
+    def test_closing_sentence_strips_trailing_emoji(self):
+        # BUG CORRIGIDO: o emoji depois da pontuacao final virava a ultima
+        # "oracao" (1 char) e o detector nunca via o encerramento real.
+        closing = CognitiveCore._closing_sentence(
+            "Boa! Como posso te ajudar hoje? 😊"
+        )
+        assert closing == "como posso te ajudar hoje?"
+
+    def test_case_a_identical_with_emoji_detected_by_both_layers(self):
+        # "boa" x4: resposta IDENTICA curta (33 chars) com emoji final.
+        r = "Boa! Como posso te ajudar hoje? 😊"
+        assert CognitiveCore._is_duplicate_response(r, [r]) is True
+        assert CognitiveCore._repeated_closing(r, [r]) is not None
+
+    def test_case_a_short_responses_still_ignored(self):
+        # Respostas de UMA palavra nunca sao duplicata nem padrao.
+        for w in ("Boa", "Fechou", "KKKK"):
+            assert CognitiveCore._is_duplicate_response(w, [w]) is False
+            assert CognitiveCore._repeated_closing(w, [w]) is None
+
+    def test_case_b_lexical_variation_detected_via_word_overlap(self):
+        # "ajudar hoje?" vs "ajudar?": jaccard de palavras >= 0.5.
+        assert CognitiveCore._repeated_closing(
+            "Como posso te ajudar?",
+            ["Como posso te ajudar hoje?"],
+        ) is not None
+
+    def test_case_c_semantic_variation_detected_via_help_offer_pattern(self):
+        # Variacoes semanticas da mesma oferta generica de ajuda.
+        variants = [
+            "O que posso fazer por você?",
+            "Em que posso ajudar?",
+            "Como posso te auxiliar?",
+            "Como posso te ajudar today?",
+            "How can I help?",
+        ]
+        for variant in variants:
+            assert CognitiveCore._repeated_closing(
+                variant, ["Como posso te ajudar hoje?"]
+            ) is not None, variant
+
+    def test_case_d_legitimate_question_not_blocked(self):
+        # Pergunta real e especifica NAO e confundida com a oferta generica.
+        assert CognitiveCore._repeated_closing(
+            "São 10h30. Você prefere continuar conversando?",
+            ["São 10h30. Como posso te ajudar?"],
+        ) is None
+
+    def test_case_d_specific_question_allowed(self):
+        # Pergunta sobre o CONTEXTO (nao template de encerramento) passa.
+        assert CognitiveCore._repeated_closing(
+            "São 10h30. Você prefere manhã ou tarde para trabalhar "
+            "no projeto?",
+            ["Como posso te ajudar hoje?"],
+        ) is None
+
+    def test_case_e_response_without_question_allowed(self):
+        assert CognitiveCore._repeated_closing(
+            "KKKK, agora entendi.",
+            ["Boa, isso explica o problema."],
+        ) is None
+
+    def test_case_f_full_session_pattern_detected(self, temp_db):
+        # Reproducao da sessao real: respostas terminando sempre com a
+        # oferta de ajuda, com corpos diferentes — camada 2 deve disparar.
+        from brain.conversation_engine import ConversationContext
+
+        config = DaviosConfig.load()
+        provider = SequencedProvider(
+            [
+                "KKKK, saquei. Como posso te ajudar hoje? 😊",
+                "Fechou, vamos nessa.",
+            ]
+        )
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        ctx = ConversationContext()
+        ctx.add_message(
+            "salve",
+            "Como posso te ajudar? 😊",
+            "conversation",
+        )
+        outcome = cognitive.generate_response("kkkk", context=ctx)
+        assert len(provider.calls) == 2
+        assert outcome["text"] == "Fechou, vamos nessa."
+        cognitive.memory_manager.database.close()
+
+    def test_retry_that_repeats_closing_is_rechecked_and_bounded(
+        self, temp_db
+    ):
+        # O retry NAO pode passar sem verificacao: se voltar com o mesmo
+        # padrao, e aceito com warning (limite de 1 retry, sem loop).
+        from brain.conversation_engine import ConversationContext
+
+        config = DaviosConfig.load()
+        provider = SequencedProvider(
+            [
+                "Boa. Como posso te ajudar hoje? 😊",
+                "Entendi. Como posso te ajudar hoje? 😊",  # retry repete
+            ]
+        )
+        cognitive = CognitiveCore(
+            llm_provider=provider,
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        cognitive.memory_manager = MemoryManager(db_path=temp_db)
+        ctx = ConversationContext()
+        ctx.add_message(
+            "fala ai",
+            "Opa. Como posso te ajudar hoje? 😊",
+            "conversation",
+        )
+        outcome = cognitive.generate_response("kkkk", context=ctx)
+        # Apenas 2 chamadas (original + 1 retry) — sem loop infinito.
+        assert len(provider.calls) == 2
+        cognitive.memory_manager.database.close()
+

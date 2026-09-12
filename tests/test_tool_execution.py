@@ -197,7 +197,7 @@ def am_registry():
 def test_action_manager_adapters_registered(am_registry):
     reg, am = am_registry
     expected = {cmd["name"] for cmd in am.list_commands()}
-    assert expected == {"datetime", "time", "echo", "list_dir"}
+    assert expected == {"datetime", "time", "echo", "list_dir", "read_file"}
     for cmd in am.list_commands():
         assert reg.has(cmd["name"])
         tool = reg.get(cmd["name"])

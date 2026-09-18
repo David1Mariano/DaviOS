@@ -32,6 +32,8 @@ class DaviosConfig:
     web_max_content_bytes: int = 200_000
     agent_server_host: str = "127.0.0.1"
     agent_server_port: int = 8765
+    # Model management
+    active_model_id: Optional[str] = None  # ID do modelo ativo no catálogo
     models_dir: str = "models"
     profiles_file: str = "model_profiles.json"
     profile_override: Optional[str] = None  # LIGHT/BALANCED/PERFORMANCE

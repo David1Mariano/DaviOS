@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -71,6 +72,10 @@ class LocalLlamaCppProvider(LLMProvider):
         # Nome REAL do modelo cargado no servidor (queried ao reutilizar un
         # servidor externo; setado ao iniciar uno nuevo). None = desconhecido.
         self._loaded_model: Optional[str] = None
+        # Lock de troca transacional: impede que duas trocas ocorram
+        # simultaneamente e impede que initialize() inicie um servidor enquanto
+        # uma troca estiver em andamento.
+        self._switch_lock: threading.Lock = threading.Lock()
 
     def initialize(self) -> bool:
         """Inicia llama-server.exe se ainda nao rodando. Nunca lanca excecao.
@@ -492,6 +497,411 @@ class LocalLlamaCppProvider(LLMProvider):
             logger.warning("[LLM] Erro ao encerrar llama-server: %s", e)
         finally:
             self._process = None
+
+    # ------------------------------------------------------------------ #
+    # Identidade do modelo (utilizados por switch_model e initialize)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _normalize_model_path(path: Optional[str]) -> Optional[Path]:
+        """Normaliza um caminho de modelo retornado pelo servidor para
+        comparacao com o caminho esperado.
+
+        O servidor pode retornar:
+        - caminho absoluto (ex: C:\\models\\qwen3.gguf)
+        - caminho relativo (ex: models\\qwen3.gguf)
+        - somente o nome do arquivo (ex: qwen3.gguf)
+
+        Quando recebe apenas o nome, nao eh possivel saber o diretorio
+        original; nesse caso retorna None para indicar "nome apenas".
+        """
+        if not path:
+            return None
+        p = Path(path)
+        if not p.is_absolute() and p.name == path:
+            # Serve clientes que retornam apenas o basename.
+            return None
+        try:
+            return Path(str(p)).resolve()
+        except (ValueError, OSError):
+            return None
+
+    def _models_match(
+        self, loaded: Optional[str], expected: Path
+    ) -> bool:
+        """Confirma se o modelo retornado pelo servidor corresponde ao
+        esperado.
+
+        Comparacao aceita:
+        - caminho absoluto equivalente (via resolve());
+        - caminho relativo equivalente (quando ambos sao relativos e
+          resolvem para o mesmo Path);
+        - somente nome de arquivo quando o servidor retorna apenas o
+          basename (neste caso compara o nome).
+        """
+        if loaded is None:
+            return False
+        normalized = self._normalize_model_path(loaded)
+        expected_resolved = expected.resolve()
+        if normalized is not None and normalized == expected_resolved:
+            return True
+        # Fallback por basename quando o servidor retorna apenas o nome.
+        if normalized is None:
+            return Path(loaded).name == expected_resolved.name
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Troca transacional de modelo
+    # ------------------------------------------------------------------ #
+
+    def switch_model(self, new_selection: ModelSelection) -> bool:
+        """Troca o modelo carregado em modo transacional.
+
+        Estrategia:
+        1. Valida entrada e bloqueia trocas concorrentes via _switch_lock.
+        2. Se o servidor atual for externo e nao controlavel, falha
+           explicitamente.
+        3. Se new_selection for o mesmo modelo do atual (comparacao de
+           caminho normalizado), retorna True sem reiniciar.
+        4. Faz snapshot do estado atual (A).
+        5. Para o servidor atual, se for proprio.
+        6. Tenta iniciar o novo servidor (B) com _start_server().
+        7. Verifica health e confirma a identidade real do modelo.
+        8. Em caso de sucesso, commit do estado (self.selection, flags,
+           _loaded_model, diagnostics).
+        9. Em caso de falha, executa rollback: para B se proprio, restaura
+           o estado A, reinicia A e confirma identidade de A.
+           Se A nao puder ser restaurado, deixa o provider indisponivel.
+        """
+        if (
+            new_selection is None
+            or new_selection.model is None
+            or new_selection.model.path is None
+        ):
+            self.diagnostics["[SWITCH]"] = "nova selecão inválida"
+            logger.warning("[LLM] switch_model: nova selecão inválida")
+            return False
+
+        with self._switch_lock:
+            return self._switch_model_inner(new_selection)
+
+    # Protected by _switch_lock (chamado dentro de switch_model).
+    def _switch_model_inner(self, new_selection: ModelSelection) -> bool:
+        """Implementacao interna protegida pelo lock."""
+        # 0. Validacao de estado atual.
+        if not self.is_available():
+            self.diagnostics["[SWITCH]"] = "provider nao disponivel para troca"
+            logger.warning("[LLM] switch_model: provider nao disponivel para troca")
+            return False
+
+        # 1. Servidor externo nao controlavel = operacao nao permitida.
+        if self._backend_used == "external" and self._process is None:
+            self.diagnostics["[SWITCH]"] = (
+                "servidor externo ativo e nao controlavel; troca nao realizada"
+            )
+            logger.warning(
+                "[LLM] switch_model: servidor externo ativo e nao controlavel; "
+                "troca nao realizada"
+            )
+            return False
+
+        # 2. Mesmo modelo: nao reinicia.
+        if self._same_model_as(new_selection):
+            self.diagnostics["[SWITCH]"] = "mesmo modelo; sem troca"
+            return True
+
+        # 3. Validacao previa do novo modelo (sem alterar o estado atual).
+        new_model_path = new_selection.model.path
+        if not Path(new_model_path).exists():
+            self.diagnostics["[SWITCH]"] = f"arquivo nao encontrado: {new_model_path}"
+            logger.warning("[LLM] switch_model: arquivo nao encontrado: %s", new_model_path)
+            return False
+
+        server_exe = self._find_server_exe()
+        if server_exe is None:
+            self.diagnostics["[SWITCH]"] = "llama-server.exe nao encontrado"
+            logger.warning("[LLM] switch_model: llama-server.exe nao encontrado")
+            return False
+
+        # 4. Snapshot do estado atual (A).
+        snapshot = self._snapshot_current_state()
+
+        # 5. Para o servidor atual (somente se proprio).
+        self._stop_current_if_ours()
+
+        # 6. Inicia novo servidor (B) com a nova selecao.
+        gen = dict(new_selection.generation or {})
+        n_threads = gen.get("threads") or self.config.threads or 4
+        ctx_size = gen.get("context_window") or self.config.context_window or 2048
+
+        backend_to_try: list[tuple[str, int]] = []
+        if self.config.use_gpu and not self._gpu_failed:
+            gpu_layers = gen.get("gpu_layers", self.config.gpu_layers)
+            if gpu_layers and gpu_layers > 0:
+                backend_to_try.append(("vulkan", gpu_layers))
+
+        backend_to_try.append(("cpu", 0))
+
+        b_success = False
+        last_backend_used: Optional[str] = None
+        for backend, gpu_layers in backend_to_try:
+            if backend == "vulkan":
+                ok = self._start_server(
+                    server_exe, new_model_path, n_threads, ctx_size,
+                    backend="vulkan", gpu_layers=gpu_layers,
+                )
+            else:
+                ok = self._start_server(
+                    server_exe, new_model_path, n_threads, ctx_size,
+                    backend="cpu", gpu_layers=0,
+                )
+            if ok:
+                last_backend_used = backend
+                b_success = True
+                break
+
+        if not b_success:
+            self.diagnostics["[SWITCH]"] = "falha ao iniciar novo servidor"
+            logger.error("[LLM] switch_model: falha ao iniciar novo servidor")
+            self._rollback_from(snapshot)
+            return False
+
+        # 7. Health check e confirmacao de identidade REAL de B.
+        loaded_model = self._query_loaded_model()
+        if loaded_model is None or not self._models_match(loaded_model, new_model_path):
+            self.diagnostics["[SWITCH]"] = "identidade do modelo B nao confirmada"
+            logger.error("[LLM] switch_model: identidade do modelo B nao confirmada")
+            self._rollback_from(snapshot)
+            return False
+
+        # 8. Commit do estado de B.
+        self.selection = new_selection
+        self._loaded_model = loaded_model
+        self._backend_used = last_backend_used or self._backend_used
+        self.diagnostics["[SWITCH]"] = f"troca concluida: {loaded_model}"
+        logger.info("[LLM] switch_model: troca concluida: %s", loaded_model)
+        return True
+
+    # ------------------------------------------------------------------ #
+    # Helpers privados para swap
+    # ------------------------------------------------------------------ #
+
+    def _same_model_as(self, new_selection: ModelSelection) -> bool:
+        """Verifica se new_selection representa o mesmo modelo ja carregado.
+
+        Compara o caminho atual com o caminho da nova selecao usando
+        normalizacao (resolve + fallback por nome).
+        """
+        if self._loaded_model is None:
+            current_path = (
+                self.selection.model.path
+                if self.selection and self.selection.model
+                else None
+            )
+            new_path = new_selection.model.path
+            if current_path is None or new_path is None:
+                return current_path == new_path
+            return (
+                self._normalize_model_path(str(current_path)) ==
+                self._normalize_model_path(str(new_path))
+            ) or (
+                current_path.name == new_path.name
+            )
+        current_resolved = self._normalize_model_path(self._loaded_model)
+        new_resolved = self._normalize_model_path(str(new_selection.model.path))
+        if current_resolved is not None and new_resolved is not None:
+            return current_resolved == new_resolved
+        # Fallback quando um dos lados eh apenas nome.
+        return (
+            (current_resolved is None and new_resolved is None and
+             Path(self._loaded_model).name == new_selection.model.path.name)
+            or
+            (current_resolved is not None and new_resolved is None and
+             current_resolved.name == new_selection.model.path.name)
+            or
+            (current_resolved is None and new_resolved is not None and
+             Path(self._loaded_model).name == new_resolved.name)
+        )
+
+    def _snapshot_current_state(self) -> dict[str, Any]:
+        """Salva o estado atual (A) para uso em caso de rollback."""
+        return {
+            "selection": self.selection,
+            "loaded_model": self._loaded_model,
+            "backend_used": self._backend_used,
+            "gpu_failed": self._gpu_failed,
+            "initialized": self._initialized,
+            "available": self._available,
+            "process": self._process,
+        }
+
+    def _restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Restaura os campos logicos do estado A a partir do snapshot."""
+        self.selection = snapshot.get("selection")
+        self._loaded_model = snapshot.get("loaded_model")
+        self._backend_used = snapshot.get("backend_used")
+        self._gpu_failed = snapshot.get("gpu_failed", False)
+        self._initialized = snapshot.get("initialized", False)
+        self._available = snapshot.get("available", False)
+
+    def _stop_current_if_ours(self) -> None:
+        """Para o servidor atual somente se for proprio (processo disponivel)."""
+        if self._process is not None:
+            self._cleanup_process()
+
+    def _server_ready_with_model(self, expected_model_path: Path) -> bool:
+        """Verifica se o servidor esta pronto (health) e se o modelo real
+        corresponde ao esperado.
+
+        Quando a identidade eh confirmada, registra em _loaded_model o valor
+        REAL devolvido pelo servidor (nao apenas o basename do arquivo).
+        """
+        if not self.is_available():
+            return False
+        loaded = self._query_loaded_model()
+        if loaded is None:
+            return False
+        if not self._models_match(loaded, expected_model_path):
+            return False
+        self._loaded_model = loaded
+        return True
+
+    def _rollback_from(self, snapshot: dict[str, Any]) -> bool:
+        """Tenta restaurar o estado A a partir do snapshot.
+
+        Retorna True se a restauracao foi bem-sucedida, False caso contrario.
+        O retorno para o chamador de switch_model deve ser False em qualquer
+        caso de falha de troca, mesmo que a restauracao tenha succeedido.
+        """
+        logger.warning("[LLM] switch_model: iniciando rollback para modelo anterior")
+        # 1. Limpa B se foi iniciado pelo provider (processo proprio).
+        self._cleanup_process()
+
+        # 2. Restaura campos logicos de A.
+        self._restore_snapshot(snapshot)
+
+        # 3. Reiniciar A.
+        #    Se o snapshot indicar que A era externo e nao controlavel, nao
+        #    tentamos reiniciar e apenas marcamos indisponivel.
+        if snapshot.get("backend_used") == "external" and snapshot.get("process") is None:
+            self._available = False
+            self._initialized = False
+            self.diagnostics["[SWITCH]"] = (
+                "rollback: servidor externo nao pode ser restaurado pelo provider"
+            )
+            logger.error(
+                "[LLM] switch_model: rollback: servidor externo nao pode ser "
+                "restaurado pelo provider"
+            )
+            return False
+
+        # Tenta reiniciar A somente se havia processo proprio registado.
+        if snapshot.get("process") is not None:
+            model_path = (
+                snapshot.get("selection").model.path
+                if snapshot.get("selection") and snapshot.get("selection").model
+                else None
+            )
+            if model_path is None or not model_path.exists():
+                self._available = False
+                self._initialized = False
+                self.diagnostics["[SWITCH]"] = (
+                    "rollback: modelo anterior nao disponivel para reinicio"
+                )
+                logger.error(
+                    "[LLM] switch_model: rollback: modelo anterior nao "
+                    "disponivel para reinicio"
+                )
+                return False
+
+            server_exe = self._find_server_exe()
+            if server_exe is None:
+                self._available = False
+                self._initialized = False
+                self.diagnostics["[SWITCH]"] = (
+                    "rollback: llama-server.exe nao encontrado para reinicio"
+                )
+                logger.error(
+                    "[LLM] switch_model: rollback: llama-server.exe nao "
+                    "encontrado para reinicio"
+                )
+                return False
+
+            gen = dict(
+                snapshot.get("selection").generation or {}
+            )
+            n_threads = gen.get("threads") or self.config.threads or 4
+            ctx_size = gen.get("context_window") or self.config.context_window or 2048
+
+            backend_to_try: list[tuple[str, int]] = []
+            if self.config.use_gpu and not self._gpu_failed:
+                gpu_layers = gen.get("gpu_layers", self.config.gpu_layers)
+                if gpu_layers and gpu_layers > 0:
+                    backend_to_try.append(("vulkan", gpu_layers))
+            backend_to_try.append(("cpu", 0))
+
+            restarted = False
+            for backend, gpu_layers in backend_to_try:
+                if backend == "vulkan":
+                    ok = self._start_server(
+                        server_exe, model_path, n_threads, ctx_size,
+                        backend="vulkan", gpu_layers=gpu_layers,
+                    )
+                else:
+                    ok = self._start_server(
+                        server_exe, model_path, n_threads, ctx_size,
+                        backend="cpu", gpu_layers=0,
+                    )
+                if ok:
+                    restarted = True
+                    break
+
+            if not restarted:
+                self._available = False
+                self._initialized = False
+                self.diagnostics["[SWITCH]"] = (
+                    "rollback: falha ao reiniciar servidor anterior"
+                )
+                logger.error(
+                    "[LLM] switch_model: rollback: falha ao reiniciar "
+                    "servidor anterior"
+                )
+                return False
+
+            # Confirma identidade de A.
+            if not self._server_ready_with_model(model_path):
+                self._available = False
+                self._initialized = False
+                self.diagnostics["[SWITCH]"] = (
+                    "rollback: servidor anterior reiniciado mas modelo "
+                    "incorreto ou indisponivel"
+                )
+                logger.error(
+                    "[LLM] switch_model: rollback: servidor anterior "
+                    "reiniciado mas modelo incorreto ou indisponivel"
+                )
+                return False
+
+            logger.info("[LLM] switch_model: rollback concluido com sucesso para A")
+            self.diagnostics["[SWITCH]"] = "rollback: servidor anterior restaurado"
+            return True
+
+        # Caso nao haja processo para reiniciar (ex: servidor anterior
+        # era externo), deixamos o provider indisponivel.
+        self._available = False
+        self._initialized = False
+        self.diagnostics["[SWITCH]"] = (
+            "rollback: nao ha servidor anterior controlavel para restauracao"
+        )
+        logger.error(
+            "[LLM] switch_model: rollback: nao ha servidor anterior "
+            "controlavel para restauracao"
+        )
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Health check
+    # ------------------------------------------------------------------ #
 
     def health_check(self) -> dict[str, Any]:
         info = super().health_check()

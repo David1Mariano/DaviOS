@@ -55,6 +55,10 @@ class ConversationResult:
     memories_used: list[Any] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
     should_exit: bool = False
+    # Etapa 6: resultado ESTRUTURADO de uma troca de modelo, quando a
+    # intencao foi MODEL_SWITCH. None nas demais interacoes — nenhuma
+    # mensagem comum passa a carregar estado de modelo.
+    model_switch: Optional[dict[str, Any]] = None
 
 
 class ConversationEngine:
@@ -75,11 +79,16 @@ class ConversationEngine:
         memory_manager: Optional[MemoryManager] = None,
         response_generator: Optional[ResponseGenerator] = None,
         cognitive_core=None,
+        model_manager=None,
     ):
         self.memory_manager = memory_manager or MemoryManager()
         self.reasoning = ReasoningEngine()
         self.response_generator = response_generator or ResponseGenerator()
         self.cognitive_core = cognitive_core
+        # Etapa 6: o engine NAO troca modelo por conta propria. Ele entrega o
+        # pedido estruturado ao ModelManager, que resolve no catalogo, valida,
+        # persiste e coordena o provider — nada de llama.cpp aqui.
+        self.model_manager = model_manager
         self.classifier = IntentClassifier()
         self.context = ConversationContext()
         # Garante que o nucleo cognitivo compartilhe o mesmo sistema de
@@ -121,11 +130,16 @@ class ConversationEngine:
                 context=self.context.to_dict(),
             )
 
-        intent = self.classifier.classify(text)
+        intent = self.classifier.classify(text, context=self.context)
+
+        # Etapa 6: unica intencao que altera estado do sistema. O engine so
+        # roteia: extracao/validacao/execucao ficam na camada de modelos.
+        if intent == Intent.MODEL_SWITCH:
+            return self._handle_model_switch(text)
 
         if intent == Intent.COMMAND:
             response = (
-                "Essa funcao ainda nao esta disponivel. Por enquanto eu "
+                "Essa funcao ainda nao esta disponible. Por enquanto eu "
                 "converso, lembro de informacoes e respondo perguntas."
             )
             self.context.add_message(text, response, "command")
@@ -138,7 +152,15 @@ class ConversationEngine:
         if intent == Intent.MEMORY_QUERY:
             return self._handle_question(text)
 
-        if intent in (Intent.GENERAL_QUESTION, Intent.OPINION):
+        if intent in (
+            Intent.GENERAL_QUESTION,
+            Intent.OPINION,
+            Intent.SOCIAL,
+            Intent.SOCIAL_RECIPROCAL,
+            Intent.FOLLOW_UP,
+            Intent.FILE_REQUEST,
+            Intent.TIME_REQUEST,
+        ):
             return self._handle_llm_question(text, intent)
 
         if intent == Intent.MEMORY_STATEMENT:
@@ -166,6 +188,142 @@ class ConversationEngine:
         }
         first_word = text_lower.split()[0] if text_lower else ""
         return first_word in starters
+
+    # ------------------------------------------------------------------ #
+    # Troca de modelo por linguagem natural (etapa 6)
+    # ------------------------------------------------------------------ #
+    # O engine NAO conhece IDs, quantizacoes nem llama.cpp. Ele recebe a
+    # intencao estruturada (Intent.MODEL_SWITCH + ModelSwitchRequest), entrega
+    # o alvo em linguagem natural ao ModelManager e traduz o resultado:
+    #
+    #   mensagem -> intent -> ModelManager.resolve_model() -> catalogo
+    #            -> ModelManager.switch_active_model() -> provider -> resposta
+    #
+    # Fonte unica da verdade: quem decide e executa e o ModelManager.
+
+    def _handle_model_switch(self, text: str) -> ConversationResult:
+        """Atende uma ordem explicita de troca de modelo.
+
+        Estados possiveis (campo `status` do resultado estruturado):
+        switched | need_target | not_found | not_installed | switch_failed |
+        divergent | unavailable.
+        """
+        request = self.classifier.is_model_switch_request(text)
+        target = (request.target if request is not None else "").strip()
+        outcome: dict[str, Any] = {
+            "success": False,
+            "requested_model": target or None,
+            "resolved_model": None,
+            "previous_model": None,
+            "error": None,
+            "status": "unavailable",
+        }
+
+        manager = self.model_manager
+        if manager is None:
+            outcome["error"] = "gerenciador de modelos indisponivel nesta sessao"
+            return self._finish_model_switch(
+                "O gerenciamento de modelos nao esta ativo nesta sessao.",
+                outcome,
+                text,
+            )
+
+        if not target:
+            # Pedido sem alvo ("quero um modelo grande"): nada e escolhido em
+            # silencio. Pedimos que a pessoa nomeie o modelo.
+            outcome["status"] = "need_target"
+            return self._finish_model_switch(
+                "Qual modelo voce quer que eu use? Diga o nome ou o tamanho "
+                '(por exemplo, "Qwen 8B") ou um tier como "leve" ou "forte".',
+                outcome,
+                text,
+            )
+
+        # Resolucao delegada: sem casamento no catalogo, nada e inventado.
+        resolved = manager.resolve_model(target)
+        if resolved is None:
+            outcome["status"] = "not_found"
+            outcome["error"] = f"modelo nao encontrado no catalogo: {target!r}"
+            return self._finish_model_switch(
+                "Nao encontrei esse modelo no catalogo. Nada foi alterado.",
+                outcome,
+                text,
+            )
+        outcome["resolved_model"] = resolved.id
+
+        if not resolved.is_installed():
+            # Catalogado mas ausente no disco: NAO baixamos nesta etapa e NAO
+            # trocamos para outro modelo por conta propria.
+            outcome["status"] = "not_installed"
+            outcome["error"] = (
+                f"{resolved.id} esta no catalogo mas o arquivo nao existe; "
+                "download nao faz parte desta etapa"
+            )
+            return self._finish_model_switch(
+                f"Nao consegui trocar para {resolved.name} porque o modelo "
+                "nao esta instalado. Nada foi baixado e o modelo atual "
+                "continua o mesmo.",
+                outcome,
+                text,
+            )
+
+        previous = manager.get_active_model()
+        outcome["previous_model"] = previous.id if previous is not None else None
+
+        # Execucao real: validacao + provider + persistencia + rollback.
+        switched = manager.switch_active_model(resolved)
+        if switched is None:
+            # Falha do gerenciador chega aqui intacta, com o motivo real.
+            outcome["error"] = (
+                getattr(manager, "last_error", "")
+                or "troca nao realizada pelo gerenciador de modelos"
+            )
+            if self._model_runtime_diverged(manager):
+                outcome["status"] = "divergent"
+                response = (
+                    "A troca encontrou um erro durante a recuperacao do "
+                    "estado. O runtime e o registro podem estar divergentes."
+                )
+            else:
+                outcome["status"] = "switch_failed"
+                response = (
+                    "A troca para o modelo solicitado falhou. O modelo "
+                    "anterior foi preservado."
+                )
+            return self._finish_model_switch(response, outcome, text)
+
+        outcome["success"] = True
+        outcome["status"] = "switched"
+        outcome["resolved_model"] = switched.id
+        return self._finish_model_switch(
+            f"Modelo alterado para {switched.name}.", outcome, text
+        )
+
+    @staticmethod
+    def _model_runtime_diverged(manager) -> bool:
+        """True so quando o status AFIRMA que registro e runtime divergem.
+
+        Um `None` (provider sem identidade confiavel) nao e divergencia: nao
+        afirmamos problema sem evidencia.
+        """
+        try:
+            status = manager.get_status()
+        except Exception:
+            return False
+        return status.get("active_model_matches_loaded") is False
+
+    def _finish_model_switch(
+        self, response: str, outcome: dict[str, Any], text: str
+    ) -> ConversationResult:
+        """Fecha a interacao registrando resposta, contexto e resultado."""
+        self.context.add_message(text, response, "model_switch")
+        return ConversationResult(
+            response=response,
+            intent="model_switch",
+            memory_action="model_switch",
+            context=self.context.to_dict(),
+            model_switch=outcome,
+        )
 
     def _handle_question(self, text: str) -> ConversationResult:
         """Perguntas de memoria: LLM com fatos recuperados; regras como fallback."""
@@ -278,7 +436,7 @@ class ConversationEngine:
 
 
     def _handle_statement(self, text: str) -> ConversationResult:
-        intent = self.classifier.classify(text)
+        intent = self.classifier.classify(text, context=self.context)
         context = self.memory_manager.context_analyzer.analyze(text)
         emotions = self._build_emotions(context)
         interpretation = MemoryInterpreter().interpret(text, context, emotions)

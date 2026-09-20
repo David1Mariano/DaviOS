@@ -363,6 +363,11 @@ class LocalLlamaCppProvider(LLMProvider):
         except Exception:
             return False
 
+    @property
+    def loaded_model(self) -> Optional[str]:
+        """Identificador do modelo efetivamente confirmado no servidor."""
+        return self._loaded_model
+
     def generate(self, request: LLMRequest) -> LLMResponse:
         """Envia request HTTP para /v1/chat/completions."""
         if not self.is_available() and not self.initialize():

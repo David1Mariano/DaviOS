@@ -197,12 +197,36 @@ def _read_config(workspace: Path) -> dict:
     return json.loads((workspace / "config" / "davios.json").read_text("utf-8"))
 
 
+def _fail_persist(manager, model_id: str) -> bool:
+    """Simula falha de persistencia para testes de rollback."""
+    manager._last_error = (
+        f"falha simulada ao persistir active_model_id: {model_id}"
+    )
+    return False
+
+
 class RecordingProvider:
     """Provider fake: registra chamadas para provar que nada é iniciado."""
 
-    def __init__(self, available: bool = True) -> None:
+    def __init__(
+        self,
+        available: bool = True,
+        switch_result: bool = True,
+        switch_results=None,
+        switch_exception: Exception | None = None,
+        switch_observer=None,
+        loaded_model: str | None = None,
+        available_exception: Exception | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self.available = available
+        self.switch_result = switch_result
+        self.switch_results = switch_results
+        self.switch_exception = switch_exception
+        self.switch_observer = switch_observer
+        self.switch_selections = []
+        self.loaded_model = loaded_model
+        self.available_exception = available_exception
 
     def initialize(self) -> bool:
         self.calls.append("initialize")
@@ -213,7 +237,29 @@ class RecordingProvider:
 
     def is_available(self) -> bool:
         self.calls.append("is_available")
+        if self.available_exception is not None:
+            raise self.available_exception
         return self.available
+
+    def switch_model(self, selection) -> bool:
+        self.calls.append("switch_model")
+        self.switch_selections.append(selection)
+        if self.switch_observer is not None:
+            self.switch_observer(selection)
+        if self.switch_exception is not None:
+            raise self.switch_exception
+        if self.switch_results is not None:
+            if not self.switch_results:
+                result = self.switch_result
+            else:
+                result = self.switch_results.pop(0)
+        else:
+            result = self.switch_result
+        # Simula atualizacao de loaded_model pelo provider real.
+        if result is True and selection is not None and selection.model is not None:
+            if selection.model.path is not None:
+                self.loaded_model = str(selection.model.path)
+        return result
 
 # --------------------------------------------------------------------- #
 # Catálogo carregado, listagens e resolução
@@ -602,6 +648,259 @@ class TestActiveModelPersistence:
         assert manager.get_active_model().id == SMALL
 
 
+class TestActiveModelSwitch:
+    def test_success_returns_target_after_provider_confirms(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        active_ids_seen_by_provider: list[str | None] = []
+        provider = RecordingProvider(
+            switch_observer=lambda _selection: active_ids_seen_by_provider.append(
+                _read_config(workspace).get("active_model_id")
+            )
+        )
+        manager.attach_provider(provider)
+
+        result = manager.switch_active_model(BIG)
+
+        assert result is not None
+        assert result.id == BIG
+        assert provider.calls == ["switch_model"]
+        assert len(provider.switch_selections) == 1
+        assert provider.switch_selections[0].model is not None
+        assert provider.switch_selections[0].model.path.name == f"{BIG}.gguf"
+        # A confirmação do provider acontece antes da persistência de B.
+        assert active_ids_seen_by_provider == [SMALL]
+        assert _read_config(workspace)["active_model_id"] == BIG
+        assert manager.active_model_id == BIG
+        assert manager.get_active_model().id == BIG
+        assert "initialize" not in provider.calls
+        assert "unload" not in provider.calls
+
+    def test_provider_false_keeps_previous_active_model(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider(switch_result=False)
+        manager.attach_provider(provider)
+
+        assert manager.switch_active_model(BIG) is None
+        assert provider.calls == ["switch_model"]
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+        assert manager.get_active_model().id == SMALL
+        assert manager.active_state == ACTIVE_STATE_PERSISTED
+
+    def test_provider_exception_keeps_previous_model_and_sets_error(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider(switch_exception=RuntimeError("falha no switch"))
+        manager.attach_provider(provider)
+
+        assert manager.switch_active_model(BIG) is None
+        assert provider.calls == ["switch_model"]
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+        assert manager.get_active_model().id == SMALL
+        assert manager.last_error
+
+    def test_without_provider_is_refused_without_persisting_target(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+
+        assert manager.switch_active_model(BIG) is None
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+        assert "provider" in manager.last_error.lower()
+
+    def test_provider_without_switch_model_does_not_manage_lifecycle(self, workspace):
+        class ProviderWithoutSwitch:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def initialize(self) -> bool:
+                self.calls.append("initialize")
+                return True
+
+            def unload(self) -> None:
+                self.calls.append("unload")
+
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = ProviderWithoutSwitch()
+        manager.attach_provider(provider)
+
+        assert manager.switch_active_model(BIG) is None
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert provider.calls == []
+
+    def test_unknown_request_does_not_call_provider_or_change_active_model(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider()
+        manager.attach_provider(provider)
+
+        assert manager.switch_active_model("modelo fantasma") is None
+        assert provider.calls == []
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+
+    def test_not_installed_target_does_not_call_provider(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL,),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider()
+        manager.attach_provider(provider)
+
+        assert manager.switch_active_model(BIG, require_installed=True) is None
+        assert provider.calls == []
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+
+    def test_successful_switch_creates_no_extra_files(self, workspace):
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider()
+        manager.attach_provider(provider)
+        before = {path for path in workspace.rglob("*") if path.is_file()}
+
+        assert manager.switch_active_model(BIG).id == BIG
+
+        after = {path for path in workspace.rglob("*") if path.is_file()}
+        assert after == before
+        assert list(workspace.rglob("*.part")) == []
+        assert list(workspace.rglob("*.tmp")) == []
+
+    def test_persistence_failure_triggers_rollback_to_previous(self, workspace):
+        """Caso 3: switch B OK, persistencia falha, rollback B->A OK.
+
+        O provider e chamado duas vezes (B depois A). O registro continua
+        em A e o runtime volta para A — estado consistente.
+        """
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider(switch_results=[True, True])
+        manager.attach_provider(provider)
+
+        # Simula falha de persistencia de B
+        manager._write_persisted_active_id = lambda mid: _fail_persist(
+            manager, mid
+        )
+
+        result = manager.switch_active_model(BIG)
+
+        assert result is None
+        assert len(provider.switch_selections) == 2
+        assert provider.switch_selections[0].model.path.name == f"{BIG}.gguf"
+        assert provider.switch_selections[1].model.path.name == f"{SMALL}.gguf"
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+        assert provider.loaded_model == str(
+            provider.switch_selections[1].model.path
+        )
+        status = manager.get_status()
+        assert status["active_model_matches_loaded"] is True
+
+    def test_persistence_failure_and_rollback_failure_leaves_divergence(
+        self, workspace
+    ):
+        """Caso 4: switch B OK, persistencia falha, rollback B->A falha.
+
+        O provider e chamado duas vezes, mas o rollback falha. O runtime
+        fica em B e o registro em A — divergencia explicitamente visivel.
+        """
+        manager = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager.set_active_model(SMALL)
+        provider = RecordingProvider(switch_results=[True, False])
+        manager.attach_provider(provider)
+
+        manager._write_persisted_active_id = lambda mid: _fail_persist(
+            manager, mid
+        )
+
+        result = manager.switch_active_model(BIG)
+
+        assert result is None
+        assert len(provider.switch_selections) == 2
+        assert _read_config(workspace)["active_model_id"] == SMALL
+        assert manager.active_model_id == SMALL
+        assert provider.loaded_model == str(
+            provider.switch_selections[0].model.path
+        )
+        status = manager.get_status()
+        assert status["active_model_matches_loaded"] is False
+        msg = manager.last_error.lower()
+        assert "persist" in msg
+        assert "rollback" in msg
+        assert "diverg" in msg
+
+    def test_persistence_failure_distinct_from_physical_failure(self, workspace):
+        """Caso 5: persistencia falha dispara rollback; falha fisica nao."""
+        # Sub-caso A: persistencia falha -> switch_model chamado 2x
+        manager_a = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager_a.set_active_model(SMALL)
+        provider_a = RecordingProvider(switch_results=[True, True])
+        manager_a.attach_provider(provider_a)
+        manager_a._write_persisted_active_id = lambda mid: _fail_persist(
+            manager_a, mid
+        )
+        manager_a.switch_active_model(BIG)
+        assert len(provider_a.switch_selections) == 2
+
+        # Sub-caso B: switch fisico falha -> switch_model chamado 1x
+        manager_b = _make_manager(
+            workspace,
+            hardware=_hardware(ram_total_gb=64.0, ram_available_gb=48.0),
+            install=(SMALL, BIG),
+        )
+        manager_b.set_active_model(SMALL)
+        provider_b = RecordingProvider(switch_result=False)
+        manager_b.attach_provider(provider_b)
+        manager_b.switch_active_model(BIG)
+        assert len(provider_b.switch_selections) == 1
+
+
 # --------------------------------------------------------------------- #
 # Efeitos colaterais: nada de llama-server, nada de download
 # --------------------------------------------------------------------- #
@@ -663,6 +962,106 @@ class TestNoSideEffects:
 
         manager.attach_provider(RecordingProvider(available=False))
         assert manager.get_status()["provider_running"] is False
+
+
+class TestRuntimeModelStatus:
+    def test_status_without_provider_keeps_runtime_unknown(self, workspace):
+        manager = _make_manager(workspace, install=(SMALL,))
+        manager.set_active_model(SMALL)
+
+        status = manager.get_status()
+
+        assert status["provider_running"] is None
+        assert status["loaded_model"] is None
+        assert status["active_model_matches_loaded"] is None
+
+    def test_status_reports_available_provider(self, workspace):
+        manager = _make_manager(workspace, install=(SMALL,))
+        manager.attach_provider(RecordingProvider(available=True))
+
+        status = manager.get_status()
+
+        assert status["provider_running"] is True
+
+    def test_status_reports_unavailable_provider(self, workspace):
+        manager = _make_manager(workspace, install=(SMALL,))
+        manager.attach_provider(RecordingProvider(available=False))
+
+        status = manager.get_status()
+
+        assert status["provider_running"] is False
+
+    def test_status_matches_registered_model_to_loaded_model(self, workspace):
+        manager = _make_manager(workspace, install=(SMALL, BIG))
+        manager.set_active_model(SMALL)
+        manager.attach_provider(RecordingProvider(loaded_model=SMALL))
+
+        status = manager.get_status()
+
+        assert status["active_model_id"] == SMALL
+        assert status["loaded_model"] == SMALL
+        assert status["active_model_matches_loaded"] is True
+
+    def test_status_exposes_loaded_model_divergence(self, workspace):
+        manager = _make_manager(workspace, install=(SMALL, BIG))
+        manager.set_active_model(SMALL)
+        manager.attach_provider(RecordingProvider(loaded_model=BIG))
+
+        status = manager.get_status()
+
+        assert status["active_model_id"] == SMALL
+        assert status["loaded_model"] == BIG
+        assert status["active_model_matches_loaded"] is False
+
+    def test_status_handles_provider_without_loaded_model_information(self, workspace):
+        class ProviderWithoutLoadedModel:
+            def is_available(self) -> bool:
+                return True
+
+        manager = _make_manager(workspace, install=(SMALL,))
+        manager.set_active_model(SMALL)
+        manager.attach_provider(ProviderWithoutLoadedModel())
+
+        status = manager.get_status()
+
+        assert status["provider_running"] is True
+        assert status["loaded_model"] is None
+        assert status["active_model_matches_loaded"] is None
+
+    def test_status_handles_health_check_exception(self, workspace):
+        manager = _make_manager(workspace, install=(SMALL,))
+        manager.attach_provider(
+            RecordingProvider(available_exception=RuntimeError("health check falhou"))
+        )
+
+        status = manager.get_status()
+
+        assert status["provider_running"] is None
+        assert manager.last_error
+        assert "health check falhou" in manager.last_error
+
+    def test_status_handles_loaded_model_property_exception(self, workspace):
+        """Se provider.loaded_model levanta excecao, get_status nao quebra."""
+        class ProviderWithBrokenIdentity:
+            available = True
+
+            def is_available(self) -> bool:
+                return True
+
+            @property
+            def loaded_model(self):
+                raise RuntimeError("nao foi possivel consultar a identidade")
+
+        manager = _make_manager(workspace, install=(SMALL,))
+        manager.set_active_model(SMALL)
+        manager.attach_provider(ProviderWithBrokenIdentity())
+
+        status = manager.get_status()
+
+        assert status["provider_running"] is True
+        assert status["loaded_model"] is None
+        assert status["active_model_matches_loaded"] is None
+        assert "nao foi possivel consultar a identidade" in manager.last_error
 
 
 # --------------------------------------------------------------------- #

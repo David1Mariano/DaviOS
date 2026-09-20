@@ -50,6 +50,7 @@ def build_engine(config: DaviosConfig):
     standalone = LocalLlamaCppProvider(
         config=config, model_manager=model_manager, selection=selection
     )
+    model_manager.attach_provider(standalone)
     if standalone.initialize():
         provider = standalone
         print(
@@ -68,6 +69,7 @@ def build_engine(config: DaviosConfig):
         provider = LocalLLMProvider(
             config=config, model_manager=model_manager, selection=selection
         )
+        model_manager.attach_provider(provider)
         provider.initialize()  # tolerante: False se backend/modelo ausentes
         if provider.is_available():
             print("[BACKEND] llama-cpp-python (in-process) ativo.")
@@ -100,7 +102,10 @@ def build_engine(config: DaviosConfig):
 
     # O MemoryManager do engine e compartilhado com o CognitiveCore no
     # construtor do engine — memória persistente disponível ao LLM.
-    engine = ConversationEngine(cognitive_core=cognitive)
+    # O ModelManager entra aqui para que pedidos explícitos de troca de modelo
+    # ("Davi, troca para o Qwen 8B") cheguem a switch_active_model() e não a
+    # um caminho paralelo.
+    engine = ConversationEngine(cognitive_core=cognitive, model_manager=model_manager)
     return engine, hardware, model_manager, selection, provider
 
 

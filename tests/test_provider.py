@@ -211,6 +211,8 @@ class TestGenerate:
             "Qwen3-4B-Q4_K_M.gguf (carregado no servidor externo)."
         )
         assert provider.health_check()["model"] == "Qwen3-4B-Q4_K_M.gguf"
+        assert provider.loaded_model == "Qwen3-4B-Q4_K_M.gguf"
+        assert provider.loaded_model == provider._loaded_model
 
     def test_external_server_unknown_model_does_not_guess(
         self, mock_config, mock_selection
@@ -233,6 +235,23 @@ class TestGenerate:
         assert "desconocido" in provider.diagnostics["[MODEL]"]
         assert "nao verificado" in provider.diagnostics["[MODEL]"]
         assert provider.health_check()["model"] == "test-model"
+
+    def test_loaded_model_property_exposes_internal_state(
+        self, mock_config, mock_selection
+    ):
+        """A propriedade loaded_model expõe _loaded_model sem lógica oculta."""
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(
+                config=mock_config,
+                selection=mock_selection,
+            )
+        # Antes de iniciar: None
+        assert provider._loaded_model is None
+        assert provider.loaded_model is None
+        # Simula runtime com modelo carregado
+        provider._loaded_model = "Qwen3-4B-Q4_K_M.gguf"
+        assert provider.loaded_model == "Qwen3-4B-Q4_K_M.gguf"
+        assert provider.loaded_model == provider._loaded_model
 
     def test_generate_timeout(self, mock_config, mock_selection):
         """Testa timeout na geracao."""

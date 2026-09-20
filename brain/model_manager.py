@@ -925,21 +925,17 @@ class ModelManager:
         self._active_state = ACTIVE_STATE_AUTO if model else ACTIVE_STATE_NONE
         return model
 
-    def set_active_model(
+    def _validate_active_target(
         self, request: Any, require_installed: bool = True
     ) -> Optional[ModelInfo]:
-        """Registra o modelo ativo (estado lógico + active_model_id em disco).
+        """Valida um pedido de modelo ativo sem persistir nada.
 
-        Esta etapa NÃO reinicia o llama-server. A troca real (parar A ->
-        iniciar B -> health check -> rollback) pertence ao provider e será
-        coordenada aqui numa etapa separada; enquanto isso, esta função apenas
-        decide e grava.
-
-        Só grava depois de validar: id resolvido no catálogo, arquivo presente
-        (por padrão) e compatibilidade não-incompatível. Se qualquer validação
-        falhar, o modelo ativo ANTERIOR permanece intacto e o motivo fica em
-        `last_error` — nunca deixamos o DaviOS sem referência de modelo por
-        causa de um pedido inválido.
+        Concentra exatamente as validações que `set_active_model()` fazia
+        antes de gravar: resolve o id no catálogo, confere instalação
+        (quando `require_installed=True`) e compatibilidade com o hardware.
+        Preenche `last_error` quando a validação falha e devolve o ModelInfo
+        válido quando todas passam. Não escreve em disco e não altera
+        `_active_state` — quem persiste é quem chama.
         """
         model = self.resolve_model(request)
         if model is None:
@@ -965,6 +961,28 @@ class ModelManager:
             logger.warning("[MODEL][ERROR] %s", self._last_error)
             return None
 
+        return model
+
+    def set_active_model(
+        self, request: Any, require_installed: bool = True
+    ) -> Optional[ModelInfo]:
+        """Registra o modelo ativo (estado lógico + active_model_id em disco).
+
+        Esta etapa NÃO reinicia o llama-server. A troca real (parar A ->
+        iniciar B -> health check -> rollback) pertence ao provider e será
+        coordenada aqui numa etapa separada; enquanto isso, esta função apenas
+        decide e grava.
+
+        Só grava depois de validar: id resolvido no catálogo, arquivo presente
+        (por padrão) e compatibilidade não-incompatível. Se qualquer validação
+        falhar, o modelo ativo ANTERIOR permanece intacto e o motivo fica em
+        `last_error` — nunca deixamos o DaviOS sem referência de modelo por
+        causa de um pedido inválido.
+        """
+        model = self._validate_active_target(request, require_installed)
+        if model is None:
+            return None
+
         if not self._write_persisted_active_id(model.id):
             return None
 
@@ -972,6 +990,132 @@ class ModelManager:
         self._last_error = ""
         logger.info("[MODEL] modelo ativo: %s", model.id)
         return model
+
+    def switch_active_model(
+        self, request: Any, require_installed: bool = True
+    ) -> Optional[ModelInfo]:
+        """Coordena a troca transacional de modelo com o provider.
+
+        O ModelManager decide e valida; o provider executa o runtime
+        (llama-server, health check, identidade real e rollback). O novo
+        active_model_id SO e persistido depois de provider.switch_model()
+        retornar True — o registro nunca fica a frente do processo real.
+
+        Quando a troca fisica A->B for confirmada mas a persistencia de B
+        falhar, o ModelManager tenta rollback fisico B->A atraves do mesmo
+        provider.switch_model(). Isso mantem runtime e registro consistentes
+        quando possivel; quando o rollback tambem falhar, a divergencia e
+        reportada explicitamente em get_status() (active_model_matches_loaded
+        == False), sem mascarar como sucesso.
+
+        Nenhuma logica de llama.cpp / subprocess / porta / HTTP vaza para
+        esta camada: o rollback usa apenas provider.switch_model().
+        """
+        model = self._validate_active_target(request, require_installed)
+        if model is None:
+            # last_error ja foi definido pela validacao; nada mais a fazer.
+            return None
+
+        if self._provider is None:
+            self._last_error = (
+                "nenhum provider anexado (attach_provider); troca nao realizada"
+            )
+            logger.warning("[MODEL] %s", self._last_error)
+            return None
+
+        switch_model_fn = getattr(self._provider, "switch_model", None)
+        if not callable(switch_model_fn):
+            self._last_error = (
+                "provider nao suporta troca de modelo (switch_model); "
+                "troca nao realizada"
+            )
+            logger.warning("[MODEL] %s", self._last_error)
+            return None
+
+        # Captura o modelo anterior para possivel rollback fisico.
+        prev_id = self._read_persisted_active_id()
+        previous_model = (
+            self.catalog.get_model_by_id(prev_id) if prev_id else None
+        )
+
+        selection = self.build_selection(model)
+
+        try:
+            switched = switch_model_fn(selection)
+        except Exception as exc:
+            self._last_error = f"provider falhou durante a troca: {exc}"
+            logger.error("[MODEL] %s", self._last_error)
+            return None
+
+        if switched is not True:
+            self._last_error = (
+                "troca recusada pelo provider; estado anterior mantido"
+            )
+            logger.warning("[MODEL] %s", self._last_error)
+            return None
+
+        # Provider confirmou A->B: agora persiste o novo ativo.
+        try:
+            persisted = self.set_active_model(model)
+        except Exception as exc:
+            persisted = None
+            self._last_error = f"persistencia levantou excecao: {exc}"
+            logger.error("[MODEL] %s", self._last_error)
+
+        if persisted is None:
+            persist_error = self._last_error
+            rolled_back = False
+            rollback_detail = "nenhuma tentativa realizada"
+
+            if previous_model is not None:
+                rollback_selection = self.build_selection(previous_model)
+                try:
+                    rollback_result = switch_model_fn(rollback_selection)
+                except Exception as exc:
+                    rollback_detail = f"provider falhou no rollback: {exc}"
+                    logger.error("[MODEL] %s", rollback_detail)
+                else:
+                    if rollback_result is True:
+                        rolled_back = True
+                    else:
+                        rollback_detail = "provider recusou o rollback"
+                        logger.warning("[MODEL] %s", rollback_detail)
+            else:
+                rollback_detail = "nenhum modelo anterior para rollback"
+
+            if rolled_back:
+                logger.warning(
+                    "[MODEL] persistencia falhou, rollback B->A concluido; "
+                    "estado consistente em %s", previous_model.id,
+                )
+                self._last_error = (
+                    f"persistencia do novo modelo ({model.id}) falhou "
+                    f"({persist_error}); rollback fisico concluido para "
+                    f"{previous_model.id}"
+                )
+            else:
+                logger.error(
+                    "[MODEL] persistencia falhou e rollback falhou; "
+                    "runtime e registro divergentes",
+                )
+                if previous_model is not None:
+                    self._last_error = (
+                        f"persistencia do novo modelo ({model.id}) falhou; "
+                        f"rollback falhou ({rollback_detail}); "
+                        f"estado divergente: registro={previous_model.id}, "
+                        f"runtime em {model.id}"
+                    )
+                else:
+                    self._last_error = (
+                        f"persistencia do novo modelo ({model.id}) falhou; "
+                        f"rollback falhou ({rollback_detail}); "
+                        f"estado divergente: registro=none, "
+                        f"runtime em {model.id}"
+                    )
+            return None
+
+        logger.info("[MODEL] troca concluida: %s", model.id)
+        return persisted
 
     @property
     def last_error(self) -> str:
@@ -988,18 +1132,61 @@ class ModelManager:
         `active_model_state` e `persisted_active_model_id` podem divergir: o
         registro é uma INTENÇÃO. Quem sabe se há servidor no ar é o provider,
         consultado em `provider_running` (None quando não há provider ligado).
+        `loaded_model` é a identidade que o provider confirmou no runtime;
+        nunca é inferida da seleção lógica.
         """
         active = self.get_active_model()
         hardware = self.detect_hardware()
 
         provider_running: Optional[bool] = None
+        loaded_model: Optional[str] = None
+        status_errors: list[str] = []
         if self._provider is not None:
             checker = getattr(self._provider, "is_available", None)
             if callable(checker):
                 try:
                     provider_running = bool(checker())
                 except Exception as exc:  # defensivo: status nunca pode quebrar
-                    logger.warning("[MODEL] provider falhou no health check: %s", exc)
+                    message = f"provider falhou no health check: {exc}"
+                    status_errors.append(message)
+                    logger.warning("[MODEL] %s", message)
+
+            try:
+                runtime_identity = getattr(self._provider, "loaded_model", None)
+                if callable(runtime_identity):
+                    runtime_identity = runtime_identity()
+                if runtime_identity is not None:
+                    identity = str(runtime_identity).strip()
+                    loaded_model = identity or None
+            except Exception as exc:  # defensivo: provider pode não expor identidade
+                message = f"provider falhou ao informar modelo carregado: {exc}"
+                status_errors.append(message)
+                logger.warning("[MODEL] %s", message)
+
+        if status_errors:
+            self._last_error = "; ".join(status_errors)
+
+        active_model_matches_loaded: Optional[bool] = None
+        if active is not None and loaded_model is not None:
+            def identity_parts(value: Any) -> set[str]:
+                text = str(value).strip()
+                if not text:
+                    return set()
+                normalized = text.replace("\\", "/").rstrip("/")
+                basename = normalized.rsplit("/", 1)[-1]
+                stem = Path(basename).stem
+                return {
+                    part.casefold()
+                    for part in (text, normalized, basename, stem)
+                    if part
+                }
+
+            active_identities: set[str] = set()
+            for value in (active.id, active.path, active.filename):
+                active_identities.update(identity_parts(value))
+            active_model_matches_loaded = bool(
+                active_identities & identity_parts(loaded_model)
+            )
 
         return {
             "active_model_id": active.id if active else None,
@@ -1007,6 +1194,8 @@ class ModelManager:
             "active_model_state": self._active_state,
             "persisted_active_model_id": self._read_persisted_active_id(),
             "provider_running": provider_running,
+            "loaded_model": loaded_model,
+            "active_model_matches_loaded": active_model_matches_loaded,
             "catalog_total": len(self.catalog),
             "installed_count": len(self.catalog.get_installed_models()),
             "hardware": {

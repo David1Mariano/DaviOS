@@ -40,6 +40,7 @@ class Intent(str, Enum):
     MODEL_LIST = "model_list"
     MODEL_LIST_INSTALLED = "model_list_installed"
     MODEL_LIST_AVAILABLE = "model_list_available"
+    MODEL_INFO = "model_info"
     MODEL_SWITCH = "model_switch"
     MODEL_DOWNLOAD = "model_download"
     MODEL_REQUIREMENTS = "model_requirements"
@@ -123,6 +124,7 @@ MODEL_STATUS_MARKERS = (
     "qual modelo", "qual e o modelo", "que modelo", "modelo atual",
     "modelo que voce", "modelo que você", "modelo usado", "modelo em uso",
     "modelo ativo", "modelo que ta", "modelo que está",
+    "usando o modelo", "modelo configurado", "modelo que foi",
 )
 
 MODEL_LIST_MARKERS = (
@@ -131,6 +133,46 @@ MODEL_LIST_MARKERS = (
     "modelos disponíveis", "modelos instlados", "modelos instalados",
     "modelos que tenho", "modelos no pc", "modelos no computador",
 )
+
+# --- Consultas read-only de modelo (etapa 7) ----------------------------
+# Consulta ≠ ação: estas expressões perguntam sobre ESTADO e nunca alteram
+# nada. Comparações ("qual é melhor?") e explicações ("me explique o qwen
+# 8b") ficam de fora — viram opinião/pergunta genérica.
+MODEL_STATUS_STATE_RE = re.compile(
+    r"\b(?:carregad\w*|rodando|ativo|ativa|em\s+uso|em\s+execucao|usando|"
+    r"instalad\w*)\b"
+)
+MODEL_STATE_PREDICATE_RE = re.compile(
+    r"\b(?:"
+    r"instalad\w*|disponivel\w*|carregad\w*|ativo|ativa|rodando|usando|"
+    r"em\s+uso|compativel|cabe|suportad\w*|baixad\w*|"
+    r"posso\s+(?:usar|rodar|utilizar)|consigo\s+(?:usar|rodar|utilizar)|"
+    r"pode\s+(?:usar|rodar|utilizar)"
+    r")\b"
+)
+MODEL_QUERY_EXCLUDE_RE = re.compile(
+    r"\b(?:"
+    r"o\s+que|oque|quem\s+e|explique|explica\w*|ensin\w*|significa|"
+    r"funcion\w*|diferen\w*|melhor|melhores|pior|piores|recomend\w*|"
+    r"suger\w*|sugest\w*|ideal|prefere\w*|favorit\w*|compar\w*|"
+    r"como\s+(?:faco|posso|devo|trocar|mudar|instalar|baixar|funciona)|"
+    r"vale\s+a\s+pena"
+    r")\b"
+)
+MODEL_INFO_STARTERS = frozenset({
+    "o", "a", "os", "as", "esse", "essa", "este", "esta", "aquele",
+    "aquela", "modelo", "posso", "consigo", "pode", "tem", "existe", "e",
+    "qual", "que", "quais", "ta", "davi", "davios", "ainda", "ja", "sera",
+})
+MODEL_INFO_STOPWORDS = frozenset({
+    "o", "a", "os", "as", "um", "uma", "de", "do", "da", "em", "no", "na",
+    "para", "pro", "pra", "com", "modelo", "model", "e", "esta", "ta",
+    "que", "qual", "quais", "agora", "atualmente", "ainda", "ja", "ele",
+    "ela", "esse", "essa", "este", "aquele", "aquela", "meu", "minha",
+    "voce", "vc", "davi", "davios", "usar", "usando", "rodar", "rodando",
+    "utilizar", "sendo", "ficando", "pc", "computador", "maquina",
+    "sistema", "foi", "sera", "atual", "real", "correto", "corretamente",
+})
 
 MODEL_SWITCH_MARKERS = (
     "troque", "mude", "altera", "alterar", "use", "utilize",
@@ -252,6 +294,135 @@ def _fold(text: str) -> str:
     return "".join(
         ch for ch in decomposed if unicodedata.category(ch) != "Mn"
     ).lower()
+
+
+# ============================================================================
+# Consulta READ-ONLY sobre um modelo específico (etapa 7)
+# ============================================================================
+
+@dataclass(frozen=True)
+class ModelInfoQuery:
+    """Consulta READ-ONLY sobre um modelo específico (etapa 7).
+
+    - `target`: referência ao modelo na linguagem do usuário ("qwen 8b");
+      quem resolve no catálogo é o ModelManager (`resolve_model`);
+    - `question`: o que se pergunta: installed | available | can_use |
+      loaded | compatible | state;
+    - `raw_text`: mensagem original, preservada para log/resposta.
+
+    Esta consulta NUNCA executa nada — apenas descreve estado.
+    """
+
+    target: str
+    question: str = "state"
+    raw_text: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        """Versão serializável (útil para log e para os testes)."""
+        return {
+            "target": self.target,
+            "question": self.question,
+            "raw_text": self.raw_text,
+        }
+
+
+def _model_info_question_kind(folded: str) -> Optional[str]:
+    """Que estado se pergunta: installed|available|can_use|loaded|compatible|state."""
+    if re.search(r"\b(?:instalad|baixad)\w*\b", folded):
+        return "installed"
+    if re.search(r"\bdisponivel\w*\b", folded):
+        return "available"
+    if re.search(
+        r"\b(?:posso|consigo|pode|podemos)\s+"
+        r"(?:usar|utilizar|rodar|colocar|carregar)\b",
+        folded,
+    ):
+        return "can_use"
+    if re.search(r"\bcarregad\w*\b", folded):
+        return "loaded"
+    if re.search(r"\b(?:compativel|suportad\w*|cabe)\b", folded):
+        return "compatible"
+    if re.search(r"\b(?:ativo|ativa|rodando|em\s+uso)\b", folded):
+        return "state"
+    return None
+
+
+def _model_info_target(folded: str) -> str:
+    """Extrai o alvo citado ("o qwen 8b esta instalado?" -> "qwen 8b").
+
+    Não interpreta nada: apenas recorta os tokens de nome, ignorando
+    perguntas de estado ("o modelo atual") e palavras de preenchimento.
+    """
+    tokens = [token.strip("?!.,;:\"'()") for token in folded.split()]
+    tokens = [token for token in tokens if token]
+    anchor = None
+    for index, token in enumerate(tokens):
+        if re.fullmatch(r"\d+(?:[.,]\d+)?b", token) or re.fullmatch(
+            r"q\d[a-z0-9_\-]*", token
+        ):
+            anchor = index
+            break
+    if anchor is None:
+        for index, token in enumerate(tokens[:-1]):
+            if token in ("modelo", "model"):
+                nxt = tokens[index + 1]
+                if (
+                    nxt not in MODEL_INFO_STOPWORDS
+                    and not MODEL_STATE_PREDICATE_RE.search(nxt)
+                ):
+                    anchor = index + 1
+                    break
+    if anchor is None:
+        return ""
+    lo = anchor
+    while (
+        lo - 1 >= 0
+        and tokens[lo - 1] not in MODEL_INFO_STOPWORDS
+        and not MODEL_STATE_PREDICATE_RE.search(tokens[lo - 1])
+        and re.fullmatch(r"[a-z][a-z0-9._\-]*", tokens[lo - 1])
+    ):
+        lo -= 1
+    hi = anchor
+    while (
+        hi + 1 < len(tokens)
+        and tokens[hi + 1] not in MODEL_INFO_STOPWORDS
+        and not MODEL_STATE_PREDICATE_RE.search(tokens[hi + 1])
+        and re.fullmatch(r"[a-z0-9][a-z0-9._\-]*", tokens[hi + 1])
+    ):
+        hi += 1
+    return " ".join(tokens[lo:hi + 1])
+
+
+def extract_model_info_query(text: str) -> Optional[ModelInfoQuery]:
+    """Traduz uma consulta READ-ONLY sobre um modelo específico.
+
+    Devolve None quando a frase não é pergunta de estado sobre um modelo
+    identificável: explicações ("me explique o qwen 8b"), comparações
+    ("qual é melhor?"), afirmações do usuário e genéricos sobre IA ficam
+    de fora. Nunca resolve o alvo no catálogo — quem resolve é o
+    ModelManager (`resolve_model`).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    folded = _fold(raw)
+    if not folded:
+        return None
+    # Explicações/comparações genéricas não são consulta de estado.
+    if MODEL_QUERY_EXCLUDE_RE.search(folded):
+        return None
+    question = _model_info_question_kind(folded)
+    if question is None:
+        return None
+    target = _model_info_target(folded)
+    if not target or target in MODEL_SWITCH_VAGUE_TARGETS:
+        return None
+    # A frase precisa ter forma de pergunta (explícita ou pela construção).
+    words = folded.split()
+    first_word = words[0] if words else ""
+    if "?" not in raw and first_word not in MODEL_INFO_STARTERS:
+        return None
+    return ModelInfoQuery(target=target, question=question, raw_text=raw)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +608,17 @@ class IntentClassifier:
         # normal de conversa.
         if self.is_model_switch_request(original) is not None:
             return Intent.MODEL_SWITCH
+        # Etapa 7: consultas READ-ONLY sobre o sistema de modelos. Nada
+        # altera estado — apenas leitura de ModelManager/provider. Ficam
+        # depois de MODEL_SWITCH ("troque..." continua sendo ordem) e antes
+        # dos genéricos para não virarem conversa do LLM.
+        if self.is_model_info_query(original):
+            return Intent.MODEL_INFO
+        if self.is_model_status_query(original):
+            return Intent.MODEL_STATUS
+        list_intent = self.is_model_list_query(original)
+        if list_intent is not None:
+            return list_intent
         if self._matches_any(normalized, COMMAND_MARKERS):
             return Intent.COMMAND
         if self._matches_any(normalized, OPINION_MARKERS):
@@ -577,9 +759,12 @@ class IntentClassifier:
         return ("instalad" in folded and ("modelo" in folded or "model" in folded))
 
     def is_model_list_available(self, text: str) -> bool:
-        """Detecta pedido para listar modelos disponíveis para instalar."""
+        """Detecta pedido para listar modelos disponíveis para instalar.
+
+        "disponiv" cobre singular e plural ("disponível"/"disponíveis").
+        """
         folded = _fold(text)
-        return ("disponivél" in folded or "disponivel" in folded) and ("modelo" in folded or "model" in folded)
+        return ("disponiv" in folded) and ("modelo" in folded or "model" in folded)
 
     def is_model_download(self, text: str) -> bool:
         """Detecta pedido para baixar/instalar modelo."""
@@ -633,6 +818,63 @@ class IntentClassifier:
         conhecimento duplicado do catálogo.
         """
         return extract_model_switch_request(text)
+
+    # ------------------------------------------------------------------
+    # Consultas READ-ONLY sobre modelos (etapa 7)
+    # ------------------------------------------------------------------
+    # Consulta ≠ ação: estas perguntas descrevem o estado e NUNCA executam
+    # nada. Comparações ("qual é melhor?") e explicações ("me explique o
+    # qwen 8b") ficam de fora — são opinião/pergunta genérica.
+
+    def is_model_status_query(self, text: str) -> bool:
+        """Estado do modelo ATUAL ("qual modelo você está usando?").
+
+        Exige "modelo" no SINGULAR ("modelos" plural é listagem, etapa 7):
+        evita capturar "que modelos posso usar?" como status.
+        """
+        folded = _fold(text)
+        if MODEL_QUERY_EXCLUDE_RE.search(folded):
+            return False
+        if self.is_model_status(text) and re.search(
+            r"\bmodelo\b|\bmodel\b", folded
+        ):
+            return True
+        if not re.search(r"\bmodelo\b|\bmodel\b", folded):
+            return False
+        return bool(MODEL_STATUS_STATE_RE.search(folded))
+
+    def is_model_list_query(self, text: str) -> Optional[Intent]:
+        """Listagem de modelos; devolve o subtipo da consulta (etapa 7).
+
+        Instalados ("quais modelos estão instalados?"), disponíveis
+        ("quais modelos estão disponíveis?") ou catálogo genérico
+        ("que modelos posso usar?").
+        """
+        folded = _fold(text)
+        if MODEL_QUERY_EXCLUDE_RE.search(folded):
+            return None
+        if not (
+            self._matches_any(text, MODEL_LIST_MARKERS)
+            or re.search(r"\b(?:lista|liste|mostre|mostra|exiba)\b[^\n]*\bmodelos?\b", folded)
+        ):
+            return None
+        if self.is_model_list_installed(text):
+            return Intent.MODEL_LIST_INSTALLED
+        if self.is_model_list_available(text):
+            return Intent.MODEL_LIST_AVAILABLE
+        # Listagem genérica: exige contexto claro de listagem (plural ou
+        # pedido explícito) para não capturar conversa comum com "modelo".
+        if "modelos" in folded and re.search(
+            r"^(?:quais|que|quaes|me\s+mostre|mostre|liste|exiba|exibe)\b", folded
+        ):
+            return Intent.MODEL_LIST
+        if re.search(r"\blista\s+de\s+modelos?\b", folded):
+            return Intent.MODEL_LIST
+        return None
+
+    def is_model_info_query(self, text: str) -> bool:
+        """Consulta sobre um modelo ESPECÍFICO ("o qwen 8b está instalado?")."""
+        return extract_model_info_query(text) is not None
 
     def is_model_cancel(self, text: str) -> bool:
         """Detecta pedido para cancelar operação."""

@@ -639,7 +639,8 @@ class TestInformationalMessagesDoNotSwitch:
 
         assert result.intent != "model_switch", text
         assert result.model_switch is None, text
-        assert provider.calls == [], text
+        assert "switch_model" not in provider.calls, text
+        assert provider.switch_selections == [], text
         assert _read_config(workspace)["active_model_id"] == MEDIUM
         assert manager.get_active_model().id == MEDIUM
         memory.database.close()

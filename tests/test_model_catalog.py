@@ -10,6 +10,18 @@ from pathlib import Path
 
 import pytest
 
+# Hashes SHA-256 oficiais, verificados na auditoria. Nenhum modelo é baixado
+# para obtê-los: vêm do `lfs.oid` da API do Hugging Face, que é o SHA-256 do
+# conteúdo do arquivo.
+OFFICIAL_SHA256 = {
+    "qwen3-4b-q4km": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    "qwen3-4b-q80": "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
+    "qwen3-8b-q4km": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+    "qwen3-8b-q5km": "068bae163faa96ad48032daf4e071a6a28fe67d8dcc95367609c2ff165e52738",
+    "qwen3-14b-q4km": "500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0",
+    "qwen3-32b-q4km": "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689",
+}
+
 from brain.model_catalog import (
     DEFAULT_CATALOG_PATH,
     LEGACY_TIER_MAP,
@@ -18,6 +30,7 @@ from brain.model_catalog import (
     ModelCatalog,
     ModelInfo,
     get_tier_label,
+    normalize_sha256,
     normalize_tier,
     resolve_model_path,
     tier_from_legacy,
@@ -489,4 +502,121 @@ class TestModelInfo:
     def test_resolve_model_path_relative_to_project_root(self, tmp_path):
         resolved = resolve_model_path("models/light/a.gguf", tmp_path)
         assert resolved == (tmp_path / "models" / "light" / "a.gguf").resolve()
+
+
+
+# --------------------------------------------------------------------- #
+# SHA-256: metadado opcional, normalizado e estrito
+# --------------------------------------------------------------------- #
+
+# Hash real de um payload pequeno, calculado por hashlib e usado como
+#.fixture de referência. Nenhum modelo é baixado para obtê-lo.
+REAL_SHA256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+
+class TestSha256Normalize:
+    def test_absent_field_is_none(self):
+        info = ModelInfo.from_dict({"id": "x", "name": "X"})
+        assert info.sha256 is None
+
+    def test_explicit_none_is_none(self):
+        info = ModelInfo.from_dict({"id": "x", "name": "X", "sha256": None})
+        assert info.sha256 is None
+
+    def test_valid_hash_is_preserved(self):
+        info = ModelInfo.from_dict(
+            {"id": "x", "name": "X", "sha256": REAL_SHA256}
+        )
+        assert info.sha256 == REAL_SHA256
+
+    def test_uppercase_is_normalized_to_lowercase(self):
+        info = ModelInfo.from_dict(
+            {"id": "x", "name": "X", "sha256": REAL_SHA256.upper()}
+        )
+        assert info.sha256 == REAL_SHA256
+
+    def test_surrounding_whitespace_is_stripped(self):
+        info = ModelInfo.from_dict(
+            {"id": "x", "name": "X", "sha256": f"  {REAL_SHA256}\t\n"}
+        )
+        assert info.sha256 == REAL_SHA256
+
+    def test_63_characters_is_invalid(self):
+        assert normalize_sha256(REAL_SHA256[:63], "x") is None
+
+    def test_65_characters_is_invalid(self):
+        assert normalize_sha256(REAL_SHA256 + "a", "x") is None
+
+    def test_non_hexadecimal_is_invalid(self):
+        invalid = REAL_SHA256[:63] + "z"
+        assert normalize_sha256(invalid, "x") is None
+
+    def test_empty_string_is_absence_not_error(self):
+        assert normalize_sha256("", "x") is None
+
+    def test_blank_string_is_absence(self):
+        assert normalize_sha256("   ", "x") is None
+
+    def test_non_string_type_is_invalid(self):
+        assert normalize_sha256(12345, "x") is None
+        assert normalize_sha256([REAL_SHA256], "x") is None
+
+    def test_invalid_hash_warns_and_becomes_none(self, caplog):
+        with caplog.at_level("WARNING", logger="davios.models.catalog"):
+            result = normalize_sha256("nao-e-um-hash", "modelo-teste")
+        assert result is None
+        assert any("modelo-teste" in r.message for r in caplog.records)
+
+    def test_invalid_hash_in_dict_becomes_none_but_model_survives(self, caplog):
+        """Um hash digitado errado NÃO pode descartar o modelo inteiro."""
+        with caplog.at_level("WARNING", logger="davios.models.catalog"):
+            info = ModelInfo.from_dict(
+                {"id": "x", "name": "X", "sha256": "abc123", "tier": "light"}
+            )
+        assert info.id == "x"
+        assert info.sha256 is None
+        assert any("sha256" in r.message for r in caplog.records)
+
+    def test_valid_hash_does_not_warn(self, caplog):
+        with caplog.at_level("WARNING", logger="davios.models.catalog"):
+            normalize_sha256(REAL_SHA256, "x")
+        assert not any("sha256" in r.message for r in caplog.records)
+
+    def test_to_dict_includes_sha256(self):
+        info = ModelInfo.from_dict(
+            {"id": "x", "name": "X", "sha256": REAL_SHA256}
+        )
+        assert info.to_dict()["sha256"] == REAL_SHA256
+
+    def test_to_dict_includes_none_when_absent(self):
+        info = ModelInfo.from_dict({"id": "x", "name": "X"})
+        assert "sha256" in info.to_dict()
+        assert info.to_dict()["sha256"] is None
+
+
+class TestSha256InRealCatalog:
+    """Os 6 modelos com origem oficial devem ter hash; os outros, não."""
+
+    OFFICIAL = OFFICIAL_SHA256
+    # Sem GGUF oficial em Q4_K_M: continuam sem hash, por decisão explícita.
+    WITHOUT_OFFICIAL_SOURCE = ("qwen3-0.6b-q4km", "qwen3-1.7b-q4km")
+
+    @pytest.mark.parametrize("model_id,expected", sorted(OFFICIAL.items()))
+    def test_official_model_has_verified_hash(self, catalog, model_id, expected):
+        model = catalog.get_model_by_id(model_id)
+        assert model is not None, f"{model_id} ausente do catálogo"
+        assert model.sha256 == expected
+
+    @pytest.mark.parametrize("model_id", WITHOUT_OFFICIAL_SOURCE)
+    def test_model_without_official_source_has_no_hash(self, catalog, model_id):
+        model = catalog.get_model_by_id(model_id)
+        assert model is not None
+        assert model.sha256 is None
+
+    def test_every_hash_in_catalog_is_well_formed(self, catalog):
+        for model in catalog:
+            if model.sha256 is not None:
+                assert len(model.sha256) == 64
+                assert model.sha256 == model.sha256.lower()
+                int(model.sha256, 16)  # levanta se não for hexadecimal
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -153,6 +154,12 @@ class ModelInfo:
     download_url: str = ""
     download_available: bool = False
     download_note: str = ""          # explica por que não há download
+    # SHA-256 oficial do arquivo GGUF, sempre em minúsculas.
+    # `None` significa "o catálogo não traz hash": o download continua
+    # permitido, mas SEM verificação criptográfica — e o chamador precisa
+    # poder distinguir isso de "o hash foi conferido e não bateu".
+    # Nunca um hash-sentinela: ausência é ausência, não um valor falso.
+    sha256: Optional[str] = None
 
     # --- Metadados ------------------------------------------------------
     description: str = ""
@@ -203,6 +210,7 @@ class ModelInfo:
             "download_url": self.download_url,
             "download_available": self.download_available,
             "download_note": self.download_note,
+            "sha256": self.sha256,
             "description": self.description,
             "source": self.source,
             "enabled": self.enabled,
@@ -215,12 +223,68 @@ class ModelInfo:
 
         Campos desconhecidos são ignorados para manter o catálogo tolerante a
         metadados extras (ex.: comentários/justificativas em chaves "_*").
+
+        O `sha256` passa por `normalize_sha256()`: um valor presente mas
+        malformado vira `None` com warning, em vez de derrubar o modelo. Um
+        hash digitado errado é um erro de digitação; descartar o modelo inteiro
+        por causa dele seria mais perigoso que aceitar o download sem
+        verificação criptográfica (que é o estado de qualquer modelo sem hash).
         """
         valid = set(cls.__dataclass_fields__.keys())
         filtered = {k: v for k, v in data.items() if k in valid}
         filtered.pop("size_gb", None)
         filtered.pop("is_installed", None)
+        if "sha256" in filtered:
+            filtered["sha256"] = normalize_sha256(
+                filtered["sha256"], model_id=filtered.get("id")
+            )
         return cls(**filtered)
+
+
+# SHA-256 tem exatamente 64 caracteres hexadecimais. Nem mais, nem menos:
+# um valor de 63 ou 65 caracteres é quase certamente um erro de cópia.
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def normalize_sha256(value: Any, model_id: str = "") -> Optional[str]:
+    """Normaliza um SHA-256 do catálogo, ou devolve `None`.
+
+    Regras:
+    - ausente, `None` ou string vazia/branco -> `None` (o catálogo não traz hash);
+    - `strip().lower()` -> spaces removidos e maiúsculas aceitas, porque um
+      hash colado em maiúsculas é o MESMO hash, não um hash diferente;
+    - qualquer outro valor -> `None` com warning, sem descartar o modelo.
+
+    A rejeição é deliberadamente estrita: um hash de 64 caracteres que não bate
+    com o arquivo é muito mais perigoso do que a ausência de hash, porque
+    "parece" verificado. Prefiro não verificar a confessar que verifiquei.
+    """
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        logger.warning(
+            "[CATALOG] sha256 de %s ignorado: tipo inesperado (%s)",
+            model_id or "?",
+            type(value).__name__,
+        )
+        return None
+
+    text = value.strip().lower()
+    if not text:
+        # Ausência declarada com string vazia: não é erro, é "sem hash".
+        return None
+
+    if not SHA256_PATTERN.fullmatch(text):
+        logger.warning(
+            "[CATALOG] sha256 de %s ignorado: formato invalido "
+            "(esperados 64 caracteres hexadecimais, obtido %d caracteres)",
+            model_id or "?",
+            len(text),
+        )
+        return None
+
+    return text
 
 
 # =============================================================================

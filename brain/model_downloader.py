@@ -29,10 +29,15 @@ Regras de segurança:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import secrets
 import shutil
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -76,6 +81,302 @@ STATUS_ALREADY_INSTALLED = "already_installed"   # já havia arquivo válido
 STATUS_REFUSED = "refused"                       # catálogo não autoriza
 STATUS_FAILED = "failed"                         # erro de rede/validação/disco
 STATUS_CANCELLED = "cancelled"                   # abortado pelo chamador
+# Outro download já está usando o MESMO destino. Não é falha nem recusa: o
+# recurso está temporariamente ocupado. Nenhum byte foi transferido por este
+# downloader, e nada foi alterado.
+STATUS_LOCKED = "locked"
+# Confirmação pedida mas não atendida: `require_confirmation=True` e nenhum
+# `confirm` fornecido. NADA foi baixado — nem `.part`, nem arquivo final.
+STATUS_CONFIRMATION_REQUIRED = "confirmation_required"
+# O usuário recebeu a prévia e respondeu NÃO. Também não baixa nada.
+STATUS_DECLINED = "declined"
+
+# =============================================================================
+# POLÍTICA DE DOWNLOADLOCK
+# =============================================================================
+# Um lock protege o `.part` e o destino de UM modelo. O objetivo é evitar que
+# dois downloader manipulem o mesmo arquivo — a auditoria reproduziu o caso em
+# que um processo crashando apagava o `.part` de outro, desperdiçando o download
+# inteiro.
+#
+# A regra que governa toda esta política: NUNCA roubar o lock de um download
+# legítimo em andamento. Um falso positivo aqui é pior que o problema que o
+# lock resolve, porque reintroduz exatamente a corrupção que tentamos evitar.
+
+LOCK_SUFFIX = ".lock"
+
+# Velocidade MÍNIMA assumida para um download, em bytes por segundo.
+# 50.000 B/s ≈ 0,4 Mbps: uma conexão deliberadamente pessimista, mas possível
+# (móvel em zona rural, hotspot congestionado, uplink de servidor remoto).
+# Uma velocidade alta tornaria o TTL curto demais e causaria falsos positivos
+# em justamente as máquinas que mais demorarão.
+LOCK_ASSUMED_MIN_BYTES_PER_SEC = 50_000
+
+# Multiplicador de segurança sobre o tempo estimado. Cobre picos de latência,
+# pausas por GC, e a validação + SHA-256 após o download (~10 s para 19,8 GB).
+LOCK_AGE_SAFETY_FACTOR = 3.0
+
+# Piso absoluto, em segundos (1 hora). Modelos sem `size_bytes`, ou minúsculos,
+# ainda precisam de uma janela que não roube um download de verdade.
+LOCK_MIN_AGE_SECONDS = 3600.0
+
+# Teto absoluto, em segundos (7 dias). Um lock de 19,8 GB a 50 KB/s levaria
+# ~4,8 dias; o teto evita que um lock órfão vire permanente só porque o modelo
+# é grande. Passado o teto, PID/hostname ainda precisam indicar processo morto:
+# o teto sozinho NÃO rouba lock ativo.
+LOCK_MAX_AGE_SECONDS = 7 * 24 * 3600.0
+
+# Tamanho máximo do arquivo de lock. O conteúdo é um JSON pequeno e conhecido;
+# um lock muito maior significa que algo estranho foi escrito ali.
+LOCK_MAX_CONTENT_BYTES = 4096
+
+
+def lock_age_limit(size_bytes: int) -> float:
+    """Idade máxima (segundos) antes de um lock poder ser considerado velho.
+
+    `size_bytes` é o tamanho ESPERADO do modelo. O cálculo é:
+
+        estimado = size_bytes / LOCK_ASSUMED_MIN_BYTES_PER_SEC
+        limite   = estimado * LOCK_AGE_SAFETY_FACTOR
+
+    limitado a [LOCK_MIN_AGE_SECONDS, LOCK_MAX_AGE_SECONDS].
+
+    Todas as unidades são explícitas: bytes, bytes/segundo e segundos.
+    """
+    try:
+        size = int(size_bytes or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return LOCK_MIN_AGE_SECONDS
+    estimated = size / float(LOCK_ASSUMED_MIN_BYTES_PER_SEC)
+    return min(
+        max(estimated * LOCK_AGE_SAFETY_FACTOR, LOCK_MIN_AGE_SECONDS),
+        LOCK_MAX_AGE_SECONDS,
+    )
+
+
+def _process_is_alive(pid: int) -> bool:
+    """True se um processo com este PID existe AGORA neste host.
+
+    PID sozinho nunca decide: o SO reutiliza PIDs, e um lock antigo pode
+    "encontrar" vivo um processo sem nenhuma relação. Por isso esta função é
+    só UMA das três condições de stale (ver `DownloadLock._is_stale`).
+
+    No Windows, `os.kill(pid, 0)` NÃO é seguro: sinal 0 não existe lá e a
+    chamada pode encerrar o processo. Usa-se `OpenProcess` via ctypes, que
+    apenas consulta. `psutil` resolveria, mas adicionaria uma dependência que
+    o resto do projeto não tem.
+    """
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            # PROCESS_QUERY_LIMITED_INFORMATION: o menos privilegiado que ainda
+            # responde "existe?".
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            # ERROR_ACCESS_DENIED (5) = existe, mas sem permissão para
+            # inspecionar. Isso é "vivo", não "morto".
+            return ctypes.windll.kernel32.GetLastError() == 5
+        except Exception:  # noqa: BLE001 - nunca derruba o download por isso
+            logger.debug("[MODEL] não foi possível verificar o PID %s", pid)
+            return True  # na dúvida, tratamos como vivo (não rouba)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # existe, mas é de outro usuário
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_content(lock_path: Path) -> Optional[dict]:
+    """Lê e valida o JSON de um lock. Devolve None se não for confiável."""
+    try:
+        if lock_path.stat().st_size > LOCK_MAX_CONTENT_BYTES:
+            return None
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class DownloadLock:
+    """Exclusão mútua sobre o `.part`/destino de UM modelo.
+
+    Um lock por `destination` — nunca global e nunca por URL — porque o recurso
+    realmente disputado é o arquivo, e dois modelos distintos precisam baixar
+    ao mesmo tempo.
+
+    A aquisição é ATÔMICA: `os.open(O_CREAT|O_EXCL)` falha se o arquivo já
+    existe, sem janela de TOCTOU entre "existe?" e "cria?".
+
+    A liberação só acontece se esta instância for a DONA, confirmada por um
+    token aleatório gravado no conteúdo. Uma instância que nunca adquiriu o
+    lock não tem como apagá-lo.
+    """
+
+    def __init__(self, lock_path: Path, model_id: str = "", size_bytes: int = 0):
+        self.lock_path = Path(lock_path)
+        self.model_id = model_id
+        self.size_bytes = int(size_bytes or 0)
+        self._token: Optional[str] = None
+        self._acquired = False
+
+    @property
+    def acquired(self) -> bool:
+        return self._acquired
+
+    def holder(self) -> Optional[str]:
+        """Descrição legível de quem está com o lock: 'host:pid'.
+
+        Diagnóstico apenas — nunca usado para decidir segurança.
+        """
+        data = _read_lock_content(self.lock_path)
+        if not data:
+            return None
+        host = data.get("hostname") or "?"
+        pid = data.get("pid")
+        return str(host) if pid is None else "%s:%s" % (host, pid)
+
+    def _is_stale(self) -> tuple[bool, str]:
+        """(stale, motivo). Três condições independentes; qualquer uma basta."""
+        data = _read_lock_content(self.lock_path)
+        if data is None:
+            # (C) ilegível, grande demais, ou não-JSON: não é confiável.
+            return True, "conteudo ilegivel ou invalido"
+
+        host = data.get("hostname")
+        pid = data.get("pid")
+        started_at = data.get("started_at")
+        size = data.get("size_bytes", self.size_bytes)
+
+        # (A) o dono não está mais vivo NESTE host.
+        if host == socket.gethostname() and isinstance(pid, int):
+            if not _process_is_alive(pid):
+                return True, "processo %s nao existe mais" % pid
+        # Hostname diferente: não podemos verificar o PID de lá, então a idade
+        # (condição B) é a única que pode liberar este lock. Nunca confiar em
+        # um PID que veio de outra máquina.
+
+        # (B) idade acima do limite derivado do tamanho.
+        if isinstance(started_at, (int, float)):
+            try:
+                age = time.time() - float(started_at)
+            except (TypeError, ValueError, OverflowError):
+                return True, "timestamp invalido"
+            limit = lock_age_limit(size)
+            if age > limit:
+                return True, "idade %.0fs acima do limite %.0fs" % (age, limit)
+
+        return False, ""
+
+    def _try_create(self) -> bool:
+        """Cria o lock atomicamente. False se já existe (de outro dono)."""
+        token = secrets.token_hex(16)
+        payload = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "started_at": time.time(),  # segundos desde a época (wall clock)
+            "size_bytes": self.size_bytes,
+            "model_id": self.model_id,
+            "token": token,
+        }
+        try:
+            fd = os.open(
+                str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            logger.warning("[MODEL] falha ao criar o lock: %s", exc)
+            return False
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        except OSError as exc:
+            # Lock criado mas inútil: remove para não deixar órfão.
+            logger.warning("[MODEL] falha ao escrever no lock: %s", exc)
+            try:
+                self.lock_path.unlink()
+            except OSError:
+                pass
+            return False
+
+        self._token = token
+        self._acquired = True
+        return True
+
+    def acquire(self) -> bool:
+        """Tenta adquirir. NÃO ESPERA: devolve False se outro tem o lock.
+
+        A ausência de espera é deliberada. Um download de 19,8 GB pode levar
+        dezenas de minutos; segurar o lock em espera prenderia a thread sem
+        dar nenhum sinal ao usuário. Recusar com `STATUS_LOCKED` é mais honesto
+        e infinitamente mais simples de testar.
+        """
+        if self._try_create():
+            return True
+
+        stale, reason = self._is_stale()
+        if not stale:
+            return False
+
+        # Reclaim: o `unlink` é apenas a limpeza; quem ARBITRA a posse é o
+        # `O_EXCL` seguinte. Se dois processos detectarem stale ao mesmo tempo,
+        # ambos tentam criar, e só um vence — nunca dois donos.
+        logger.warning("[MODEL] lock obsoleto (%s), tentando reclamar", reason)
+        try:
+            self.lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("[MODEL] falha ao remover lock obsoleto: %s", exc)
+            return False
+
+        return self._try_create()
+
+    def release(self) -> None:
+        """Libera o lock, mas SOMENTE se esta instância for a dona.
+
+        Confirma pelo token: se o conteúdo no disco for de outro (ou ilegível),
+        esta instância não tem autoridade para apagá-lo.
+        """
+        if not self._acquired or not self._token:
+            return
+        data = _read_lock_content(self.lock_path)
+        if data is not None and data.get("token") != self._token:
+            # O lock foi roubado/reclamado por outro. Não toca nele.
+            logger.warning("[MODEL] lock pertence a outra instância; não será removido")
+            self._acquired = False
+            self._token = None
+            return
+        try:
+            self.lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("[MODEL] falha ao remover o lock: %s", exc)
+        finally:
+            self._acquired = False
+            self._token = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
 
 # Sentinela interno: "nada a decidir aqui, siga o fluxo normal do download".
 # Usamos um objeto único (e comparação por identidade) para não confundir
@@ -83,6 +384,94 @@ STATUS_CANCELLED = "cancelled"                   # abortado pelo chamador
 _CONTINUE = object()
 
 ProgressCallback = Callable[[int, int], None]
+
+# Função que recebe a prévia e devolve a decisão do chamador. `True` autoriza
+# o download; qualquer outra coisa recusa. Um chamador não interactivo (CLI,
+# teste, serviço) decide como perguntar — este módulo só guarda a resposta.
+ConfirmCallback = Callable[["DownloadPreview"], bool]
+
+
+@dataclass
+class DownloadPreview:
+    """Prévia READ-ONLY de um download: o que BAIXARIA, não o que baixou.
+
+    Existe para que nada seja transferido antes de o usuário saber o quê. Todos
+    os campos vêm de fontes reais (catálogo, disco, destino derivado) — nenhum
+    valor é inventado ou preenchido com URL montada a partir do nome.
+
+    `download()` usa esta mesma prévia internamente, então o que o chamador vê
+    é exatamente o que o downloader checou.
+    """
+
+    model_id: str = ""
+    name: str = ""
+    expected_bytes: int = 0
+    expected_is_estimate: bool = False
+    download_url: str = ""
+    destination: str = ""
+    part_path: str = ""
+    free_bytes: Optional[int] = None
+    space_message: str = ""
+    # Estado já observado no disco, antes de qualquer escrita.
+    already_installed: bool = False
+    destination_exists: bool = False
+    # Motivo que impede o download agora (catálogo sem fonte, destino fora da
+    # pasta de modelos, arquivo inválido no lugar, disco cheio). Vazio = pode
+    # baixar, sujeito à confirmação.
+    blocked_reason: str = ""
+    warnings: list[str] = field(default_factory=list)
+    # Existe alguma prévia válida para este modelo? Quando False, os campos
+    # acima não devem ser interpretados como uma oferta de download.
+    downloadable: bool = False
+
+    @property
+    def can_download(self) -> bool:
+        """True quando nada impede o download AGORA (não significa autorizado)."""
+        return self.downloadable and not self.blocked_reason
+
+    @property
+    def expected_human(self) -> str:
+        return _human_gb(self.expected_bytes)
+
+    @property
+    def free_human(self) -> str:
+        return _human_gb(self.free_bytes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "name": self.name,
+            "expected_bytes": self.expected_bytes,
+            "expected_is_estimate": self.expected_is_estimate,
+            "expected_human": self.expected_human,
+            "download_url": self.download_url,
+            "destination": self.destination,
+            "part_path": self.part_path,
+            "free_bytes": self.free_bytes,
+            "free_human": self.free_human,
+            "space_message": self.space_message,
+            "already_installed": self.already_installed,
+            "destination_exists": self.destination_exists,
+            "blocked_reason": self.blocked_reason,
+            "warnings": list(self.warnings),
+            "downloadable": self.downloadable,
+            "can_download": self.can_download,
+        }
+
+    def summary(self) -> str:
+        """Descrição curta e legível da prévia, para o usuário."""
+        if not self.downloadable:
+            return self.blocked_reason or f"Download de {self.model_id} indisponível."
+        if self.already_installed:
+            return f"{self.name} já está instalado em {self.destination}."
+        lines = [
+            f"Modelo   : {self.name} ({self.model_id})",
+            f"Tamanho  : ~{self.expected_human}",
+            f"Origem   : {self.download_url}",
+            f"Destino  : {self.destination}",
+            f"Espaço   : {self.free_human} livres",
+        ]
+        return "\n".join(lines)
 
 
 def _human_gb(num_bytes: Optional[int]) -> str:
@@ -116,6 +505,27 @@ class DownloadResult:
     # True quando `expected_bytes` veio de estimativa do catálogo (e não do
     # Content-Length do servidor). Permite ao chamador explicar a diferença.
     expected_is_estimate: bool = False
+    # --- Integridade SHA-256 ------------------------------------------- #
+    # Três campos juntos, porque `hash_verified=False` é ambíguo sozinho:
+    # pode ser "o catálogo não traz hash" ou "o hash não bateu". Os três
+    # juntos deixam a diferença explícita:
+    #   sem hash   -> expected=None, actual=<hex>, verified=False
+    #   hash ok    -> expected=<hex>, actual=<hex>, verified=True
+    #   hash errado-> expected=<hex>, actual=<outro>, verified=False
+    expected_sha256: Optional[str] = None
+    actual_sha256: Optional[str] = None
+    hash_verified: bool = False
+    # --- DownloadLock -------------------------------------------------- #
+    # True se este download fez alguma espera pelo lock. Hoje é sempre False:
+    # a política é NÃO esperar (um download de 19,8 GB pode levar dezenas de
+    # minutos, e prender a thread sem sinal ao usuário é pior que recusar).
+    # O campo existe para que a camada acima possa distinguir esse caso se a
+    # política mudar, sem breaking change.
+    lock_waited: bool = False
+    # Descrição de quem ocupava o lock quando houve conflito: "host:pid".
+    # Informativo, para diagnóstico. NUNCA usado para decidir segurança — um
+    # PID recycled e um hostname forjado não diriam nada sobre o dono real.
+    lock_holder: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +542,11 @@ class DownloadResult:
             "error": self.error,
             "validation_errors": list(self.validation_errors),
             "validation_warnings": list(self.validation_warnings),
+            "expected_sha256": self.expected_sha256,
+            "actual_sha256": self.actual_sha256,
+            "hash_verified": self.hash_verified,
+            "lock_waited": self.lock_waited,
+            "lock_holder": self.lock_holder,
         }
 
     def summary(self) -> str:
@@ -145,6 +560,19 @@ class DownloadResult:
             )
         if self.status == STATUS_CANCELLED:
             return f"Download de {self.model_id} cancelado."
+        if self.status == STATUS_CONFIRMATION_REQUIRED:
+            return (
+                f"O download de {self.model_id} precisa de confirmação antes "
+                "de começar."
+            )
+        if self.status == STATUS_DECLINED:
+            return f"Download de {self.model_id} não autorizado; nada foi baixado."
+        if self.status == STATUS_LOCKED:
+            who = self.lock_holder or "outro processo"
+            return (
+                f"Já existe um download em andamento para {self.model_id} "
+                f"({who}). Nenhum download novo foi iniciado."
+            )
         if self.status == STATUS_REFUSED:
             return self.error or f"Download de {self.model_id} não está disponível."
         return self.error or f"Falha ao baixar {self.model_id}."
@@ -229,6 +657,19 @@ class ModelDownloader:
         """
         return destination.with_name(destination.name + PART_SUFFIX)
 
+    def lock_path_for(self, destination: Path) -> Path:
+        """Caminho do lock associado a um destino: `<destino>.lock`.
+
+        Fica ao lado do `.part` e do `.gguf`, portanto dentro de `models_root()`
+        — nunca aceita um caminho vindo do chamador. `destination` sempre vem
+        de `destination_path()` (derivado do catálogo) e já passou por
+        `_ensure_within_models_root()`.
+
+        O sufixo `.lock` é diferente tanto de `.part` quanto de `.gguf`, então
+        nem o `ModelCatalog` nem o `validate_file()` o confundem com um modelo.
+        """
+        return Path(destination).with_name(Path(destination).name + LOCK_SUFFIX)
+
     # ------------------------------------------------------------------ #
     # Validação
     # ------------------------------------------------------------------ #
@@ -301,6 +742,83 @@ class ModelDownloader:
         return errors, warnings
 
     # ------------------------------------------------------------------ #
+    # Integridade SHA-256
+    # ------------------------------------------------------------------ #
+
+    def _compute_sha256(self, path: Path) -> str:
+        """SHA-256 do arquivo, lido em chunks (nunca o arquivo inteiro).
+
+        O tamanho dos modelos é de|GiBs, então carregar o arquivo em memória
+        seria inviável. A leitura usa `CHUNK_SIZE` e o hash é acumulado
+        incrementalmente, o que mantém o pico de memória em poucos MiB,
+        independentemente do tamanho do `.gguf`.
+        """
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(self.chunk_size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def verify_sha256(
+        self,
+        path: Path,
+        model: ModelInfo,
+        result: Optional[DownloadResult] = None,
+    ) -> tuple[list[str], list[str]]:
+        """Confere a integridade do arquivo contra o SHA-256 do catálogo.
+
+        Devolve (erros, avisos) no mesmo formato de `validate_file()`, para que
+        o chamador trate os dois validadores igual.
+
+        - catálogo sem hash -> nenhum erro; UM aviso dizendo que a integridade
+          NÃO foi verificada. O silêncio seria uma falsa garantia.
+        - hash confere     -> nenhum erro, nenhum aviso.
+        - hash não confere -> um erro, com o esperado e o obtido, e nada mais.
+
+        Os valores esperados/observados são escritos em `result` quando um
+        DownloadResult é fornecido, para que a camada de cima possa explicar a
+        falha sem recalcular nada.
+        """
+        errors: list[str] = []
+        warnings: list[str] = []
+        expected = model.sha256
+
+        if result is not None:
+            result.expected_sha256 = expected
+
+        if not expected:
+            warnings.append(
+                f"O catálogo não traz SHA-256 para {model.id}: a integridade "
+                "criptográfica deste arquivo não foi verificada."
+            )
+            return errors, warnings
+
+        try:
+            actual = self._compute_sha256(path)
+        except OSError as exc:
+            errors.append(f"Não foi possível calcular o SHA-256: {exc}")
+            return errors, warnings
+
+        if result is not None:
+            result.actual_sha256 = actual
+
+        # `expected` já foi normalizado em minúsculas pelo catálogo, e
+        # `hexdigest()` também devolve minúsculas: a comparação é direta.
+        if actual != expected:
+            errors.append(
+                f"SHA-256 incompatível: esperado {expected}, obtido {actual}. "
+                "O arquivo pode estar corrompido ou ter sido adulterado."
+            )
+            return errors, warnings
+
+        if result is not None:
+            result.hash_verified = True
+        return errors, warnings
+
+    # ------------------------------------------------------------------ #
     # Espaço em disco
     # ------------------------------------------------------------------ #
 
@@ -338,6 +856,110 @@ class ModelDownloader:
             )
         return True, f"Espaço suficiente: {_human_gb(usage.free)} livres."
 
+    def _free_space(self, target_dir: Optional[Path] = None) -> Optional[int]:
+        """Bytes livres no volume do destino, ou None se não foi possível medir.
+
+        Usado pela prévia. Nunca levanta exceção: um disco ilegível é apenas
+        "espaço desconhecido", que o chamador deve mostrar como tal em vez de
+        assumir zero (o que sugeriria disco cheio sem evidência).
+        """
+        probe = Path(target_dir) if target_dir else self.models_root()
+        if not probe.exists():
+            probe = self.project_root
+        try:
+            return int(shutil.disk_usage(str(probe)).free)
+        except OSError as exc:
+            logger.debug("[MODEL] não foi possível medir o disco livre: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Prévia (read-only)
+    # ------------------------------------------------------------------ #
+
+    def preview(self, model: Any) -> DownloadPreview:
+        """Descreve o que um `download()` FARIA, sem baixar nem criar arquivo.
+
+        Puramente informativo e seguro: não abre conexão, não escreve nada e não
+        altera `active_model_id` nem o catálogo. Reaproveita exatamente as
+        mesmas validações do download (fonte no catálogo, destino confinado,
+        arquivo existente, espaço) para que a prévia não possa prometer algo que
+        a execução faria de modo diferente.
+
+        `downloadable=False` significa que o modelo não existe no catálogo ou o
+        catálogo não declara origem — nunca que a URL foi "construída" aqui.
+        """
+        resolved = self.resolve(model)
+        if resolved is None:
+            return DownloadPreview(
+                model_id=str(model),
+                blocked_reason=f"Modelo não encontrado no catálogo: {model!r}",
+            )
+        model = resolved
+
+        preview = DownloadPreview(
+            model_id=model.id,
+            name=model.name,
+            expected_bytes=int(model.size_bytes or 0),
+            expected_is_estimate=bool(model.size_is_estimate),
+            download_url=model.download_url or "",
+        )
+
+        # 1. O catálogo autoriza? (mesma condição do download, passo 1)
+        if not model.download_available or not model.download_url:
+            preview.blocked_reason = f"{model.name}: {model.download_note or (
+                'O catálogo não declara uma origem de download confirmada para '
+                'este modelo.'
+            )}"
+            return preview
+        preview.downloadable = True
+
+        # 2. Destino confinado (mesma proteção contra path traversal).
+        destination = self.destination_path(model)
+        preview.destination = str(destination)
+        preview.part_path = str(self.part_path_for(destination))
+        safety_error = self._ensure_within_models_root(destination)
+        if safety_error:
+            preview.blocked_reason = safety_error
+            return preview
+
+        # 3. O que já existe no destino? (aviso, nunca sobrescrita)
+        if destination.exists():
+            preview.destination_exists = True
+            errors, warnings = self.validate_file(destination, model)
+            preview.warnings.extend(warnings)
+            if not errors:
+                # A prévia promete o que a execução fará, então precisa aplicar
+                # a mesma verificação de integridade: um arquivo já instalado
+                # com o hash errado FAZ `download()` recusar.
+                hash_errors, hash_warnings = self.verify_sha256(
+                    destination, model
+                )
+                preview.warnings.extend(hash_warnings)
+                if hash_errors:
+                    preview.blocked_reason = " ".join(hash_errors)
+                    return preview
+                preview.already_installed = True
+            else:
+                # `download()` recusaria aqui sem `allow_replace_invalid`.
+                preview.blocked_reason = (
+                    f"Já existe um arquivo em {destination}, mas ele parece "
+                    f"inválido ({'; '.join(errors)}). O DaviOS não sobrescreve "
+                    "arquivos existentes automaticamente."
+                )
+                return preview
+
+        # 4. Cabe no disco?
+        fits, space_message = self.check_space(model, destination.parent)
+        preview.space_message = space_message
+        preview.free_bytes = self._free_space(destination.parent)
+        if "apertado" in space_message or "não verificado" in space_message:
+            preview.warnings.append(space_message)
+        if not fits:
+            preview.blocked_reason = space_message
+            return preview
+
+        return preview
+
     # ------------------------------------------------------------------ #
     # Resolução (busca de dados, não decisão)
     # ------------------------------------------------------------------ #
@@ -369,6 +991,8 @@ class ModelDownloader:
         cancel_event: Optional[threading.Event] = None,
         keep_partial: bool = False,
         allow_replace_invalid: bool = False,
+        confirm: Optional[ConfirmCallback] = None,
+        require_confirmation: bool = False,
     ) -> DownloadResult:
         """Baixa o modelo para `<arquivo>.part` e promove para `.gguf`.
 
@@ -381,6 +1005,18 @@ class ModelDownloader:
         - allow_replace_invalid — se True, move um `.gguf` existente e
           INVÁLIDO para `<arquivo>.gguf.invalid` antes de baixar de novo.
           Default False: nunca destruímos arquivo existente em silêncio.
+        - confirm — `confirm(preview) -> bool`, chamado com a prévia ANTES de
+          qualquer byte trafegar. True autoriza; False recusa.
+        - require_confirmation — se True, a confirmação é obrigatória: sem
+          `confirm` o download NÃO começa e volta STATUS_CONFIRMATION_REQUIRED.
+          Default False para não mudar o comportamento dos chamadores atuais.
+
+        A confirmação é a ÚLTIMA etapa antes da rede. Todas as recusas mais
+        fortes (catálogo sem fonte, destino inseguro, arquivo inválido no lugar,
+        disco insuficiente) vêm ANTES dela: o usuário não precisa responder a uma
+        pergunta sobre algo que já está errado.
+
+        `preview()` é read-only e não é afetado por nenhuma destas flags.
 
         Nunca altera `active_model_id`, nunca fala com o provider e nunca
         edita o catálogo.
@@ -420,8 +1056,11 @@ class ModelDownloader:
         result.expected_bytes = expected
 
         # --- 3. Já existe um arquivo final? ---------------------------- #
+        # Checagem inicial, SÓ LEITURA: `defer_write=True` adia qualquer
+        # escrita (o `os.replace` para `.invalid`) para a revalidação sob o
+        # lock. A decisão final é confirmada lá, com o estado real.
         existing_error = self._handle_existing(
-            destination, model, result, allow_replace_invalid
+            destination, model, result, allow_replace_invalid, defer_write=True
         )
         if existing_error is not _CONTINUE:
             return result
@@ -444,11 +1083,78 @@ class ModelDownloader:
             result.error = f"Não foi possível criar a pasta de destino: {exc}"
             return result
 
-        logger.info("[MODEL] download iniciado: %s -> %s", model.id, destination)
-        return self._run_download(
-            model, destination, part, result, progress_callback,
-            cancel_event, keep_partial,
+        # --- 5. Confirmação do chamador --------------------------------- #
+        # Só aqui: todas as recusas mais fortes já passaram. A prévia vem da
+        # MESMA função que `preview()` expõe, então o chamador decide vendo
+        # exatamente o que será feito. Nenhum byte trafegou até aqui.
+        if require_confirmation or confirm is not None:
+            preview = self.preview(model)
+            for warning in preview.warnings:
+                if warning not in result.validation_warnings:
+                    result.validation_warnings.append(warning)
+
+            if confirm is None:
+                result.status = STATUS_CONFIRMATION_REQUIRED
+                result.error = (
+                    "Este download exige confirmação explícita e nenhuma foi "
+                    "fornecida. Passe confirm(preview) -> bool para decidir."
+                )
+                logger.info("[MODEL] download aguardando confirmação: %s", model.id)
+                return result
+
+            if not confirm(preview):
+                result.status = STATUS_DECLINED
+                result.error = f"Download de {model.name} recusado pelo chamador."
+                logger.info("[MODEL] download recusado na confirmação: %s", model.id)
+                return result
+
+        # --- 6. DownloadLock: exclusão mútua sobre o `.part` ------------ #
+        # Adquirido AQUI, depois da confirmação: a confirmação do usuário não
+        # pode prender o lock enquanto ele lê o prompt. Modelos diferentes têm
+        # destinos diferentes e, portanto, locks diferentes — nunca se bloqueiam.
+        lock = DownloadLock(
+            self.lock_path_for(destination),
+            model_id=model.id,
+            size_bytes=expected,
         )
+        if not lock.acquire():
+            result.status = STATUS_LOCKED
+            result.lock_waited = False      # política: não esperar
+            result.lock_holder = lock.holder()
+            logger.info(
+                "[MODEL] download já em andamento para %s (holder=%s)",
+                model.id,
+                result.lock_holder,
+            )
+            return result
+
+        # --- 7. Revalidação pós-lock ------------------------------------ #
+        # A decisão de `_handle_existing()` foi tomada ANTES do lock, e pode
+        # ter ficado obsoleta enquanto esperávamos. Sob o lock, o estado real é
+        # o único que vale: se outro processo acabou de promover este modelo,
+        # não devemos sobrescrevê-lo cegamente.
+        #
+        # A liberação do lock é feita em TODOS os caminhos a partir daqui — o
+        # `return` do recheck está dentro do `try` cujo `finally` libera.
+        try:
+            recheck = self._handle_existing(
+                destination, model, result, allow_replace_invalid
+            )
+            if recheck is not _CONTINUE:
+                return result
+
+            # --- 8. Agora sim: rede e disco de escrita ------------------- #
+            # Tudo daqui roda sob o lock: `_run_download()` escreve o `.part`,
+            # valida, calcula o SHA-256 e promove com `os.replace()`. O
+            # `finally` cobre sucesso, falha, cancelamento, SHA mismatch e
+            # qualquer exceção inesperada.
+            logger.info("[MODEL] download iniciado: %s -> %s", model.id, destination)
+            return self._run_download(
+                model, destination, part, result, progress_callback,
+                cancel_event, keep_partial,
+            )
+        finally:
+            lock.release()
 
     # ------------------------------------------------------------------ #
     # Fluxo interno
@@ -460,6 +1166,7 @@ class ModelDownloader:
         model: ModelInfo,
         result: DownloadResult,
         allow_replace_invalid: bool,
+        defer_write: bool = False,
     ) -> Any:
         """O que fazer quando já existe algo no destino FINAL.
 
@@ -469,21 +1176,52 @@ class ModelDownloader:
         - existe e é inválido -> recusa explicando o motivo. Só move o arquivo
           para `<nome>.invalid` se `allow_replace_invalid=True`. Nunca
           destruímos um arquivo existente em silêncio.
+
+        A integridade SHA-256 é verificada AQUI TAMBÉM, e não só em
+        `_run_download`, porque um arquivo já presente no disco nunca passa
+        pelo fluxo de download.
         """
         if not destination.exists():
             return _CONTINUE
 
         errors, warnings = self.validate_file(destination, model)
         if not errors:
+            # A integridade SHA-256 entra AQUI, e não só no `_run_download`:
+            # sem isso, um `.gguf` adulterado localmente e do MESMO tamanho
+            # passaria despercebido e seria aceito como "já instalado" — a
+            # verificação só protegeria downloads novos, nunca os arquivos que
+            # já estão no disco.
+            hash_errors, hash_warnings = self.verify_sha256(destination, model, result)
+            result.validation_warnings.extend(warnings)
+            result.validation_warnings.extend(hash_warnings)
+
+            if hash_errors:
+                result.status = STATUS_REFUSED
+                result.validation_errors.extend(hash_errors)
+                result.error = (
+                    f"Já existe um arquivo em {destination}, mas ele NÃO confere "
+                    f"com o SHA-256 oficial de {model.id}. O DaviOS não aceita "
+                    "nem sobrescreve esse arquivo automaticamente: remova-o ou "
+                    "mova-o para .invalid e baixe de novo."
+                )
+                logger.warning(
+                    "[MODEL] arquivo existente com SHA-256 incompatível: %s",
+                    destination,
+                )
+                return result
+
             result.status = STATUS_ALREADY_INSTALLED
             result.success = True
             result.already_installed = True
-            result.validation_warnings.extend(warnings)
             try:
                 result.downloaded_bytes = destination.stat().st_size
             except OSError:
                 pass
-            logger.info("[MODEL] já instalado, não sobrescrito: %s", model.id)
+            logger.info(
+                "[MODEL] já instalado, não sobrescrito: %s (sha256=%s)",
+                model.id,
+                "verificado" if result.hash_verified else "sem verificação",
+            )
             return result
 
         result.validation_errors.extend(errors)
@@ -497,6 +1235,13 @@ class ModelDownloader:
             )
             logger.warning("[MODEL] arquivo existente inválido: %s", destination)
             return result
+
+        if defer_write:
+            # Chamada ANTES do lock (checagem inicial, só leitura): o arquivo
+            # inválido será movido para `.invalid` na revalidação SOB o lock.
+            # Mover aqui escreveria no destino sem exclusão mútua, que é
+            # exatamente o que o DownloadLock existe para impedir.
+            return _CONTINUE
 
         backup = destination.with_name(destination.name + ".invalid")
         try:
@@ -603,6 +1348,23 @@ class ModelDownloader:
                 f"O arquivo baixado não passou na validação: {'; '.join(errors)}"
             )
             logger.error("[MODEL][ERROR] validação falhou: %s", errors)
+            return self._abandon_part(part, result, keep_partial)
+
+        # --- Integridade SHA-256 ----------------------------------------- #
+        # Calculado SOBRE O `.part`, ANTES da promoção: é o único momento em que
+        # a decisão de publicar o arquivo ainda não foi tomada. Calcular depois
+        # do `os.replace` exigiria reverter um `.gguf` que o ModelCatalog já
+        # enxergaria como instalado.
+        hash_errors, hash_warnings = self.verify_sha256(part, model, result)
+        result.validation_warnings.extend(hash_warnings)
+        if hash_errors:
+            result.status = STATUS_FAILED
+            result.validation_errors.extend(hash_errors)
+            result.error = (
+                "O arquivo baixado não passou na verificação de integridade: "
+                + "; ".join(hash_errors)
+            )
+            logger.error("[MODEL][ERROR] SHA-256 falhou: %s", hash_errors)
             return self._abandon_part(part, result, keep_partial)
 
         # --- Promoção atômica ------------------------------------------ #

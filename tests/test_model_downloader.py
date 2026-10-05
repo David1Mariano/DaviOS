@@ -653,9 +653,14 @@ class TestSuccessfulDownload:
         downloader = _make_downloader(workspace, _ok_transport())
         result = downloader.download(DOWNLOADABLE)
         assert result.success is True
-        # Nenhum resíduo na pasta: nem .part, nem cópia temporária.
-        leftovers = [p.name for p in (_destination(workspace).parent).iterdir()]
-        assert leftovers == ["baixavel-q4km.gguf"]
+        # Nenhum resíduo: nem .part, nem cópia temporária. O arquivo `.lock`
+        # NÃO é resíduo — ele persiste por design desde o lock do SO, para
+        # que o inode (e portanto a trava) seja sempre o mesmo.
+        leftovers = sorted(
+            p.name for p in (_destination(workspace).parent).iterdir()
+        )
+        assert leftovers == ["baixavel-q4km.gguf", "baixavel-q4km.gguf.lock"]
+        assert not any(n.endswith(".part") for n in leftovers), leftovers
 
 
 class TestAlreadyInstalled:
@@ -1245,6 +1250,33 @@ def _lock_path(workspace: Path, model_id: str = DOWNLOADABLE) -> Path:
     return destination.with_name(destination.name + ".lock")
 
 
+def _read_lock_json(lock_path: Path) -> dict:
+    """Lê a metadata do lock SEM tocar no byte sentinela travado.
+
+    Ler o arquivo inteiro é proibido enquanto alguém possui o lock: no Windows
+    a trava nega acesso ao range, e o `read_text()` falharia com
+    PermissionError. A região do JSON fica em [0, LOCK_SENTINEL_OFFSET).
+    """
+    from brain.model_downloader import LOCK_SENTINEL_OFFSET
+
+    with open(str(lock_path), "rb", buffering=0) as fh:
+        bruto = fh.read(LOCK_SENTINEL_OFFSET)
+    return json.loads(bruto.decode("utf-8").strip())
+
+
+def assert_lock_livre(workspace: Path, model_id: str = DOWNLOADABLE) -> None:
+    """Afirma que o lock do SO está livre.
+
+    Desde a adoção do lock do sistema operacional, o arquivo `.lock` NÃO é
+    removido ao liberar: ele permanece no disco, e é o SO que decide se o
+    recurso está ocupado. Afirmar que o arquivo sumiu testaria a implementação
+    antiga (unlink), não a garantia de exclusividade.
+    """
+    lock = DownloadLock(_lock_path(workspace, model_id), model_id, SIZE_DOWNLOADABLE)
+    assert lock.acquire() is True, "ninguem deveria estar com o lock do SO"
+    lock.release()
+
+
 def _write_lock(lock_path: Path, **fields) -> None:
     """Grava um lock com campos específicos, completando o resto."""
     payload = {
@@ -1283,7 +1315,7 @@ class TestLockAcquisition:
     def test_lock_contains_metadata(self, workspace):
         lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
         assert lock.acquire() is True
-        data = json.loads(_lock_path(workspace).read_text(encoding="utf-8"))
+        data = _read_lock_json(_lock_path(workspace))
         assert data["pid"] == os.getpid()
         assert data["hostname"] == socket.gethostname()
         assert isinstance(data["started_at"], (int, float))
@@ -1309,7 +1341,7 @@ class TestLockAcquisition:
         lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
         lock.acquire()
         lock.release()
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
         assert lock.acquired is False
 
     def test_lock_path_is_sibling_inside_models_root(self, workspace):
@@ -1331,7 +1363,7 @@ class TestLockAcquisition:
         assert _lock_path(workspace).exists(), "o lock do dono foi removido!"
 
         owner.release()
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
 
     def test_stolen_lock_is_not_removed_by_previous_owner(self, workspace):
         """Se outro tomou o lock, o antigo NÃO o apaga ao sair."""
@@ -1341,7 +1373,7 @@ class TestLockAcquisition:
 
         first.release()
         assert _lock_path(workspace).exists(), "removeu lock de terceiro"
-        json.loads(_lock_path(workspace).read_text())  # ainda é JSON válido
+        _read_lock_json(_lock_path(workspace))  # ainda é JSON válido
 
 
 class TestLockAgePolicy:
@@ -1386,7 +1418,7 @@ class TestStaleLocks:
 
         lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
         assert lock.acquire() is True
-        assert json.loads(_lock_path(workspace).read_text())["pid"] == os.getpid()
+        assert _read_lock_json(_lock_path(workspace))["pid"] == os.getpid()
         lock.release()
 
     def test_malformed_lock_is_reclaimed(self, workspace):
@@ -1424,21 +1456,32 @@ class TestStaleLocks:
         """O ponto mais importante: um download de 19,8 GB legítimo NÃO pode
         ter seu lock roubado só por ser 'velho' na escala de um modelo pequeno."""
         started = time.time() - (3600 * 2)  # 2 horas atrás
+        limit = lock_age_limit(20 * 1024 ** 3)
+        assert 3600 * 2 < limit, "2h deveria estar dentro da janela de 19,8 GB"
+
+        # O dono adquire de verdade (lock do SO) e só depois a metadata é
+        # ajustada para simular "2 horas de download". Sem a trava do SO, um
+        # contender adquiriria — o que seria correto, pois o SO é o árbitro.
+        dono = DownloadLock(
+            _lock_path(workspace), DOWNLOADABLE, 20 * 1024 ** 3
+        )
+        assert dono.acquire() is True
         _write_lock(
             _lock_path(workspace),
             pid=os.getpid(),  # processo VIVO
             size_bytes=20 * 1024 ** 3,  # 19,8 GB
             started_at=started,
         )
-        limit = lock_age_limit(20 * 1024 ** 3)
-        assert 3600 * 2 < limit, "2h deveria estar dentro da janela de 19,8 GB"
 
         lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, 20 * 1024 ** 3)
         assert lock.acquire() is False, "lock legítimo de modelo grande foi roubado!"
         assert _lock_path(workspace).exists()
+        dono.release()
 
     def test_other_hostname_relies_on_age_only(self, workspace):
         """Lock de outra máquina: o PID dela não é verificável aqui."""
+        dono = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert dono.acquire() is True
         _write_lock(
             _lock_path(workspace),
             pid=999_999,  # morto aqui, mas é de outro host
@@ -1447,33 +1490,72 @@ class TestStaleLocks:
         lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
         # Não pode ser roubado só porque "o PID não existe aqui".
         assert lock.acquire() is False
+        dono.release()
 
     def test_stale_reclaim_has_no_double_owner(self, workspace):
-        """Dois contenders disputando o MESMO lock obsoleto: so um pode ser dono."""
-        _write_lock(_lock_path(workspace), pid=999_999, hostname=socket.gethostname())
+        """NUNCA dois donos para o mesmo destino.
 
-        results = []
-        start = threading.Barrier(2)
+        Reproduz o bug da auditoria (CRITICO-1): o reclaim legado fazia
+        `unlink() -> O_EXCL`, e o unlink de B podia apagar o lock que A
+        acabara de criar. Resultado: A.acquired == B.acquired == True.
 
-        def contender():
-            lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
-            start.wait()
-            results.append(lock.acquire())
+        Este teste nao reproduz mais o reclaim legado, porque ele saiu do
+        caminho de aquisicao. Ele verifica o INVARIANTE no modelo novo: o SO
+        serializa os contenders e nao existe unlink na aquisicao.
 
-        threads = [threading.Thread(target=contender) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        O gate mantem o interleaving exato da auditoria: B observa o lock
+        ocupado ANTES de A liberar e so tenta de novo DEPOIS. Sem a barreira o
+        GIL serializaria as threads e a corrida nao apareceria.
+        """
+        lock_path = _lock_path(workspace)
 
-        # Exatamente um venceu: o O_EXCL é o árbitro, não o unlink.
-        assert sorted(results) == [False, True]
+        a = DownloadLock(lock_path, DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert a.acquire() is True, "A deveria ter adquirido o lock inicial"
 
-        dono = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
-        assert dono.acquire() is False, "o lock deveria continuar com um dono"
-        # Libera para não deixar resíduo no tmp_path.
-        json.loads(_lock_path(workspace).read_text())
-        _lock_path(workspace).unlink()
+        ja_observaram = threading.Barrier(2, timeout=15)
+        a_liberou = threading.Event()
+        resultado = {}
+
+        def contender(nome):
+            lock = DownloadLock(lock_path, DOWNLOADABLE, SIZE_DOWNLOADABLE)
+            ja_observaram.wait()
+            resultado[nome + "_1"] = lock.acquire()
+            a_liberou.wait(timeout=15)
+            resultado[nome + "_2"] = lock.acquire()
+
+        t1 = threading.Thread(target=contender, args=("A",))
+        t2 = threading.Thread(target=contender, args=("B",))
+        t1.start()
+        t2.start()
+        # NAO usar join() antes do release: as duas threads estao bloqueadas
+        # em `a_liberou.wait()`, e um join aqui as deixaria estourar o timeout
+        # antes de o dono liberar. As duas tentativas seguintes falhariam por
+        # lock ainda ocupado, mascarando o que o teste quer provar.
+        #
+        # Espera-se apenas o instante em que ambas observaram o lock ocupado.
+        for _ in range(300):
+            if resultado.get("A_1") is not None and resultado.get("B_1") is not None:
+                break
+            time.sleep(0.01)
+        assert resultado.get("A_1") is not None, "A nao chegou a tentar"
+        assert resultado.get("B_1") is not None, "B nao chegou a tentar"
+
+        # Agora o dono libera e as duas tentam de novo, DEPOIS.
+        a.release()
+        a_liberou.set()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        assert not t1.is_alive() and not t2.is_alive(), "thread travou"
+
+        # Enquanto A segura o lock do SO, nenhum contender conseguiu adquirir.
+        assert resultado["A_1"] is False
+        assert resultado["B_1"] is False
+
+        # Apos A liberar, exatamente UM consegue adquirir.
+        donos = [resultado["A_2"], resultado["B_2"]]
+        assert sum(1 for d in donos if d is True) == 1, (
+            "DOUBLE OWNER: A={} B={}".format(resultado["A_2"], resultado["B_2"])
+        )
 
 
 class TestDownloadLockIntegration:
@@ -1494,7 +1576,7 @@ class TestDownloadLockIntegration:
 
         assert result.status == STATUS_DOWNLOADED
         assert visto_durante == [True], "o lock não existia durante o download"
-        assert not _lock_path(workspace).exists(), "o lock não foi liberado"
+        assert_lock_livre(workspace)
 
     def test_release_after_failure(self, workspace):
         downloader = _make_downloader(
@@ -1503,7 +1585,7 @@ class TestDownloadLockIntegration:
         result = downloader.download(DOWNLOADABLE)
 
         assert result.status == STATUS_FAILED
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
 
     def test_release_after_cancel(self, workspace):
         event = threading.Event()
@@ -1513,7 +1595,7 @@ class TestDownloadLockIntegration:
         result = downloader.download(DOWNLOADABLE, cancel_event=event)
 
         assert result.status == STATUS_CANCELLED
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
 
     def test_release_after_cancel_keeps_part_when_requested(self, workspace):
         event = threading.Event()
@@ -1526,7 +1608,7 @@ class TestDownloadLockIntegration:
         )
 
         assert result.status == STATUS_CANCELLED
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
         # `_abandon_part` preservou o .part, como antes do lock.
         assert destination.with_name(destination.name + PART_SUFFIX).exists()
 
@@ -1539,7 +1621,7 @@ class TestDownloadLockIntegration:
         result = downloader.download(BAD_HASH)
 
         assert result.status == STATUS_FAILED
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
         assert not part.exists()
         assert not destination.exists()
 
@@ -1553,7 +1635,7 @@ class TestDownloadLockIntegration:
         result = downloader.download(DOWNLOADABLE)
 
         assert result.status == STATUS_ALREADY_INSTALLED
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
         assert downloader._opener.call_count == 0
 
     def test_promotion_occurs_under_lock(self, workspace):
@@ -1645,7 +1727,7 @@ class TestDownloadLockIntegration:
         assert state["n"] == 2, "a revalidação pós-lock não aconteceu"
         assert result.status == STATUS_ALREADY_INSTALLED
         assert downloader._opener.call_count == 0, "não deveria ter baixado"
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
 
 
 class TestConcurrency:
@@ -1686,7 +1768,7 @@ class TestConcurrency:
         assert destination.exists()
         assert destination.read_bytes() == PAYLOAD
         assert not destination.with_name(destination.name + PART_SUFFIX).exists()
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
 
     def test_locked_result_carries_holder_info(self, workspace):
         """O recusado sabe QUEM está segurando, para diagnóstico."""
@@ -1745,8 +1827,8 @@ class TestConcurrency:
         # E cada um promoveu para o SEU destino.
         assert _destination_for(workspace, HASHED).exists()
         assert not _destination_for(workspace, CORRUPT_HASH).exists()
-        assert not _lock_path(workspace, HASHED).exists()
-        assert not _lock_path(workspace, CORRUPT_HASH).exists()
+        assert_lock_livre(workspace, HASHED)
+        assert_lock_livre(workspace, CORRUPT_HASH)
 
     def test_no_partial_file_ever_visible_at_destination(self, workspace):
         """Durante o download, o destino ou não existe ou está completo.
@@ -1767,17 +1849,26 @@ class TestConcurrency:
         v = threading.Thread(target=vigia)
         v.start()
         try:
-            downloader = _make_downloader(workspace, SlowTransport(delay=0.1))
+            # Payload grande + transporte lento: sem isso o download termina em
+            # milissegundos e a vigia nunca chega a ver o arquivo no destino.
+            grande = PAYLOAD * 4000
+            transporte = SlowTransport(delay=0.05, payload=grande)
+            downloader = _make_downloader(workspace, transporte)
+            time.sleep(0.05)  # warm-up: a vigia precisa estar ativa antes
             result = downloader.download(DOWNLOADABLE)
+            # Janela de observacao pos-promocao: o destino existe e continua
+            # existindo, entao a vigia precisa de tempo para pollar.
+            time.sleep(0.15)
         finally:
             parar.set()
             v.join()
 
         assert result.status == STATUS_DOWNLOADED
         assert observados, "a vigia nunca viu o arquivo (teste suspecto)"
-        # Nenhum tamanho parcial observado.
-        assert all(size == len(PAYLOAD) for size in observados), (
-            f"tamanho parcial visível: {set(observados)}"
+        # Nenhum tamanho parcial observado: o destino so aparece completo.
+        completo = len(PAYLOAD) * 4000
+        assert all(size == completo for size in observados), (
+            f"tamanho parcial visivel: {set(observados)} != {completo}"
         )
 
 
@@ -1795,8 +1886,8 @@ def _process_worker(workspace_str, model_id, barrier, queue):
         barrier.wait(timeout=30)
 
         downloader = _make_downloader(
-            workspace, FakeTransport(
-                FakeResponse(data=PAYLOAD, content_length=len(PAYLOAD))
+            workspace, SlowTransport(
+                delay=0.6, payload=PAYLOAD * 3000,
             )
         )
         result = downloader.download(model_id)
@@ -1838,11 +1929,11 @@ class TestCrossProcess:
 
         assert not any(s.startswith("EXCECAO") for s in status), status
         assert sorted(status) == sorted([STATUS_DOWNLOADED, STATUS_LOCKED]), status
-        # Exatamente UM arquivo final, íntegro.
+        # Exatamente UM arquivo final, integro.
         destination = _destination_for(workspace, DOWNLOADABLE)
         assert destination.exists()
-        assert destination.read_bytes() == PAYLOAD
-        assert not _lock_path(workspace).exists()
+        assert destination.read_bytes() == PAYLOAD * 3000
+        assert_lock_livre(workspace)
 
 
 class TestLockApi:
@@ -1883,7 +1974,7 @@ class TestLockApi:
         downloader = _make_downloader(workspace, _ok_transport())
         preview = downloader.preview(DOWNLOADABLE)
         assert preview.can_download is True
-        assert not _lock_path(workspace).exists()
+        assert_lock_livre(workspace)
 
     def test_no_lock_bypass_flags_exist(self):
         """Nenhuma forma de ignorar o lock foi introduzida."""
@@ -1897,3 +1988,210 @@ class TestLockApi:
         # E não há constante de "ignorar lock".
         assert not hasattr(ModelDownloader, "ignore_lock")
         assert not hasattr(ModelDownloader, "force_lock")
+# --------------------------------------------------------------------- #
+# Fase 3-11: lock do sistema operacional como fonte de verdade da posse
+# --------------------------------------------------------------------- #
+
+
+class TestOperatingSystemLock:
+    """O SO — e não o JSON — decide quem possui o lock."""
+
+    def test_acquired_only_after_real_lock(self, workspace):
+        """`acquired` só é True depois de o SO confirmar a trava."""
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert lock.acquired is False
+        assert lock.acquire() is True
+        assert lock.acquired is True
+        lock.release()
+        assert lock.acquired is False
+
+    def test_second_instance_cannot_acquire(self, workspace):
+        """Enquanto o primeiro segura, o segundo falha imediatamente."""
+        primeiro = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert primeiro.acquire() is True
+        segundo = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        inicio = time.time()
+        assert segundo.acquire() is False
+        # Não espera: volta rápido demais para ter esperado.
+        assert time.time() - inicio < 1.0, "acquire não deveria esperar"
+        primeiro.release()
+
+    def test_lock_file_survives_release(self, workspace):
+        """O arquivo permanece: é o inode estável que sustenta a trava."""
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert lock.acquire() is True
+        lock.release()
+        assert _lock_path(workspace).exists(), (
+            "o arquivo .lock deve permanecer para o inode ser estável"
+        )
+
+    def test_inode_is_stable_across_acquire_cycles(self, workspace):
+        """O inode não é substituído entre ciclos de aquisição."""
+        primeiro = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert primeiro.acquire() is True
+        inode_1 = os.stat(str(_lock_path(workspace))).st_ino
+        primeiro.release()
+
+        segundo = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert segundo.acquire() is True
+        inode_2 = os.stat(str(_lock_path(workspace))).st_ino
+        segundo.release()
+
+        assert inode_1 == inode_2, "o arquivo do lock foi substituído"
+
+    def test_release_frees_the_os_lock(self, workspace):
+        """Após release, outro consegue adquirir de novo."""
+        primeiro = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert primeiro.acquire() is True
+        primeiro.release()
+        segundo = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert segundo.acquire() is True
+        segundo.release()
+
+    def test_metadata_readable_while_locked(self, workspace):
+        """O JSON continua legível durante a posse (o SO não o bloqueia)."""
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert lock.acquire() is True
+        data = _read_lock_json(_lock_path(workspace))
+        assert data["pid"] == os.getpid()
+        assert data["hostname"] == socket.gethostname()
+        assert isinstance(data["started_at"], (int, float))
+        assert data["size_bytes"] == SIZE_DOWNLOADABLE
+        assert data["model_id"] == DOWNLOADABLE
+        assert isinstance(data["token"], str) and data["token"]
+        lock.release()
+
+
+class TestIncompleteMetadata:
+    """JSON válido porém incompleto NÃO pode bloquear para sempre."""
+
+    @pytest.mark.parametrize(
+        "conteudo",
+        [
+            "{}",
+            '{"pid": 123}',
+            '{"hostname": "h"}',
+            '{"hostname": "h", "pid": "abc"}',
+            '{"pid": 1, "hostname": "h", "started_at": null, '
+            '"size_bytes": 1, "token": "t"}',
+            '{"pid": 1, "hostname": "h", "started_at": "invalid", '
+            '"size_bytes": 1, "token": "t"}',
+            '{"pid": 1, "hostname": "h", "started_at": 1, "size_bytes": 1}',
+        ],
+        ids=[
+            "vazio",
+            "so_pid",
+            "so_hostname",
+            "pid_string",
+            "started_at_null",
+            "started_at_texto",
+            "sem_token",
+        ],
+    )
+    def test_metadata_incompleta_e_stale(self, workspace, conteudo):
+        _lock_path(workspace).write_text(conteudo, encoding="utf-8")
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        stale, motivo = lock._is_stale()
+        assert stale is True, "metadata incompleta deveria ser stale"
+        assert motivo, "deveria haver um motivo"
+        # E, portanto, é recuperável.
+        assert lock.acquire() is True
+        lock.release()
+
+    def test_timestamp_no_futuro_e_stale(self, workspace):
+        """Relógio adiantado não pode travar o destino para sempre."""
+        _write_lock(
+            _lock_path(workspace),
+            pid=os.getpid(),
+            started_at=time.time() + 86400,  # 1 dia no futuro
+        )
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        stale, motivo = lock._is_stale()
+        assert stale is True
+        assert "futuro" in motivo
+
+    def test_timestamp_absurdamente_futuro_e_stale(self, workspace):
+        _write_lock(_lock_path(workspace), pid=os.getpid(), started_at=9e18)
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert lock._is_stale()[0] is True
+        assert lock.acquire() is True
+        lock.release()
+
+    def test_lock_legitimo_nao_e_roubado(self, workspace):
+        """Contra-regressão: metadata válida não pode ser stale."""
+        dono = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert dono.acquire() is True
+        outro = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert outro._is_stale()[0] is False, "metadata válida não é stale"
+        assert outro.acquire() is False
+        dono.release()
+
+
+def _lock_holder_process(lock_path_str, segurando, morreu):
+    """Processo filho: adquire o lock e fica segurando até ser morto."""
+    from brain.model_downloader import DownloadLock as _DL
+
+    lock = _DL(Path(lock_path_str), "modelo", 1024)
+    ok = lock.acquire()
+    segurando.put(ok)
+    # Fica vivo segurando o lock até o pai encerrar este processo.
+    while not morreu.is_set():
+        time.sleep(0.05)
+
+
+@pytest.mark.skipif(
+    not hasattr(multiprocessing, "get_context"),
+    reason="multiprocessing indisponível",
+)
+class TestLockReleasedOnProcessDeath:
+    """A propriedade do SO: processo morto devolve o lock automaticamente."""
+
+    def test_lock_liberado_quando_processo_morre(self, workspace):
+        """Um processo que morre segurando o lock NÃO deixa órfão.
+
+        Este é o teste de Fase 10: não simulamos morte reescrevendo o JSON —
+        matamos o processo de verdade e verificamos que o SO devolve o lock.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        segurando = ctx.Queue()
+        morreu = ctx.Event()
+        lock_path = str(_lock_path(workspace))
+
+        filho = ctx.Process(
+            target=_lock_holder_process,
+            args=(lock_path, segurando, morreu),
+        )
+        filho.start()
+        try:
+            assert segurando.get(timeout=60) is True, "o filho não adquiriu"
+
+            # Enquanto o filho vive, ninguém mais consegue.
+            outro = DownloadLock(
+                _lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE
+            )
+            assert outro.acquire() is False, "lock roubado de um processo vivo"
+
+            # MATAR o processo, de verdade.
+            filho.kill()
+            filho.join(timeout=60)
+            assert filho.exitcode is not None
+        finally:
+            if filho.is_alive():
+                filho.kill()
+                filho.join(timeout=10)
+            morreu.set()
+
+        # O SO já devolveu o lock; nenhum stale-check foi necessário.
+        depois = DownloadLock(
+            _lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE
+        )
+        assert depois.acquire() is True, "o lock deveria estar livre após a morte"
+        depois.release()
+
+    def test_holder_reports_the_real_owner(self, workspace):
+        """`holder()` é diagnóstico e continua funcionando sob lock."""
+        lock = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert lock.acquire() is True
+        outro = DownloadLock(_lock_path(workspace), DOWNLOADABLE, SIZE_DOWNLOADABLE)
+        assert outro.holder() == "%s:%s" % (socket.gethostname(), os.getpid())
+        lock.release()

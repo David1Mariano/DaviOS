@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -204,10 +205,131 @@ def _read_lock_content(lock_path: Path) -> Optional[dict]:
     try:
         if lock_path.stat().st_size > LOCK_MAX_CONTENT_BYTES:
             return None
-        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        with open(str(lock_path), "rb", buffering=0) as fh:
+            # Lê APENAS a região do JSON, e SEM buffer. Um handle com buffer
+            # pode pedir mais bytes do que pedimos e cruzar o byte sentinela,
+            # travado — e o Windows nega o arquivo inteiro com
+            # PermissionError, fazendo um lock vivo parecer ilegível.
+            bruto = fh.read(LOCK_SENTINEL_OFFSET)
+        texto = bruto.decode("utf-8", "replace").strip()
+        if not texto:
+            return None
+        data = json.loads(texto)
     except (OSError, ValueError, UnicodeDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _has_valid_metadata(data: Optional[dict]) -> bool:
+    """True se o lock carrega TODA a metadata de que a política depende.
+
+    Um lock sem metadata completa não foi escrito por esta implementação
+    (ou foi corrompido), e portanto não tem dono que se possa verificar.
+    Classificá-lo como "vivo" o deixaria bloqueando o destino para sempre —
+    sem nenhum caminho de recuperação. Por isso a ausência é tratada como
+    stale, nunca como lock legítimo.
+
+    Obrigatórios:
+      pid         > 0        → verificar liveness
+      hostname    não vazio  → saber se o PID é local
+      started_at  finito     → calcular a idade
+      size_bytes  >= 0       → definir a janela de idade
+      token       não vazio  → provar posse no release
+
+    `model_id` é diagnóstico e NÃO é obrigatório.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    pid = data.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+
+    hostname = data.get("hostname")
+    if not isinstance(hostname, str) or not hostname.strip():
+        return False
+
+    started_at = data.get("started_at")
+    if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
+        return False
+    if not math.isfinite(float(started_at)):
+        return False
+
+    size = data.get("size_bytes")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return False
+
+    token = data.get("token")
+    if not isinstance(token, str) or not token.strip():
+        return False
+
+    return True
+
+
+def _lock_byte_offset(handle, unlock: bool) -> None:
+        """Trava/libera o byte SENTINELA, fora da região do JSON.
+
+        Por que um byte separado: `msvcrt.locking` (e `LockFile`) nega
+        leitura/escrita do range travado a QUALQUER handle, inclusive do mesmo
+        processo. Se travassemos o offset 0, o `read_text()` do próprio dono
+        falharia com PermissionError, e o lock pareceria "ilegível" para o
+        diagnóstico — abrindo caminho para classificar um lock vivo como
+        órfão. Por isso o JSON ocupa [0, LOCK_SENTINEL_OFFSET) e o byte
+        travado é logo depois dele.
+        """
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(LOCK_SENTINEL_OFFSET)
+            op = msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK
+            msvcrt.locking(handle.fileno(), op, 1)
+        else:
+            import fcntl
+
+            if unlock:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle) -> None:
+    """Libera o lock do SO. Idempotente e nunca levanta."""
+    try:
+        _lock_byte_offset(handle, unlock=True)
+    except Exception:  # noqa: BLE001
+        # Fechar o descritor também libera o lock; nunca mascarar erro de release.
+        pass
+
+
+def _try_lock_file(handle) -> bool:
+    """Trava EXCLUSIVA e NÃO-BLOQUEANTE o byte sentinela.
+
+    True  = adquirido (esta instância é a dona)
+    False = já está travado por outro processo
+
+    O SO é o árbitro: para um mesmo inode, apenas um handle obtém a trava.
+    """
+    try:
+        _lock_byte_offset(handle, unlock=False)
+    except (OSError, IOError):
+        return False
+    return True
+
+
+# Offset do byte que o sistema operacional efetivamente trava.
+#
+# O JSON de metadata ocupa a região [0, LOCK_SENTINEL_OFFSET). O byte travado
+# fica logo depois, para que a trava NÃO bloqueie a leitura do próprio JSON:
+# `msvcrt.locking`/`LockFile` nega acesso ao range travado a qualquer handle,
+# até no mesmo processo, e ler o lock do próprio dono falharia.
+#
+# Deve ser > qualquer tamanho de JSON válido e <= LOCK_MAX_CONTENT_BYTES.
+LOCK_SENTINEL_OFFSET = 512
+
+# Tolerância (segundos) para deriva de relógio entre a gravação e a leitura do
+# lock. Um `started_at` além disso não veio de um relógio coerente e, sem
+# correção, bloquearia o destino para sempre.
+LOCK_CLOCK_SKEW_TOLERANCE_SECONDS = 300.0
 
 
 class DownloadLock:
@@ -249,127 +371,177 @@ class DownloadLock:
         return str(host) if pid is None else "%s:%s" % (host, pid)
 
     def _is_stale(self) -> tuple[bool, str]:
-        """(stale, motivo). Três condições independentes; qualquer uma basta."""
+        """(stale, motivo). Três condições independentes; qualquer uma basta.
+
+        IMPORTANTE: desde a adoção do lock do sistema operacional, esta função
+        NÃO decide mais posse. Ela responde apenas "esta metadata describe um
+        dono que ainda pode ser verificado?". Um lock realmente mantido pelo SO
+        nunca deve ser roubado com base em JSON — o SO é a autoridade.
+        """
         data = _read_lock_content(self.lock_path)
         if data is None:
             # (C) ilegível, grande demais, ou não-JSON: não é confiável.
             return True, "conteudo ilegivel ou invalido"
 
+        # (C2) JSON válido porém SEM metadata completa. Antes, `{}` ou um
+        # `pid` sem `started_at` caíam em "não stale" e bloqueavam o destino
+        # para sempre, sem caminho de recuperação.
+        if not _has_valid_metadata(data):
+            return True, "metadata obrigatoria ausente ou invalida"
+
         host = data.get("hostname")
-        pid = data.get("pid")
-        started_at = data.get("started_at")
-        size = data.get("size_bytes", self.size_bytes)
+        pid = data["pid"]
+        started_at = float(data["started_at"])
+        size = data["size_bytes"]
+
+        # (D) Relógio adiantado ou lixo: um `started_at` no futuro não é um
+        # download em andamento, é um registro inconsistente.
+        agora = time.time()
+        if started_at > agora + LOCK_CLOCK_SKEW_TOLERANCE_SECONDS:
+            return True, "timestamp no futuro (%.0fs a frente)" % (
+                started_at - agora
+            )
 
         # (A) o dono não está mais vivo NESTE host.
-        if host == socket.gethostname() and isinstance(pid, int):
-            if not _process_is_alive(pid):
-                return True, "processo %s nao existe mais" % pid
+        if host == socket.gethostname() and not _process_is_alive(pid):
+            return True, "processo %s nao existe mais" % pid
         # Hostname diferente: não podemos verificar o PID de lá, então a idade
         # (condição B) é a única que pode liberar este lock. Nunca confiar em
         # um PID que veio de outra máquina.
 
         # (B) idade acima do limite derivado do tamanho.
-        if isinstance(started_at, (int, float)):
-            try:
-                age = time.time() - float(started_at)
-            except (TypeError, ValueError, OverflowError):
-                return True, "timestamp invalido"
-            limit = lock_age_limit(size)
-            if age > limit:
-                return True, "idade %.0fs acima do limite %.0fs" % (age, limit)
+        age = agora - started_at
+        limit = lock_age_limit(size)
+        if age > limit:
+            return True, "idade %.0fs acima do limite %.0fs" % (age, limit)
 
         return False, ""
 
-    def _try_create(self) -> bool:
-        """Cria o lock atomicamente. False se já existe (de outro dono)."""
-        token = secrets.token_hex(16)
+    def _open_lock_file(self):
+        """Abre (criando se preciso) o arquivo de lock e garante 1 byte.
+
+        O arquivo NUNCA é removido durante o ciclo de vida normal. Isso é
+        essencial para a garantia de exclusividade: enquanto o inode existe,
+        o lock do SO recai sempre sobre o MESMO byte do MESMO objeto. Se o
+        arquivo fosse apagado e recriado, um contender poderia travar um inode
+        diferente do que o dono atual possui — double-owner.
+
+        No Windows, `msvcrt.locking` trava um RANGE de bytes e falha se o
+        arquivo estiver vazio; por isso garantimos pelo menos 1 byte.
+        """
+        try:
+            handle = open(str(self.lock_path), "r+b")
+        except FileNotFoundError:
+            # Criar sem `a+b`: em modo append o Python ignora `seek()` para
+            # escrita, e o byte sentinela acabaria no offset 0 — exatamente
+            # onde o JSON mora.
+            handle = open(str(self.lock_path), "w+b")
+        try:
+            # Garante que exista o byte sentinela em LOCK_SENTINEL_OFFSET.
+            # Sem ele, `msvcrt.locking` falha e nada trava.
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() < LOCK_SENTINEL_OFFSET + 1:
+                handle.seek(LOCK_SENTINEL_OFFSET)
+                handle.write(b"\x00")
+                handle.flush()
+        except OSError:
+            handle.close()
+            raise
+        return handle
+
+    def _write_metadata(self, handle) -> None:
+        """Grava a metadata de diagnóstico no arquivo que já está travado.
+
+        NÃO decide posse — a posse é a do SO.
+
+        Não usamos `truncate()`: no Windows, truncar pode invalidar o range
+        que `msvcrt.locking` travou, e então outro processo conseguiria travar
+        o mesmo byte. Em vez disso sobrescrevemos a partir do offset 0 e, se o
+        conteúdo novo for mais curto que o antigo, preenchemos o resto com
+        espaços — preservando o tamanho do arquivo e, portanto, a trava.
+        """
         payload = {
             "pid": os.getpid(),
             "hostname": socket.gethostname(),
             "started_at": time.time(),  # segundos desde a época (wall clock)
             "size_bytes": self.size_bytes,
             "model_id": self.model_id,
-            "token": token,
+            "token": self._token,
         }
+        data = json.dumps(payload).encode("utf-8")
         try:
-            fd = os.open(
-                str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-        except FileExistsError:
-            return False
+            handle.seek(0)
+            handle.write(data)
+            # Preenche até o byte sentinela com espaços: mantém o tamanho do
+            # arquivo estável (a trava do SO continua válida) e deixa um
+            # leitor de diagnóstico com JSON parseável.
+            if len(data) < LOCK_SENTINEL_OFFSET:
+                handle.write(b" " * (LOCK_SENTINEL_OFFSET - len(data)))
+            handle.flush()
         except OSError as exc:
-            logger.warning("[MODEL] falha ao criar o lock: %s", exc)
-            return False
-
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle)
-        except OSError as exc:
-            # Lock criado mas inútil: remove para não deixar órfão.
-            logger.warning("[MODEL] falha ao escrever no lock: %s", exc)
-            try:
-                self.lock_path.unlink()
-            except OSError:
-                pass
-            return False
-
-        self._token = token
-        self._acquired = True
-        return True
+            logger.warning("[MODEL] falha ao escrever metadata do lock: %s", exc)
 
     def acquire(self) -> bool:
         """Tenta adquirir. NÃO ESPERA: devolve False se outro tem o lock.
+
+        A posse é decidida EXCLUSIVAMENTE pelo sistema operacional (flock no
+        POSIX, LockFile/msvcrt.locking no Windows). O JSON é apenas
+        diagnóstico.
 
         A ausência de espera é deliberada. Um download de 19,8 GB pode levar
         dezenas de minutos; segurar o lock em espera prenderia a thread sem
         dar nenhum sinal ao usuário. Recusar com `STATUS_LOCKED` é mais honesto
         e infinitamente mais simples de testar.
+
+        INVARIANTE: para um destino, no máximo uma instância tem
+        `acquired == True`. Isso vale porque `_acquired` só é setado depois de
+        o SO confirmar a trava, e o SO serializa contenders sobre o mesmo
+        inode. Não existe `unlink() -> create()` neste caminho.
         """
-        if self._try_create():
+        if self._acquired:
             return True
 
-        stale, reason = self._is_stale()
-        if not stale:
-            return False
-
-        # Reclaim: o `unlink` é apenas a limpeza; quem ARBITRA a posse é o
-        # `O_EXCL` seguinte. Se dois processos detectarem stale ao mesmo tempo,
-        # ambos tentam criar, e só um vence — nunca dois donos.
-        logger.warning("[MODEL] lock obsoleto (%s), tentando reclamar", reason)
         try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            handle = self._open_lock_file()
         except OSError as exc:
-            logger.warning("[MODEL] falha ao remover lock obsoleto: %s", exc)
+            # Sem lock do SO não há garantia de exclusividade. Falhar de forma
+            # segura é preferível a aceitar uma corrida silenciosa.
+            logger.warning("[MODEL] nao foi possivel abrir o lock: %s", exc)
             return False
 
-        return self._try_create()
+        if not _try_lock_file(handle):
+            # Outro processo/thread possui o byte travado.
+            handle.close()
+            return False
+
+        # A partir daqui SOMENTE esta instância possui o lock. Um processo que
+        # morre aqui devolve o lock ao SO automaticamente (o descritor fecha),
+        # sem precisar de heurística de PID.
+        self._handle = handle
+        self._token = secrets.token_hex(16)
+        self._acquired = True
+        self._write_metadata(handle)
+        return True
 
     def release(self) -> None:
-        """Libera o lock, mas SOMENTE se esta instância for a dona.
+        """Libera o lock devolvendo-o ao SO.
 
-        Confirma pelo token: se o conteúdo no disco for de outro (ou ilegível),
-        esta instância não tem autoridade para apagá-lo.
+        O arquivo `.lock` permanece no disco (com a última metadata, para
+        diagnóstico). Removê-lo permitiria que um contender travasse um inode
+        novo e se auto-declarasse dono.
         """
-        if not self._acquired or not self._token:
+        if not self._acquired:
             return
-        data = _read_lock_content(self.lock_path)
-        if data is not None and data.get("token") != self._token:
-            # O lock foi roubado/reclamado por outro. Não toca nele.
-            logger.warning("[MODEL] lock pertence a outra instância; não será removido")
-            self._acquired = False
-            self._token = None
-            return
-        try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            logger.warning("[MODEL] falha ao remover o lock: %s", exc)
-        finally:
-            self._acquired = False
-            self._token = None
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _unlock_file(handle)
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self._handle = None
+        self._acquired = False
+        self._token = None
 
     def __enter__(self):
         return self

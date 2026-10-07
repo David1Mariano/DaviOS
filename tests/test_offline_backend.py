@@ -202,19 +202,85 @@ class TestModelDownloaderOffline:
         lock_path = tmp_path / "model.gguf.lock"
         lock_path.write_text("99999999")  # PID inexistente = stale
 
-        # Mock os.kill para simular processo morto (Windows pode ter comportamento diferente)
+        # Seam de teste agora e _process_is_alive: no Windows a deteccao
+        # usa OpenProcess (sem sinal), entao mockar os.kill nao teria
+        # efeito e o teste dependeria da nao-existencia real do PID.
         import utils.model_downloader as md
 
-        original_kill = md.os.kill
-
-        def fake_kill(pid, sig):
-            if pid == 99999999:
-                raise ProcessLookupError("PID nao existe")
-            return original_kill(pid, sig)
-
-        monkeypatch.setattr(md.os, "kill", fake_kill)
+        monkeypatch.setattr(
+            md, "_process_is_alive", lambda pid: pid != 99999999
+        )
         with DownloadLock(lock_path):
             assert lock_path.exists()
+
+    def test_process_is_alive_detection(self):
+        """Deteccao de processo ativo/expirado SEM enviar sinal:
+        proprio PID = vivo; PID impossivel = morto; PIDs invalidos = morto."""
+        import utils.model_downloader as md
+
+        assert md._process_is_alive(os.getpid()) is True
+        assert md._process_is_alive(99999999) is False
+        assert md._process_is_alive(0) is False
+        assert md._process_is_alive(-1) is False
+
+    def test_process_access_denied_means_alive(self):
+        """ERROR_ACCESS_DENIED (PID protegido) prova que o processo EXISTE."""
+        import utils.model_downloader as md
+
+        if os.name != "nt":
+            pytest.skip("PID 4 (System) so existe no Windows")
+        # PID 4 = processo System: existe sempre em qualquer Windows e o
+        # OpenProcess falha com ERROR_ACCESS_DENIED para processos normais.
+        # (Se por algum motivo o acesso fosse concedido, o resultado
+        # continuaria True = vivo.)
+        assert md._process_is_alive(4) is True
+
+    def test_process_winapi_error_codes(self, monkeypatch):
+        """So ERROR_INVALID_PARAMETER prova morte; demais erros = vivo."""
+        import ctypes
+        import utils.model_downloader as md
+
+        if os.name != "nt":
+            pytest.skip("codigos de erro Win32 exigem Windows")
+
+        class _FakeKernel32:
+            def OpenProcess(self, access, inherit, pid):
+                return None  # NULL = falha; o erro vem do last-error
+
+            def CloseHandle(self, handle):  # pragma: no cover
+                return 1
+
+        casos = [
+            (5, True),  # ERROR_ACCESS_DENIED: existe, sem permissao
+            (87, False),  # ERROR_INVALID_PARAMETER: PID inexistente
+            (8, True),  # ERROR_NOT_ENOUGH_MEMORY: inesperado -> vivo
+            (0, True),  # last-error indefinido: inesperado -> vivo
+        ]
+        for err, esperado in casos:
+            monkeypatch.setattr(md, "_win32_api", lambda: _FakeKernel32())
+            monkeypatch.setattr(ctypes, "get_last_error", lambda e=err: e)
+            assert md._process_is_alive(1234) is esperado, f"erro={err}"
+
+    def test_lock_invalid_content_is_reclaimed(self, tmp_path):
+        """Lock com conteudo invalido e reescrito; nao toca em outros locks."""
+        lock_path = tmp_path / "model.gguf.lock"
+        lock_path.write_text("nao-e-um-pid")
+        with DownloadLock(lock_path):
+            assert lock_path.exists()
+            assert lock_path.read_text() == str(os.getpid())
+
+    def test_lock_acquire_and_release_semantics(self, tmp_path):
+        """Adquirir cria lock com o proprio PID; liberar remove; re-adquirir volta."""
+        lock_path = tmp_path / "model.gguf.lock"
+        lock = DownloadLock(lock_path)
+        assert lock.acquire() is True
+        assert lock_path.read_text() == str(os.getpid())
+        lock.release()
+        assert not lock_path.exists()
+        lock.release()  # release repetido e inofensivo (nao apaga lock de terceiros)
+        with DownloadLock(lock_path):
+            assert lock_path.exists()
+        assert not lock_path.exists()
 
     def test_sha256_verification(self, tmp_path):
         dl = ModelDownloader()

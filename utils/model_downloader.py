@@ -30,6 +30,95 @@ _DEFAULT_CONNECT_TIMEOUT = 30
 _DEFAULT_READ_TIMEOUT = 120
 
 
+_ERROR_ACCESS_DENIED = 5
+_ERROR_INVALID_PARAMETER = 87
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+_win32_kernel = None
+
+
+def _win32_api():
+    """Retorna o kernel32 com protótipos Win32 e captura documentada de erro.
+
+    `WinDLL(..., use_last_error=True)` habilita `ctypes.get_last_error()`,
+    o mecanismo documentado para ler o último código de erro da chamada.
+    `argtypes`/`restype` explícitos (HANDLE = ponteiro) evitam truncamento
+    de handle em sistemas de 64 bits. Instanciado uma única vez (cache).
+    """
+    global _win32_kernel
+    if _win32_kernel is None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+        kernel.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        _win32_kernel = kernel
+    return _win32_kernel
+
+
+def _process_is_alive(pid: int) -> bool:
+    """True se o processo com este PID existe AGORA neste host.
+
+    No Windows, `os.kill(pid, 0)` NAO e seguro: signal 0 vale
+    CTRL_C_EVENT (0) e a chamada gera um Ctrl+C no console
+    compartilhado, interrompendo o processo chamador (e o shell
+    hospedeiro). Usa-se `OpenProcess` via ctypes, que apenas consulta.
+    No POSIX, `os.kill(pid, 0)` e o probe padrao (não envia sinal).
+
+    No Windows, morte so e afirmada com `ERROR_INVALID_PARAMETER` (87),
+    que indica que o PID não existe. `ERROR_ACCESS_DENIED` (5) prova que
+    o processo EXISTE. Qualquer outro codigo de erro ou excecao segue a
+    política conservadora de tratar como vivo, para não roubar o lock.
+    """
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel = _win32_api()
+            # PROCESS_QUERY_LIMITED_INFORMATION: o menos privilegiado
+            # que ainda responde "existe?".
+            handle = kernel.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                kernel.CloseHandle(handle)
+                return True
+            err = ctypes.get_last_error()
+            if err == _ERROR_ACCESS_DENIED:
+                return True  # existe, mas sem permissao para inspecionar
+            if err == _ERROR_INVALID_PARAMETER:
+                return False  # PID inexistente (codigo confiavel)
+            # Codigo inesperado: nao prova morte; na duvida, vivo.
+            logger.debug(
+                "OpenProcess: erro %d inesperado; PID %d tratado como vivo.",
+                err,
+                pid,
+            )
+            return True
+        except Exception:  # noqa: BLE001 - nunca derruba o download por isso
+            return True  # na duvida, vivo (nao rouba o lock)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # existe, mas e de outro usuario
+    except OSError:
+        return False
+    return True
+
+
 @dataclass
 class DownloadResult:
     """Resultado de um download."""
@@ -70,17 +159,15 @@ class DownloadLock:
             try:
                 pid_str = self.lock_path.read_text().strip()
                 pid = int(pid_str)
-                try:
-                    os.kill(pid, 0)  # signal 0 = checa existencia
+                if _process_is_alive(pid):
                     logger.info("Download ja em andamento (PID %d).", pid)
                     return False
-                except (OSError, ProcessLookupError):
-                    logger.info("Lock stale (PID %d morto). Reclamando.", pid)
-                    # Remove o lock stale antes de tentar criar novo
-                    try:
-                        self.lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                logger.info("Lock stale (PID %d morto). Reclamando.", pid)
+                # Remove o lock stale antes de tentar criar novo
+                try:
+                    self.lock_path.unlink()
+                except FileNotFoundError:
+                    pass
             except (ValueError, IOError):
                 # Conteudo invalido no lock: remove e tenta criar novo
                 try:

@@ -58,6 +58,50 @@ class PromptBuilder:
         self.config = config or DaviosConfig.load()
         self.personality = personality or DEFAULT_PERSONALITY
 
+    # ------------------------------------------------------------------
+    # Politica conversacional (etapa 2): orienta COMO responder segun la
+    # intencion. NO escribe la respuesta: solo le da al modelo la clave de
+    # lectura de la mensaje actual. Solo se aplica para las intenciones
+    # nuevas; cualquier otro intent (conversation, greeting...) no genera
+    # bloque, por lo que el prompt base queda inalterado.
+    # ------------------------------------------------------------------
+    CONVERSATION_POLICIES: dict[str, str] = {
+        "social": (
+            "Conversa casual: responda de forma natural e breve. NAO "
+            "transforme la interacao social en oferta automatica de ayuda "
+            "e NAO force una pregunta al usuario. Pode terminar a resposta "
+            "sem pregunta."
+        ),
+        "social_reciprocal": (
+            "O usuario esta devolvendo a pregunta (ex.: \"e voce?\", \"como "
+            "voce esta?\"). Responda DIRETAMENTE a essa parte reciproca, de "
+            "forma breve. NAO devuelva automaticamente a mesma pregunta e "
+            "NAO feche com oferta generica de ayuda."
+        ),
+        "follow_up": (
+            "Esta mensaje e uma CONTINUACION da conversacion: refere-se a "
+            "algo dito antes (conversa recente acima). Interprete-ah usando "
+            "esse contexto, continue o mesmo assunto e NAO reinicie a "
+            "conversacion nem invente um topico novo."
+        ),
+        "file_request": (
+            "O usuario pede o CONTENIDO de um arquivo. Se a herramienta "
+            "read_file esta disponible na lista de ferramentas, genere um "
+            "TOOL_REQUEST valido para ela (nome \"read_file\"). NAO diga "
+            "que nao pude acessar arquivos se la herramienta autorizada "
+            "existe."
+        ),
+        "time_request": (
+            "O usuario pregunta a HORA atual. Se a herramienta time esta "
+            "disponible na lista, genere um TOOL_REQUEST valido para ela."
+        ),
+    }
+
+    @classmethod
+    def _conversation_policy(cls, intent: str) -> str:
+        """Devolve la orientacion corta de la intencion ('' si no hay)."""
+        return cls.CONVERSATION_POLICIES.get((intent or "").lower(), "")
+
     def build(
         self,
         user_message: str,
@@ -90,6 +134,7 @@ class PromptBuilder:
         history_block = self._format_history(context)
         topic = getattr(context, "current_topic", "") if context else ""
         style_text = self._format_style(style_profile)
+        policy_block = self._conversation_policy(intent)
 
         tools_block = ""
         if self.config.tools_visible_to_llm:
@@ -121,6 +166,9 @@ class PromptBuilder:
 
         if tools_block:
             sections.append(tools_block)
+
+        if policy_block:
+            sections.append(policy_block)
 
         sections.append(f"Mensagem do usuario: {user_message}")
 
@@ -551,16 +599,39 @@ class PromptBuilder:
         messages = getattr(context, "messages", []) or []
         recent = messages[-self.config.max_recent_messages:]
 
-        lines = [
-            "Conversa anterior - so contexto, nao exemplo: nao copie nem imite "
-            "o formato ou encerramento das respostas anteriores."
-        ]
+        # Flag OFF => caminho anterior byte a byte: texto de contexto sem
+        # cabecalho novo, prefixo "Usuario:" e sem instrucao neutra (fonte:
+        # comportamento de HEAD). Flag ON => cabecalho "HISTÓRICO RECENTE",
+        # prefixo "Usuário:" e a instrucao neutra de uso do historico.
+        tools_on = bool(getattr(self.config, "tools_visible_to_llm", False))
+
+        if tools_on:
+            lines = [
+                "HISTÓRICO RECENTE — apenas para contextualizar a mensagem atual:",
+            ]
+            prefix = "Usuário"
+        else:
+            lines = [
+                "Conversa anterior - so contexto, nao exemplo: nao copie nem imite "
+                "o formato ou encerramento das respostas anteriores."
+            ]
+            prefix = "Usuario"
 
         for item in recent:
             user = item.get("user", "")
             response = item.get("response", "")
 
-            lines.append(f"Usuario: {user}")
+            lines.append(f"{prefix}: {user}")
             lines.append(f"DaviOS: {response}")
+
+        if tools_on:
+            # Instrução neutra: o histórico serve para entender referências,
+            # não para continuar ou completar tarefas anteriores automaticamente.
+            lines.append("")
+            lines.append(
+                "Use o histórico para compreender referências e contexto da "
+                "mensagem atual. Não continue, complete ou invente uma tarefa "
+                "anterior a menos que a mensagem atual peaça isso explicitamente."
+            )
 
         return "\n".join(lines)

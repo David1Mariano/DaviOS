@@ -81,7 +81,7 @@ class ModelStatusResult:
     """Resposta de consulta sobre o modelo ativo/carregado/persistido.
 
     Campos:
-      active_model       -> modelo que o gerenciador\ModelManager considera ativo
+      active_model       -> modelo que o ModelManager considera ativo
                            (resolvido + selecionado), ou None quando nao ha modelo
                            ativo/logico.
       active_model_id    -> ID do modelo ativo (string), ou None.
@@ -471,7 +471,7 @@ class ConversationEngine:
         return handler(text)
 
     def _handle_model_status(self, text: str) -> ConversationResult:
-        """Responde a: "qual modelo voce esta usando?", "que modelo esta rodando?". """
+        """Responde a perguntas sobre o estado atual dos modelos."""
         manager = self.model_manager
         try:
             status = manager.get_status()
@@ -483,7 +483,10 @@ class ConversationEngine:
             )
             self.context.add_message(text, "erro ao consultar status", "model_status")
             return ConversationResult(
-                response="Nao consegui verificar o estado dos modelos agora. Tente novamente em instantes.",
+                response=(
+                    "Nao consegui verificar o estado dos modelos agora. "
+                    "Tente novamente em instantes."
+                ),
                 intent="model_status",
                 memory_action="model_status_error",
                 context=self.context.to_dict(),
@@ -491,30 +494,29 @@ class ConversationEngine:
             )
 
         active_id = status.get("active_model_id")
-        active_name = status.get("active_model")
-        active = None
-        if active_id:
-            try:
-                active = manager.resolve_model(active_id)
-            except Exception:
-                active = None
-        active_state = getattr(manager, 'active_state', None)
+        active_data = status.get("active_model")
+        if isinstance(active_data, dict):
+            active_name = (
+                active_data.get("name")
+                or active_data.get("id")
+                or active_id
+                or "nenhum"
+            )
+        else:
+            active_name = active_data or active_id or "nenhum"
+
         persisted_id = status.get("persisted_active_model_id")
         loaded = status.get("loaded_model")
         provider_running = status.get("provider_running")
         provider_backend = status.get("provider_backend")
         matches_loaded = status.get("active_model_matches_loaded")
 
-        active_str = active_name or active_id or "nenhum"
-        loaded_str = loaded if loaded else "nenhum confirmado"
-        persisted_str = persisted_id if persisted_id else "nenhum registrado"
-
         if provider_running is False:
             provider_str = "indisponivel"
         elif provider_running is True:
             provider_str = provider_backend or "disponivel"
         else:
-            provider_str = "desconhecido (sem provider)"
+            provider_str = "indisponivel (sem provider)"
 
         if matches_loaded is True:
             sync_str = "sincronizado"
@@ -523,21 +525,37 @@ class ConversationEngine:
         else:
             sync_str = "nao e possivel confirmar"
 
-        parts = [f"Modelo ativo: {active_str}.", f"Modelo carregado: {loaded_str}.", f"Provider: {provider_str}."]
-        if persisted_id and active_id and persisted_id != active_id:
-            parts.append(f"Registrado: {persisted_str} (diferente do ativo).")
-        parts.append(f"Estado: {sync_str}.")
+        active = None
+        if active_id:
+            try:
+                active = manager.resolve_model(active_id)
+            except Exception:
+                active = None
 
-        response = " ".join(parts)
+        response = " ".join(
+            [
+                f"Modelo ativo: {active_name}.",
+                f"Modelo carregado: {loaded or 'nenhum confirmado'}.",
+                f"Modelo persistido: {persisted_id or 'nenhum registrado'}.",
+                f"Provider: {provider_str}.",
+                f"Estado: {sync_str}.",
+            ]
+        )
         self.context.add_message(text, response, "model_status")
         return ConversationResult(
-            response=response, intent="model_status", memory_action="model_status",
+            response=response,
+            intent="model_status",
+            memory_action="model_status",
             context=self.context.to_dict(),
             model_status=ModelStatusResult(
-                active_model=self._model_to_dict(active), active_model_id=active_id,
-                active_model_state=active_state, persisted_model_id=persisted_id,
-                loaded_model=loaded, provider_running=provider_running,
-                provider_backend=provider_backend, matches_loaded=matches_loaded, error=None,
+                active_model=self._model_to_dict(active),
+                active_model_id=active_id,
+                active_model_state=getattr(manager, "active_state", None),
+                persisted_model_id=persisted_id,
+                loaded_model=loaded,
+                provider_running=provider_running,
+                provider_backend=provider_backend,
+                matches_loaded=matches_loaded,
             ),
         )
 
@@ -579,6 +597,7 @@ class ConversationEngine:
             ),
         )
 
+
     def _model_to_dict(self, model) -> Optional[dict[str, Any]]:
         if model is None:
             return None
@@ -586,6 +605,7 @@ class ConversationEngine:
             return model.to_dict()
         except AttributeError:
             return {'id': getattr(model, 'id', None), 'name': getattr(model, 'name', None), 'tier': getattr(model, 'tier', None)}
+
 
     def _handle_model_list_available(self, text: str) -> ConversationResult:
         """Responde a: "quais modelos estao disponiveis?", "que modelos posso usar?". """
@@ -621,6 +641,7 @@ class ConversationEngine:
         ic = len([m for m in models if m and m.get('installed')])
         return ConversationResult(response=response, intent='model_list_available', memory_action='model_list', context=self.context.to_dict(), model_list=ModelListResult(kind='available', models=models, installed_count=ic, catalog_total=total))
 
+
     def _handle_model_list(self, text: str) -> ConversationResult:
         """Responde a listagens genericas: "quais modelos existem?". """
         return self._handle_model_list_available(text)
@@ -632,7 +653,18 @@ class ConversationEngine:
             return ConversationResult(response='Nao consegui interpretar a consulta.', intent='model_info', memory_action='model_info_error', context=self.context.to_dict(), model_info=ModelInfoResult(question=None, target=None, error='consulta nao reconhecida'))
         manager = self.model_manager
         target = request.target or ''
-        resolved = manager.resolve_model(target) if target else None
+        try:
+            resolved = manager.resolve_model(target) if target else None
+        except Exception as exc:
+            self.context.add_message(text, 'erro ao resolver modelo', 'model_info')
+            return ConversationResult(
+                response='Nao consegui consultar esse modelo agora. Tente novamente em instantes.',
+                intent='model_info', memory_action='model_info_error',
+                context=self.context.to_dict(),
+                model_info=ModelInfoResult(
+                    question=request.question, target=target, error=str(exc)
+                ),
+            )
         rid = getattr(resolved, 'id', None) if resolved else None
         rd = self._model_to_dict(resolved) if resolved else None
         if resolved is None:

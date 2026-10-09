@@ -134,14 +134,35 @@ class TestPromptBuilder:
         built = PromptBuilder(DaviosConfig()).build("qual e meu nome?", memories=[Fact()])
         assert "Davi" in built.prompt
 
-    def test_history_included(self):
+    def test_history_context_instruction_present(self):
+        """O prompt deve conter a instrução neutra sobre uso do histórico."""
         from brain.conversation_engine import ConversationContext
 
         context = ConversationContext()
-        context.add_message("estou estudando Python", "Legal!", "conversation")
-        built = PromptBuilder(DaviosConfig()).build("interfaces", context=context)
-        assert "estudando Python" in built.prompt
-        assert "interfaces" in built.prompt
+        context.add_message("msg anterior", "resp anterior", "conversation")
+        built = PromptBuilder(DaviosConfig(tools_visible_to_llm=True)).build("msg atual", context=context)
+
+        assert "HISTÓRICO RECENTE" in built.prompt
+        assert "Use o histórico para compreender referências" in built.prompt
+        assert "Não continue, complete ou invente uma tarefa anterior" in built.prompt
+        assert "Usuário: msg anterior" in built.prompt
+        assert "DaviOS: resp anterior" in built.prompt
+        # A mensagem atual deve estar na seção final
+        assert "Mensagem do usuario: msg atual" in built.prompt
+
+    def test_current_message_not_in_history_section(self):
+        """A mensagem atual não deve aparecer na seção de histórico."""
+        from brain.conversation_engine import ConversationContext
+
+        context = ConversationContext()
+        context.add_message("msg anterior", "resp anterior", "conversation")
+        current = "esta e a msg atual"
+        built = PromptBuilder(DaviosConfig()).build(current, context=context)
+
+        # Separar a seção de histórico da mensagem atual
+        hist_section = built.prompt.split("Mensagem do usuario:")[0]
+        assert current not in hist_section
+        assert "msg anterior" in hist_section
 
 
 @pytest.fixture

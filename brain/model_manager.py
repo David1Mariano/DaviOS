@@ -1139,6 +1139,7 @@ class ModelManager:
         hardware = self.detect_hardware()
 
         provider_running: Optional[bool] = None
+        provider_backend: Optional[str] = None
         loaded_model: Optional[str] = None
         status_errors: list[str] = []
         if self._provider is not None:
@@ -1162,6 +1163,22 @@ class ModelManager:
                 message = f"provider falhou ao informar modelo carregado: {exc}"
                 status_errors.append(message)
                 logger.warning("[MODEL] %s", message)
+
+            # Etapa 7: nome do backend informado pelo provider (leitura pura).
+            # Falha aqui é silenciosa: o backend é cosmético para a consulta;
+            # o estado real (running/loaded) já vem dos campos acima.
+            health_fn = getattr(self._provider, "health_check", None)
+            if callable(health_fn):
+                try:
+                    health = health_fn()
+                except Exception as exc:
+                    message = f"provider falhou no health check: {exc}"
+                    logger.warning("[MODEL] %s", message)
+                else:
+                    if isinstance(health, dict):
+                        backend = health.get("backend")
+                        if backend is not None:
+                            provider_backend = str(backend).strip() or None
 
         if status_errors:
             self._last_error = "; ".join(status_errors)
@@ -1194,6 +1211,7 @@ class ModelManager:
             "active_model_state": self._active_state,
             "persisted_active_model_id": self._read_persisted_active_id(),
             "provider_running": provider_running,
+            "provider_backend": provider_backend,
             "loaded_model": loaded_model,
             "active_model_matches_loaded": active_model_matches_loaded,
             "catalog_total": len(self.catalog),

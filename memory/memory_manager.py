@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
@@ -181,12 +182,10 @@ class MemoryManager:
                 facts[0],
             )
         logger.debug(
-            "[MATCH] existing_memory_id=%s matching_fact_id=%s target=%s old_relation=%s new_relation=%s",
+            "[MATCH] existing_memory_id=%s matching_fact_id=%s has_new_fact=%s",
             getattr(existing_memory, "id", None),
             getattr(matching_fact, "id", None),
-            getattr(matching_fact or (facts[0] if facts else None), "target", None),
-            getattr(matching_fact, "relation", None),
-            getattr(facts[0], "relation", None) if facts else None,
+            bool(facts),
         )
         return {
             "existing_memory": existing_memory,
@@ -288,12 +287,13 @@ class MemoryManager:
 
         Nada é apagado: histórico e evidências permanecem preservados.
         """
-        fixed_targets = self.database.normalize_all_fact_targets(
-            self.normalize_fact_target
-        )
-        result = self.database.consolidate_duplicate_memories()
-        result["fixed_targets"] = fixed_targets
-        result["unique_index"] = self.database.ensure_semantic_uniqueness_index()
+        with self.database.atomic_write(force_commit=True):
+            fixed_targets = self.database.normalize_all_fact_targets(self.normalize_fact_target, commit=False)
+            result = self.database.consolidate_duplicate_memories(commit=False)
+            result["unique_index"] = self.database.ensure_semantic_uniqueness_index(commit=False)
+            if not result["unique_index"]:
+                raise RuntimeError("semantic uniqueness index could not be ensured")
+            result["fixed_targets"] = fixed_targets
         return result
 
     def _determine_operation(
@@ -390,18 +390,15 @@ class MemoryManager:
         matching_fact: Optional[MemoryFact],
         database_action: str,
     ) -> None:
-        new_value = (
-            f"{new_fact.target}/{new_fact.relation}"
-            if new_fact is not None else "None"
-        )
-        matching_value = (
-            f"{matching_fact.target}/{matching_fact.relation}"
-            if matching_fact is not None else "None"
-        )
         logger.debug(
             "[MEMORY FLOW] "
-            "operation=%s existing_memory_id=%s new_fact=%s matching_fact=%s database_action=%s",
-            operation, getattr(existing_memory, 'id', None), new_value, matching_value, database_action,
+            "operation=%s existing_memory_id=%s new_fact_present=%s "
+            "matching_fact_id=%s database_action=%s",
+            operation,
+            getattr(existing_memory, "id", None),
+            new_fact is not None,
+            getattr(matching_fact, "id", None),
+            database_action,
         )
 
     def create_memory(self, memory: Memory) -> dict[str, Any]:
@@ -413,6 +410,7 @@ class MemoryManager:
         self.normalize_memory_facts(memory)
         if not memory.facts:
             return {"action": "ignore", "reason": "empty_memory", "facts": []}
+        self.database.validate_memory(memory)
 
         # Processa cada fato
         # Se todos os fatos determinam a mesma operação, executa operação única
@@ -514,17 +512,33 @@ class MemoryManager:
         if existing_memory is None:
             return {"action": "error", "reason": "add_without_existing_memory"}
         self.normalize_memory_facts(new_memory)
+        self.database.validate_memory(new_memory)
         added = []
-        try:
+        with self.database.atomic_write(force_commit=True):
+            matches = []
+            batch_facts = []
             for fact in new_memory.facts:
                 matching = self._find_matching_fact_in_database(existing_memory, fact)
+                if matching is None:
+                    matching = next(
+                        (
+                            prior_fact
+                            for prior_fact in batch_facts
+                            if (prior_fact.status or "active") == "active"
+                            and self.facts_are_semantically_equal(prior_fact, fact)
+                        ),
+                        None,
+                    )
                 self._flow_log("add", existing_memory, fact, matching, "none")
                 if matching is not None:
                     if self.facts_are_identical(matching, fact):
-                        self.database.connection.rollback()
                         return {"action": "ignore", "target": fact.target, "reason": "identical_fact"}
-                    self.database.connection.rollback()
                     return {"action": "error", "reason": "add_existing_fact", "target": fact.target}
+                matches.append((fact, matching))
+                if (fact.status or "active") == "active":
+                    batch_facts.append(fact)
+
+            for fact, _ in matches:
                 fact_id = self.database.add_memory_fact(
                     memory_id=existing_memory.id,
                     target=fact.target,
@@ -546,10 +560,6 @@ class MemoryManager:
                     commit=False,
                 )
                 added.append({"action": "add", "fact_id": fact_id, "target": fact.target, "relation": fact.relation})
-            self.database.connection.commit()
-        except Exception:
-            self.database.connection.rollback()
-            raise
         existing_memory.facts = self.database.get_memory_facts(existing_memory.id)
         self._flow_log("add", existing_memory, new_memory.facts[0], None, "add_memory_fact")
         return {"action": "add", "memory": existing_memory, "facts": added}
@@ -564,14 +574,18 @@ class MemoryManager:
         self.normalize_memory_facts(new_memory)
         if not new_memory.facts:
             return {"action": "error", "reason": "empty_update"}
+        self.database.validate_memory(new_memory)
         updated = []
-        try:
+        with self.database.atomic_write(force_commit=True):
+            matches = []
             for fact in new_memory.facts:
                 matching = self._find_matching_fact_in_database(existing_memory, fact)
                 self._flow_log("update", existing_memory, fact, matching, "none")
                 if matching is None:
-                    self.database.connection.rollback()
                     return {"action": "error", "reason": "update_without_matching_fact", "target": fact.target}
+                matches.append((fact, matching))
+
+            for fact, matching in matches:
                 if self.facts_are_identical(matching, fact):
                     updated.append({"action": "ignore", "target": fact.target})
                     continue
@@ -601,6 +615,7 @@ class MemoryManager:
                     metadata=metadata,
                     reason="Fato atualizado por nova declaração do usuário.",
                     revision_type="updated",
+                    commit=False,
                 )
                 if not changed:
                     raise RuntimeError("database_update_memory_fact_failed")
@@ -612,12 +627,9 @@ class MemoryManager:
                     self.database.update_memory_content(
                         existing_memory.id,
                         new_memory.content,
+                        commit=False,
                     )
                 updated.append({"action": "update", "fact_id": matching.id, "target": fact.target, "relation": fact.relation})
-            self.database.connection.commit()
-        except Exception:
-            self.database.connection.rollback()
-            raise
         refreshed_memory = self.database.get_memory(existing_memory.id)
         if refreshed_memory is not None:
             existing_memory.__dict__.update(refreshed_memory.__dict__)
@@ -684,11 +696,12 @@ class MemoryManager:
         self.normalize_memory_facts(memory)
         if not memory.facts:
             return {"operation": "ignored", "memory": None, "facts": []}
+        evidence_items = self.database.validate_memory(memory, evidence)
 
         timestamp = self._timestamp(now)
         new_facts: list[MemoryFact] = []
         reinforced: list[dict[str, Any]] = []
-        default_evidence = list(evidence or [])
+        default_evidence = evidence_items
         if not default_evidence:
             default_evidence = [
                 {
@@ -698,99 +711,108 @@ class MemoryManager:
                     "confidence": memory.confidence,
                 }
             ]
+        self.database.validate_memory(memory, default_evidence)
 
-        for fact in memory.facts:
-            fact.fact_type = fact.fact_type or memory.memory_type
-            candidates = self.database.find_facts_for_semantic_key(
-                fact.subject,
-                fact.target,
-                fact.relation_family,
-                include_inactive=False,
+        with self.database.atomic_write(force_commit=True):
+            for fact in memory.facts:
+                fact.fact_type = fact.fact_type or memory.memory_type
+                candidates = self.database.find_facts_for_semantic_key(
+                    fact.subject,
+                    fact.target,
+                    fact.relation_family,
+                    include_inactive=False,
+                )
+                equivalent = next(
+                    (candidate for candidate in candidates if self.facts_are_identical(candidate, fact)),
+                    None,
+                )
+                if equivalent is None:
+                    new_facts.append(fact)
+                    continue
+                used_evidence = fact.evidence or default_evidence
+                for item in used_evidence:
+                    self.database.add_fact_evidence(
+                        equivalent.id,
+                        item,
+                        now=timestamp,
+                        commit=False,
+                    )
+                evidence_count = len(self.database.get_fact_evidence(equivalent.id))
+                reinforced_confidence = min(
+                    0.99,
+                    max(equivalent.confidence, fact.confidence) + min(0.12, evidence_count * 0.02),
+                )
+                self.database.update_memory_fact(
+                    memory_id=equivalent.memory_id,
+                    fact_id=equivalent.id,
+                    confidence=reinforced_confidence,
+                    reason="Declaração equivalente reforçada por nova evidência.",
+                    revision_type="confirmed",
+                    now=timestamp,
+                    commit=False,
+                )
+                reinforced.append(
+                    {
+                        "action": "reinforce",
+                        "fact_id": equivalent.id,
+                        "target": equivalent.target,
+                        "relation": equivalent.relation,
+                    }
+                )
+
+            if not new_facts:
+                return {
+                    "operation": "reinforced",
+                    "memory": None,
+                    "facts": reinforced,
+                }
+
+            record = Memory(
+                content=memory.content,
+                memory_type=memory.memory_type,
+                importance=memory.importance,
+                base_importance=memory.base_importance,
+                emotion=memory.emotion,
+                emotional_intensity=memory.emotional_intensity,
+                confidence=memory.confidence,
+                status=memory.status,
+                metadata=memory.metadata,
+                facts=new_facts,
             )
-            equivalent = next(
-                (candidate for candidate in candidates if self.facts_are_identical(candidate, fact)),
-                None,
-            )
-            if equivalent is None:
-                new_facts.append(fact)
-                continue
-            used_evidence = fact.evidence or default_evidence
-            for item in used_evidence:
-                self.database.add_fact_evidence(equivalent.id, item, now=timestamp)
-            evidence_count = len(self.database.get_fact_evidence(equivalent.id))
-            reinforced_confidence = min(
-                0.99,
-                max(equivalent.confidence, fact.confidence) + min(0.12, evidence_count * 0.02),
-            )
-            self.database.update_memory_fact(
-                memory_id=equivalent.memory_id,
-                fact_id=equivalent.id,
-                confidence=reinforced_confidence,
-                reason="Declaração equivalente reforçada por nova evidência.",
-                revision_type="confirmed",
+            memory_id = self.database.save_memory(
+                record,
+                evidence=default_evidence,
                 now=timestamp,
+                allow_duplicate_content=allow_duplicate_content,
+                commit=False,
             )
-            reinforced.append(
-                {
-                    "action": "reinforce",
-                    "fact_id": equivalent.id,
-                    "target": equivalent.target,
-                    "relation": equivalent.relation,
+            if memory_id is None:
+                return {
+                    "operation": "ignored",
+                    "memory": self.database.find_memory(memory),
+                    "facts": reinforced,
                 }
-            )
 
-        if not new_facts:
-            return {
-                "operation": "reinforced",
-                "memory": None,
-                "facts": reinforced,
-            }
-
-        record = Memory(
-            content=memory.content,
-            memory_type=memory.memory_type,
-            importance=memory.importance,
-            base_importance=memory.base_importance,
-            emotion=memory.emotion,
-            emotional_intensity=memory.emotional_intensity,
-            confidence=memory.confidence,
-            status=memory.status,
-            metadata=memory.metadata,
-            facts=new_facts,
-        )
-        memory_id = self.database.save_memory(
-            record,
-            evidence=default_evidence,
-            now=timestamp,
-            allow_duplicate_content=allow_duplicate_content,
-        )
-        if memory_id is None:
-            return {
-                "operation": "ignored",
-                "memory": self.database.find_memory(memory),
-                "facts": reinforced,
-            }
-
-        conflict_results = [
-            self.resolve_conflicts_for_fact(fact, now=timestamp)
-            for fact in record.facts
-        ]
-        saved = self.database.get_memory(memory_id)
-        return {
-            "operation": "created",
-            "memory": saved,
-            "facts": [
-                {
-                    "action": "add",
-                    "fact_id": fact.id,
-                    "target": fact.target,
-                    "relation": fact.relation,
-                }
+            conflict_results = [
+                self.resolve_conflicts_for_fact(fact, now=timestamp, commit=False)
                 for fact in record.facts
             ]
-            + reinforced,
-            "conflicts": [item for item in conflict_results if item is not None],
-        }
+            saved = self.database.get_memory(memory_id)
+            return {
+                "operation": "created",
+                "memory": saved,
+                "facts": [
+                    {
+                        "action": "add",
+                        "fact_id": fact.id,
+                        "target": fact.target,
+                        "relation": fact.relation,
+                    }
+                    for fact in record.facts
+                ]
+                + reinforced,
+                "conflicts": [item for item in conflict_results if item is not None],
+            }
 
     def synchronize_memory_facts(
         self,
@@ -957,6 +979,7 @@ class MemoryManager:
         fact: MemoryFact,
         *,
         now: Optional[datetime | str] = None,
+        commit: bool = True,
     ) -> Optional[dict[str, Any]]:
         """Persiste conflitos e aplica uma resolução determinística quando segura."""
 
@@ -970,81 +993,91 @@ class MemoryManager:
             exclude_fact_id=fact.id,
         )
         resolutions = []
-        for candidate in candidates:
-            if not self.facts_conflict(candidate, fact):
-                continue
-            candidate_score = self._conflict_score(candidate, now=now)
-            fact_score = self._conflict_score(fact, now=now)
-            winner, loser = (
-                (fact, candidate)
-                if fact_score >= candidate_score
-                else (candidate, fact)
-            )
-            difference = abs(fact_score - candidate_score)
-            if difference >= 0.08:
-                reason = (
-                    "Conflito resolvido por confiança, evidências, importância "
-                    "efetiva e contexto temporal."
+        scope = (
+            self.database.atomic_write(force_commit=True)
+            if commit
+            else nullcontext()
+        )
+        with scope:
+            for candidate in candidates:
+                if not self.facts_conflict(candidate, fact):
+                    continue
+                candidate_score = self._conflict_score(candidate, now=now)
+                fact_score = self._conflict_score(fact, now=now)
+                winner, loser = (
+                    (fact, candidate)
+                    if fact_score >= candidate_score
+                    else (candidate, fact)
                 )
-                conflict_id = self.database.record_conflict(
-                    candidate.id,
-                    fact.id,
-                    status="resolved",
-                    winner_fact_id=winner.id,
-                    reason=reason,
-                    now=now,
-                )
-                self.database.set_fact_status(
-                    loser.id,
-                    "superseded",
-                    reason=f"Superado pelo fato #{winner.id}: {reason}",
-                    now=now,
-                )
-                self.database._upsert_graph_edge(
-                    f"fact:{winner.id}",
-                    f"fact:{loser.id}",
-                    "supersedes",
-                    fact_id=winner.id,
-                    weight=1.0,
-                    metadata={"conflict_id": conflict_id},
-                )
-                self.database.connection.commit()
-                resolutions.append(
-                    {
-                        "conflict_id": conflict_id,
-                        "status": "resolved",
-                        "winner_fact_id": winner.id,
-                        "loser_fact_id": loser.id,
-                    }
-                )
-            else:
-                reason = "Conflito mantido aberto: evidências insuficientes para desempatar."
-                conflict_id = self.database.record_conflict(
-                    candidate.id,
-                    fact.id,
-                    status="open",
-                    reason=reason,
-                    now=now,
-                )
-                self.database.set_fact_status(
-                    candidate.id,
-                    "conflicted",
-                    reason=reason,
-                    now=now,
-                )
-                self.database.set_fact_status(
-                    fact.id,
-                    "conflicted",
-                    reason=reason,
-                    now=now,
-                )
-                resolutions.append(
-                    {
-                        "conflict_id": conflict_id,
-                        "status": "open",
-                        "winner_fact_id": None,
-                    }
-                )
+                difference = abs(fact_score - candidate_score)
+                if difference >= 0.08:
+                    reason = (
+                        "Conflito resolvido por confiança, evidências, importância "
+                        "efetiva e contexto temporal."
+                    )
+                    conflict_id = self.database.record_conflict(
+                        candidate.id,
+                        fact.id,
+                        status="resolved",
+                        winner_fact_id=winner.id,
+                        reason=reason,
+                        now=now,
+                        commit=False,
+                    )
+                    self.database.set_fact_status(
+                        loser.id,
+                        "superseded",
+                        reason=f"Superado pelo fato #{winner.id}: {reason}",
+                        now=now,
+                        commit=False,
+                    )
+                    self.database._upsert_graph_edge(
+                        f"fact:{winner.id}",
+                        f"fact:{loser.id}",
+                        "supersedes",
+                        fact_id=winner.id,
+                        weight=1.0,
+                        metadata={"conflict_id": conflict_id},
+                    )
+                    resolutions.append(
+                        {
+                            "conflict_id": conflict_id,
+                            "status": "resolved",
+                            "winner_fact_id": winner.id,
+                            "loser_fact_id": loser.id,
+                        }
+                    )
+                else:
+                    reason = "Conflito mantido aberto: evidências insuficientes para desempatar."
+                    conflict_id = self.database.record_conflict(
+                        candidate.id,
+                        fact.id,
+                        status="open",
+                        reason=reason,
+                        now=now,
+                        commit=False,
+                    )
+                    self.database.set_fact_status(
+                        candidate.id,
+                        "conflicted",
+                        reason=reason,
+                        now=now,
+                        commit=False,
+                    )
+                    self.database.set_fact_status(
+                        fact.id,
+                        "conflicted",
+                        reason=reason,
+                        now=now,
+                        commit=False,
+                    )
+                    resolutions.append(
+                        {
+                            "conflict_id": conflict_id,
+                            "status": "open",
+                            "winner_fact_id": None,
+                        }
+                    )
         return {"fact_id": fact.id, "resolutions": resolutions} if resolutions else None
 
     # ------------------------------------------------------------------
@@ -1085,6 +1118,7 @@ class MemoryManager:
         item: Memory | MemoryFact,
         *,
         now: Optional[datetime | str] = None,
+        evidence_count: Optional[int] = None,
     ) -> float:
         """Calcula importance dinâmica sem destruir o valor-base persistido."""
 
@@ -1094,7 +1128,10 @@ class MemoryManager:
             timestamp = item.updated_at or item.created_at
             confidence = item.confidence
             accesses = item.access_count
-            evidence_count = len(item.evidence or self.database.get_fact_evidence(item.id))
+            if evidence_count is None:
+                evidence_count = len(
+                    item.evidence or self.database.get_fact_evidence(item.id)
+                )
             emotion_intensity = item.emotional_intensity
             status = item.status
         else:
@@ -1138,29 +1175,31 @@ class MemoryManager:
         """
 
         results: list[dict[str, Any]] = []
-        for memory in self.database.find_memories(include_archived=True):
-            for fact in memory.facts:
-                score = self.effective_importance(fact, now=now)
-                archived = False
-                if (
-                    archive_below is not None
-                    and fact.status == "active"
-                    and score < archive_below
-                ):
-                    archived = self.database.set_fact_status(
-                        fact.id,
-                        "archived",
-                        reason=f"Arquivado por decay abaixo de {archive_below}.",
-                        now=now,
+        with self.database.atomic_write(force_commit=archive_below is not None):
+            for memory in self.database.find_memories(include_archived=True):
+                for fact in memory.facts:
+                    score = self.effective_importance(fact, now=now)
+                    archived = False
+                    if (
+                        archive_below is not None
+                        and fact.status == "active"
+                        and score < archive_below
+                    ):
+                        archived = self.database.set_fact_status(
+                            fact.id,
+                            "archived",
+                            reason=f"Arquivado por decay abaixo de {archive_below}.",
+                            now=now,
+                            commit=False,
+                        )
+                    results.append(
+                        {
+                            "memory_id": memory.id,
+                            "fact_id": fact.id,
+                            "effective_importance": score,
+                            "archived": archived,
+                        }
                     )
-                results.append(
-                    {
-                        "memory_id": memory.id,
-                        "fact_id": fact.id,
-                        "effective_importance": score,
-                        "archived": archived,
-                    }
-                )
         return results
 
     def recall_relevant(
@@ -1191,54 +1230,57 @@ class MemoryManager:
         query_tokens = set(query_text.split())
 
         ranked: list[dict[str, Any]] = []
-        for memory in self.database.find_memories(include_archived=True):
-            if memory.status == "archived" and not include_inactive:
-                continue
-            for fact in memory.facts:
-                if not include_inactive and fact.status not in {"active", "conflicted"}:
-                    continue
-                target = self.normalize_fact_target(fact.target)
-                target_tokens = set(target.split())
-                reasons: list[str] = []
-                score = 0.0
-                if target in query_targets:
-                    score += 0.48
-                    reasons.append("alvo exato")
-                elif target and target in query_text:
-                    score += 0.38
-                    reasons.append("alvo mencionado")
-                elif query_tokens and target_tokens:
-                    overlap = len(query_tokens & target_tokens) / len(target_tokens)
-                    if overlap:
-                        score += 0.28 * overlap
-                        reasons.append("sobreposição lexical")
-                if (fact.relation or "").casefold() in query_relations:
-                    score += 0.10
-                    reasons.append("relação compatível")
-                if query_text and query_text in memory.content.casefold():
-                    score += 0.08
-                    reasons.append("texto da memória")
-                temporal_kind = self._temporal_kind(fact.temporal_context)
-                if temporal_kind == "current":
-                    score += 0.05
-                    reasons.append("contexto atual")
-                elif temporal_kind == "past":
-                    score += 0.01
-                effective = self.effective_importance(fact, now=now)
-                score += effective * 0.35
-                reasons.append("importância dinâmica")
-                if fact.status == "conflicted":
-                    score -= 0.12
-                    reasons.append("penalidade de conflito aberto")
-                ranked.append(
-                    {
-                        "memory": memory,
-                        "fact": fact,
-                        "score": round(max(0.0, score), 6),
-                        "effective_importance": effective,
-                        "reasons": reasons,
-                    }
-                )
+        candidates = self.database.find_recall_candidates(
+            include_inactive=include_inactive
+        )
+        for candidate in candidates:
+            fact = candidate["fact"]
+            target = self.normalize_fact_target(fact.target)
+            target_tokens = set(target.split())
+            reasons: list[str] = []
+            score = 0.0
+            if target in query_targets:
+                score += 0.48
+                reasons.append("alvo exato")
+            elif target and target in query_text:
+                score += 0.38
+                reasons.append("alvo mencionado")
+            elif query_tokens and target_tokens:
+                overlap = len(query_tokens & target_tokens) / len(target_tokens)
+                if overlap:
+                    score += 0.28 * overlap
+                    reasons.append("sobreposição lexical")
+            if (fact.relation or "").casefold() in query_relations:
+                score += 0.10
+                reasons.append("relação compatível")
+            if query_text and query_text in candidate["memory_content"].casefold():
+                score += 0.08
+                reasons.append("texto da memória")
+            temporal_kind = self._temporal_kind(fact.temporal_context)
+            if temporal_kind == "current":
+                score += 0.05
+                reasons.append("contexto atual")
+            elif temporal_kind == "past":
+                score += 0.01
+            effective = self.effective_importance(
+                fact,
+                now=now,
+                evidence_count=candidate["evidence_count"],
+            )
+            score += effective * 0.35
+            reasons.append("importância dinâmica")
+            if fact.status == "conflicted":
+                score -= 0.12
+                reasons.append("penalidade de conflito aberto")
+            ranked.append(
+                {
+                    "memory_id": candidate["memory_id"],
+                    "fact": fact,
+                    "score": round(max(0.0, score), 6),
+                    "effective_importance": effective,
+                    "reasons": reasons,
+                }
+            )
 
         ranked.sort(
             key=lambda item: (
@@ -1249,6 +1291,27 @@ class MemoryManager:
             reverse=False,
         )
         selected = ranked[: max(0, limit)]
+        hydrated_memories: dict[int, Optional[Memory]] = {}
+        hydrated = []
+        for item in selected:
+            memory_id = item["memory_id"]
+            if memory_id not in hydrated_memories:
+                hydrated_memories[memory_id] = self.database.get_memory(memory_id)
+            memory = hydrated_memories[memory_id]
+            if memory is None:
+                continue
+            fact_id = item["fact"].id
+            full_fact = next(
+                (fact for fact in memory.facts if fact.id == fact_id),
+                None,
+            )
+            if full_fact is None:
+                continue
+            item["memory"] = memory
+            item["fact"] = full_fact
+            del item["memory_id"]
+            hydrated.append(item)
+        selected = hydrated
         # Uma leitura reforça acesso, mas não altera updated_at nem a semântica.
         for memory_id in {item["memory"].id for item in selected}:
             self.database.touch_memory(memory_id, now=now)

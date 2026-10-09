@@ -4,6 +4,7 @@ Usa um FakeLLMProvider — nenhum teste depende de modelo real gigante.
 """
 
 import os
+import logging
 import tempfile
 
 import pytest
@@ -224,12 +225,74 @@ class TestCognitiveCoreFlow:
         cognitive.generate_response("voce lembra de pizza?")
         assert "pizza" in provider.calls[0].prompt
 
+    def test_exact_target_sql_limit_matches_ordered_prefix(self, core):
+        cognitive, manager, _ = core
+        from memory.memory import Memory
+        from memory.memory_fact import MemoryFact
+
+        for index in range(12):
+            manager.database.save_memory(
+                Memory(
+                    content=f"fictitious pizza fact {index}",
+                    memory_type="preference",
+                    importance=0.7,
+                    emotion="neutral",
+                    emotional_intensity=0.0,
+                    facts=[MemoryFact(target="pizza", relation="like")],
+                ),
+                allow_duplicate_content=True,
+            )
+
+        database = manager.database
+        all_facts = database.find_facts_by_target(
+            "pizza",
+            include_inactive=False,
+        )
+        limited = database.find_facts_by_target(
+            "pizza",
+            include_inactive=False,
+            limit=4,
+        )
+        assert [fact.id for fact in limited] == [fact.id for fact in all_facts[:4]]
+
+        cognitive.config.max_memories_in_prompt = 3
+        original = database.find_facts_by_target
+        requested_limits = []
+
+        def capture_limit(*args, **kwargs):
+            requested_limits.append(kwargs.get("limit"))
+            return original(*args, **kwargs)
+
+        database.find_facts_by_target = capture_limit
+        facts = cognitive.retrieve_relevant_memories("pizza", memory_manager=manager)
+
+        assert requested_limits == [3]
+        assert len(facts) == 1
+        assert facts[0].target == "pizza"
+
     def test_intent_forwarded(self, core):
         cognitive, _, _ = core
         outcome = cognitive.generate_response(
             "o que voce acha da vida?", intent=Intent.OPINION
         )
         assert outcome["intent"] == "opinion"
+
+    def test_user_text_and_raw_response_are_not_logged(self, caplog):
+        user_sentinel = "PRIVATE_USER_SENTINEL"
+        response_sentinel = "PRIVATE_RESPONSE_SENTINEL"
+        config = DaviosConfig()
+        cognitive = CognitiveCore(
+            llm_provider=FakeLLMProvider(response_sentinel),
+            config=config,
+            prompt_builder=PromptBuilder(config),
+        )
+        caplog.set_level(logging.INFO, logger="davios.cognitive")
+
+        result = cognitive.generate_response(user_sentinel)
+
+        assert result["text"] == response_sentinel
+        assert user_sentinel not in caplog.text
+        assert response_sentinel not in caplog.text
 
 
 class TestProviderUnavailable:
@@ -332,6 +395,22 @@ class TestConversationEngineWithLLM:
         provider._available = False
         result = engine_obj.process("o que e programacao?")
         assert result.response == "Nao tenho essa informacao ainda."
+
+    def test_exception_message_is_not_logged(self, engine, caplog):
+        engine_obj, _, provider = engine
+        sentinel = "PRIVATE_EXCEPTION_SENTINEL"
+
+        def fail_generation(request):
+            raise RuntimeError(sentinel)
+
+        provider.generate = fail_generation
+        caplog.set_level(logging.WARNING, logger="davios.conversation")
+
+        result = engine_obj.process("o que e programacao?")
+
+        assert result.memory_action == "llm_error"
+        assert sentinel not in caplog.text
+        assert "RuntimeError" in caplog.text
 
 
 class TestOfflineMode:

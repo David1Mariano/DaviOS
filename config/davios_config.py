@@ -11,6 +11,40 @@ CONFIG_DIR = Path(__file__).resolve().parent
 
 
 @dataclass
+class VoiceConfig:
+    """Configuração do sistema de voz/TTS."""
+    
+    # Controle geral
+    enabled: bool = True
+    primary_provider: str = "piper"      # "piper" | "sapi5"
+    fallback_provider: str = "sapi5"     # "sapi5" | "none"
+    
+    # Piper
+    piper_executable: str = "piper"
+    piper_model_path: str = "models/voice/piper/pt_BR-faber-medium.onnx"
+    piper_config_path: str = "models/voice/piper/pt_BR-faber-medium.onnx.json"
+    piper_data_dir: str = ""
+    piper_speaker_id: int = 0
+    piper_length_scale: float = 1.0
+    piper_noise_scale: float = 0.667
+    piper_noise_w: float = 0.8
+    
+    # SAPI5
+    sapi5_voice_name: str = ""  # vazio = auto-detect PT-BR
+    sapi5_rate: int = 0         # -10 a 10
+    sapi5_volume: int = 100     # 0 a 100
+    
+    # Timeouts
+    synthesis_timeout_seconds: float = 10.0
+    playback_timeout_seconds: float = 30.0
+    
+    # Comportamento
+    block_on_playback: bool = False  # se True, aguarda áudio terminar antes de continuar
+    skip_empty_text: bool = True
+    log_synthesis_errors: bool = True
+
+
+@dataclass
 class DaviosConfig:
     """Configuração carregada de config/davios.json com defaults seguros."""
 
@@ -48,6 +82,8 @@ class DaviosConfig:
     use_gpu: bool = False
     max_recent_messages: int = 6
     max_memories_in_prompt: int = 5
+    # Voice/TTS
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
     # system_prompt usado quando tools_visible_to_llm=False (padrao). Contem
     # a frase que nega categoricamente a capacidade de executar comandos,
     # abrir programas ou acessar arquivos — so e contraditoria se tools_visible_to_llm=True.
@@ -79,7 +115,17 @@ class DaviosConfig:
                 data = json.loads(config_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 data = {}
-        known = {f for f in cls.__dataclass_fields__}
+        
+        # Converte campos de dataclass aninhados (ex: voice)
+        fields = cls.__dataclass_fields__
+        for field_name, field_def in fields.items():
+            if field_name in data and hasattr(field_def.type, '__dataclass_fields__'):
+                # É um dataclass aninhado
+                nested_cls = field_def.type
+                if isinstance(data[field_name], dict):
+                    data[field_name] = nested_cls(**data[field_name])
+        
+        known = {f for f in fields}
         filtered = {k: v for k, v in data.items() if k in known}
         config = cls(**filtered)
         config.apply_env_overrides()

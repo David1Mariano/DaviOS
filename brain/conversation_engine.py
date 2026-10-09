@@ -726,11 +726,13 @@ class ConversationEngine:
                     memories_used=outcome.get("memories_used", []),
                     context=self.context.to_dict(),
                 )
-            except Exception:
+            except Exception as exc:
                 import logging
 
                 logging.getLogger("davios.conversation").warning(
-                    "[LLM] falha ao responder pergunta; usando regras", exc_info=True
+                    "[LLM] falha ao responder pergunta; usando regras "
+                    "error_type=%s",
+                    type(exc).__name__,
                 )
         response, memories_used = self.response_generator.answer_question(
             text, self.memory_manager, self.context
@@ -765,7 +767,8 @@ class ConversationEngine:
                 import logging
 
                 logging.getLogger("davios.conversation").warning(
-                    "[LLM] falha ao gerar resposta: %s", exc
+                    "[LLM] falha ao gerar resposta error_type=%s",
+                    type(exc).__name__,
                 )
                 response = (
                     "Tive um problema ao consultar meu modelo local agora. "
@@ -903,11 +906,13 @@ class ConversationEngine:
                     memories_used=outcome.get("memories_used", []),
                     context=self.context.to_dict(),
                 )
-            except Exception:
+            except Exception as exc:
                 import logging
 
                 logging.getLogger("davios.conversation").warning(
-                    "[LLM] falha apos salvar memoria; usando regras", exc_info=True
+                    "[LLM] falha apos salvar memoria; usando regras "
+                    "error_type=%s",
+                    type(exc).__name__,
                 )
 
         response = self.response_generator.generate_from_memory_result(

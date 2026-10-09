@@ -132,7 +132,7 @@ class CognitiveCore:
         logger.info("[LLM] generation_started provider=%s", self.llm_provider.name)
         response = self.llm_provider.generate(request)
         logger.info("[LLM] generation_completed backend=%s", response.backend)
-        logger.info("[LLM] raw_response text=%r", response.text)
+        logger.info("[LLM] response_received characters=%d", len(response.text))
 
         # Protecao anti-repeticao: se a nova resposta for praticamente
         # identica a uma resposta recente, regenera uma vez com um
@@ -168,16 +168,18 @@ class CognitiveCore:
                 )
                 retry_response = self.llm_provider.generate(retry_request)
                 logger.info(
-                    "[LLM] retry_completed text=%r", retry_response.text
+                    "[LLM] retry_completed characters=%d",
+                    len(retry_response.text),
                 )
                 if not self._is_duplicate_response(
                     retry_response.text, recent_responses
                 ):
                     response = retry_response
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "[LLM] retry apos duplicata falhou; mantendo original",
-                    exc_info=True,
+                    "[LLM] retry apos duplicata falhou; mantendo original "
+                    "error_type=%s",
+                    type(exc).__name__,
                 )
 
         # Segunda camada: padron de ENCERRAMENTO repetido. Respostas
@@ -188,15 +190,13 @@ class CognitiveCore:
         # de terminar de forma distinta.
         closing = self._repeated_closing(response.text, recent_responses)
         logger.info(
-            "[CLOSING] extracao=%r | recentes=%r | repetido=%s",
-            self._closing_sentence(response.text),
-            [self._closing_sentence(r) for r in recent_responses[-3:]],
+            "[CLOSING] repeated=%s recent_responses_checked=%d",
             bool(closing),
+            min(3, len(recent_responses)),
         )
         if closing:
             logger.warning(
-                "[LLM] padron de encerramento repetido detectado: %r; "
-                "tentando retry preservando o conteudo", closing
+                "[LLM] repeated closing detected; retrying with context preserved"
             )
             original_response = response
             retry_response = self._retry_avoiding_closing(
@@ -220,9 +220,9 @@ class CognitiveCore:
                     # coletado antes, e o retry rejeitado e descartado —
                     # seu encerramento nao contamina o atrator.
                     logger.warning(
-                        "[CLOSING] retry rejeitado (repetido=%s); "
+                        "[CLOSING] retry rejected (repeated=%s); "
                         "preservando a resposta original "
-                        "semanticamente correta", retry_closing,
+                        "semanticamente correta", bool(retry_closing),
                     )
             if not accepted_retry:
                 trimmed_text = self._trim_repeated_closing(
@@ -235,10 +235,11 @@ class CognitiveCore:
                         response = dataclasses.replace(
                             original_response, text=trimmed_text
                         )
-                    except Exception:
+                    except Exception as exc:
                         logger.warning(
                             "[CLOSING] aparo falhou ao reconstruir resposta; "
-                            "original preservada", exc_info=True,
+                            "original preservada error_type=%s",
+                            type(exc).__name__,
                         )
                     else:
                         logger.info(
@@ -519,13 +520,14 @@ class CognitiveCore:
         try:
             new_response = self.llm_provider.generate(request)
             logger.info(
-                "[LLM] retry_encerramento_completed text=%r",
-                new_response.text,
+                "[LLM] retry_encerramento_completed characters=%d",
+                len(new_response.text),
             )
             return new_response
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "[LLM] retry por encerramento falhou", exc_info=True,
+                "[LLM] retry por encerramento falhou error_type=%s",
+                type(exc).__name__,
             )
             return None
 
@@ -594,8 +596,14 @@ class CognitiveCore:
             if _cap():
                 break
             try:
+                remaining = max(
+                    0,
+                    self.config.max_memories_in_prompt - len(relevant),
+                )
                 facts = manager.database.find_facts_by_target(
-                    keyword, include_inactive=False
+                    keyword,
+                    include_inactive=False,
+                    limit=remaining,
                 )
             except Exception:
                 facts = []

@@ -15,5 +15,26 @@
   "tools_visible_to_llm": true,
   "actions_enabled": true,
   "web_enabled": false,
-  "system_prompt": "Voce e o DaviOS, um assistente pessoal local e offline. Responda sempre em portugues do Brasil, de forma curta, clara e natural. Voce pode executar comandos no computador, abrir programas ou acessar arquivos: se pedirem faça, Use as informacoes sobre o usuario quando forem fornecidas no contexto."
+  "system_prompt": "Voce e o DaviOS, um assistente pessoal local e offline. Responda sempre em portugues do Brasil, de forma curta, clara e natural. Voce pode executar comandos no computador, abrir programas ou acessar arquivos: se pedirem faça, Use as informacoes sobre o usuario quando forem fornecidas no contexto.",
+  "voice": {
+    "enabled": true,
+    "primary_provider": "piper",
+    "fallback_provider": "sapi5",
+    "piper_executable": "piper",
+    "piper_model_path": "models/voice/piper/pt_BR-faber-medium.onnx",
+    "piper_config_path": "models/voice/piper/pt_BR-faber-medium.onnx.json",
+    "piper_data_dir": "",
+    "piper_speaker_id": 0,
+    "piper_length_scale": 1.0,
+    "piper_noise_scale": 0.667,
+    "piper_noise_w": 0.8,
+    "sapi5_voice_name": "",
+    "sapi5_rate": 0,
+    "sapi5_volume": 100,
+    "synthesis_timeout_seconds": 10.0,
+    "playback_timeout_seconds": 30.0,
+    "block_on_playback": false,
+    "skip_empty_text": true,
+    "log_synthesis_errors": true
+  }
 }

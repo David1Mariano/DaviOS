@@ -8,12 +8,50 @@ independentes sobre a mesma entidade sem apagar evidências ou contexto.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Callable, Iterable, Optional
 
 from memory.memory import Memory
 from memory.memory_fact import MemoryFact
+
+_MEMORY_STATUSES = frozenset({"active", "archived", "inactive"})
+_FACT_STATUSES = frozenset(
+    {
+        "active",
+        "archived",
+        "conflicted",
+        "deleted",
+        "inactive",
+        "legacy",
+        "retracted",
+        "superseded",
+    }
+)
+_CONFLICT_STATUSES = frozenset({"open", "resolved"})
+
+
+class _RollbackWrite(Exception):
+    def __init__(self, result: Any):
+        self.result = result
+
+
+def _atomic_write(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        self._ensure_writable()
+        if not kwargs.get("commit", True):
+            return method(self, *args, **kwargs)
+        try:
+            with self.atomic_write():
+                return method(self, *args, **kwargs)
+        except _RollbackWrite as abort:
+            return abort.result
+
+    return wrapped
 
 
 class Database:
@@ -26,11 +64,102 @@ class Database:
     ):
         self.db_path = db_path
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+        self._transaction_counter = 0
+        self._transaction_stack: list[tuple[bool, Optional[str]]] = []
+        self._transaction_unusable = False
         self.connection = sqlite3.connect(db_path)
         self.connection.row_factory = sqlite3.Row
         self.cursor = self.connection.cursor()
         self.cursor.execute("PRAGMA foreign_keys = ON")
         self.initialize()
+
+    def _ensure_writable(self) -> None:
+        if self._transaction_unusable:
+            raise RuntimeError(
+                "SQLite transaction state is uncertain; this connection cannot write"
+            )
+
+    def _rollback_write_scope(
+        self,
+        owns_transaction: bool,
+        savepoint: Optional[str],
+    ) -> None:
+        if owns_transaction:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+            if self.connection.in_transaction:
+                raise RuntimeError("SQLite rollback left a transaction active")
+            return
+
+        if savepoint is None:
+            raise RuntimeError("SQLite savepoint state is unavailable")
+        self.cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        self.cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if not self.connection.in_transaction:
+            raise RuntimeError("SQLite outer transaction ended unexpectedly")
+
+    @contextmanager
+    def atomic_write(self, *, force_commit: bool = False):
+        """Own an outer transaction or isolate this write with a savepoint.
+
+        ``force_commit`` remains accepted for compatibility. Only a transaction
+        started by this outer scope is committed; an existing caller-owned
+        transaction is never committed here.
+        """
+        self._ensure_writable()
+        has_managed_parent = bool(self._transaction_stack)
+        has_database_transaction = self.connection.in_transaction
+        if has_managed_parent and not has_database_transaction:
+            self._transaction_unusable = True
+            raise RuntimeError("Managed SQLite transaction disappeared unexpectedly")
+
+        owns_transaction = not has_database_transaction
+        savepoint = None
+        if owns_transaction:
+            self.cursor.execute("BEGIN")
+        else:
+            self._transaction_counter += 1
+            savepoint = f"davios_write_{self._transaction_counter}"
+            self.cursor.execute(f"SAVEPOINT {savepoint}")
+        self._transaction_stack.append((owns_transaction, savepoint))
+
+        try:
+            yield
+        except BaseException:
+            try:
+                self._rollback_write_scope(owns_transaction, savepoint)
+            except BaseException as rollback_error:
+                self._transaction_unusable = True
+                raise RuntimeError(
+                    "SQLite rollback failed; this connection is unusable"
+                ) from rollback_error
+            raise
+        else:
+            try:
+                if owns_transaction:
+                    self.connection.commit()
+                    if self.connection.in_transaction:
+                        raise RuntimeError("SQLite commit left a transaction active")
+                else:
+                    self.cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    if not self.connection.in_transaction:
+                        raise RuntimeError("SQLite outer transaction ended unexpectedly")
+            except BaseException as finalization_error:
+                if owns_transaction and not self.connection.in_transaction:
+                    self._transaction_unusable = True
+                    raise RuntimeError(
+                        "SQLite commit failed with an uncertain outcome; this connection is unusable"
+                    ) from finalization_error
+                try:
+                    self._rollback_write_scope(owns_transaction, savepoint)
+                except BaseException as rollback_error:
+                    self._transaction_unusable = True
+                    raise RuntimeError(
+                        "SQLite finalization and rollback failed; this connection is unusable"
+                    ) from rollback_error
+                raise
+        finally:
+            self._transaction_stack.pop()
 
     # ------------------------------------------------------------------
     # Schema and migration
@@ -120,6 +249,7 @@ class Database:
             """
         )
 
+    @_atomic_write
     def save_style_profile(self, profile_json: str, now: Optional[datetime | str] = None) -> None:
         """Persiste o perfil de estilo (single-row upsert)."""
         timestamp = self._now(now)
@@ -133,7 +263,6 @@ class Database:
             """,
             (profile_json, timestamp),
         )
-        self.connection.commit()
 
     def load_style_profile(self) -> Optional[str]:
         """Carrega o JSON do perfil de estilo persistido (ou None)."""
@@ -456,7 +585,148 @@ class Database:
 
     @staticmethod
     def _dump(value: Any, fallback: str) -> str:
-        return json.dumps(value if value is not None else json.loads(fallback), ensure_ascii=False)
+        return json.dumps(
+            value if value is not None else json.loads(fallback),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    def _sqlite_length_limit(self) -> Optional[int]:
+        getlimit = getattr(self.connection, "getlimit", None)
+        limit_id = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
+        if getlimit is None or limit_id is None:
+            return None
+        return getlimit(limit_id)
+
+    def _validate_text(
+        self,
+        value: Any,
+        field: str,
+        *,
+        allow_none: bool = False,
+        allow_blank: bool = False,
+    ) -> None:
+        if value is None and allow_none:
+            return
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be text")
+        if not allow_blank and not value.strip():
+            raise ValueError(f"{field} must not be empty")
+        limit = self._sqlite_length_limit()
+        if limit is not None and len(value.encode("utf-8")) > limit:
+            raise ValueError(f"{field} exceeds the configured SQLite length limit")
+
+    @staticmethod
+    def _validate_score(value: Any, field: str) -> None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{field} must be numeric") from None
+        if not math.isfinite(numeric):
+            raise ValueError(f"{field} must be finite")
+
+    def _validate_metadata(self, value: Any, field: str) -> None:
+        if value is None:
+            return
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        try:
+            serialized = self._dump(value, "{}")
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{field} must be JSON serializable") from None
+        self._validate_text(serialized, field)
+
+    def _validate_fact(self, fact: MemoryFact, index: int) -> None:
+        if not isinstance(fact, MemoryFact):
+            raise ValueError(f"facts[{index}] must be a MemoryFact")
+        self._validate_text(fact.target, f"facts[{index}].target")
+        self._validate_text(fact.relation, f"facts[{index}].relation")
+        for field, value in (
+            ("emotion", fact.emotion),
+            ("temporal_context", fact.temporal_context),
+            ("subject", fact.subject),
+            ("status", fact.status),
+            ("source", fact.source),
+        ):
+            self._validate_text(
+                value,
+                f"facts[{index}].{field}",
+                allow_none=True,
+                allow_blank=True,
+            )
+        self._validate_text(
+            fact.value,
+            f"facts[{index}].value",
+            allow_none=True,
+            allow_blank=True,
+        )
+        self._validate_text(
+            fact.fact_type,
+            f"facts[{index}].fact_type",
+            allow_none=True,
+            allow_blank=True,
+        )
+        for field, value in (
+            ("emotional_intensity", fact.emotional_intensity),
+            ("confidence", fact.confidence),
+            ("importance", fact.importance),
+        ):
+            self._validate_score(value, f"facts[{index}].{field}")
+        self._validate_metadata(fact.metadata, f"facts[{index}].metadata")
+        if fact.status not in (None, "") and fact.status not in _FACT_STATUSES:
+            raise ValueError(f"facts[{index}].status is not supported")
+
+    def validate_memory(
+        self,
+        memory: Memory,
+        evidence: Optional[Iterable[dict[str, Any] | str]] = None,
+    ) -> list[dict[str, Any] | str]:
+        if not isinstance(memory, Memory):
+            raise ValueError("memory must be a Memory")
+        self._validate_text(memory.content, "memory.content")
+        self._validate_text(memory.memory_type, "memory.memory_type")
+        self._validate_text(memory.emotion, "memory.emotion")
+        self._validate_text(memory.status, "memory.status")
+        if memory.status not in _MEMORY_STATUSES:
+            raise ValueError("memory.status is not supported")
+        if memory.status not in _MEMORY_STATUSES:
+            raise ValueError("memory.status is not supported")
+        for field, value in (
+            ("importance", memory.importance),
+            ("base_importance", memory.base_importance),
+            ("confidence", memory.confidence),
+            ("emotional_intensity", memory.emotional_intensity),
+        ):
+            self._validate_score(value, f"memory.{field}")
+        if isinstance(memory.access_count, bool) or not isinstance(memory.access_count, int) or memory.access_count < 0:
+            raise ValueError("memory.access_count must be a non-negative integer")
+        self._validate_text(
+            memory.last_accessed_at,
+            "memory.last_accessed_at",
+            allow_none=True,
+            allow_blank=True,
+        )
+        self._validate_metadata(memory.metadata, "memory.metadata")
+        if not isinstance(memory.facts, (list, tuple)):
+            raise ValueError("memory.facts must be a list")
+        for index, fact in enumerate(memory.facts):
+            self._validate_fact(fact, index)
+
+        if evidence is None:
+            evidence_items: list[dict[str, Any] | str] = []
+        elif isinstance(evidence, (str, dict)):
+            evidence_items = [evidence]
+        else:
+            evidence_items = list(evidence)
+        for index, item in enumerate(evidence_items):
+            self._validate_evidence(item, f"evidence[{index}]")
+        for fact_index, fact in enumerate(memory.facts):
+            for evidence_index, item in enumerate(fact.evidence or []):
+                self._validate_evidence(
+                    item,
+                    f"facts[{fact_index}].evidence[{evidence_index}]",
+                )
+        return evidence_items
 
     @staticmethod
     def _load(value: Optional[str], fallback: Any) -> Any:
@@ -526,6 +796,7 @@ class Database:
     # Memory CRUD
     # ------------------------------------------------------------------
 
+    @_atomic_write
     def save_memory(
         self,
         memory: Memory,
@@ -533,6 +804,7 @@ class Database:
         evidence: Optional[Iterable[dict[str, Any] | str]] = None,
         now: Optional[datetime | str] = None,
         allow_duplicate_content: bool = False,
+        commit: bool = True,
     ) -> Optional[int]:
         """Persiste uma memória e seus fatos.
 
@@ -540,6 +812,8 @@ class Database:
         como padrão. Chamadores que representam episódios repetidos podem optar
         por ``allow_duplicate_content=True``.
         """
+
+        evidence_items = self.validate_memory(memory, evidence)
 
         if not allow_duplicate_content and self.find_memory(memory) is not None:
             return None
@@ -576,7 +850,7 @@ class Database:
 
         for fact in memory.facts:
             fact.fact_type = fact.fact_type or memory.memory_type
-            fact_evidence = fact.evidence or evidence
+            fact_evidence = fact.evidence or evidence_items
             self.add_memory_fact(
                 memory_id=memory_id,
                 target=fact.target,
@@ -598,8 +872,6 @@ class Database:
                 commit=False,
                 fact_object=fact,
             )
-
-        self.connection.commit()
         return memory_id
 
     def get_memory(self, memory_id: int) -> Optional[Memory]:
@@ -609,6 +881,32 @@ class Database:
         if row is None:
             return None
         return self._memory_from_row(row, facts=self.get_memory_facts(memory_id))
+
+    def find_recall_candidates(
+        self,
+        *,
+        include_inactive: bool = False,
+    ) -> Iterable[dict[str, Any]]:
+        sql = """
+            SELECT f.*, m.content AS recall_memory_content,
+                   (SELECT COUNT(*) FROM fact_evidence e WHERE e.fact_id = f.id)
+                       AS recall_evidence_count
+            FROM memory_facts f
+            INNER JOIN memories m ON m.id = f.memory_id
+        """
+        if not include_inactive:
+            sql += """
+                WHERE (m.status IS NULL OR m.status != 'archived')
+                  AND COALESCE(f.status, 'active') IN ('active', 'conflicted')
+            """
+        sql += " ORDER BY f.created_at ASC, f.id ASC"
+        for row in self.cursor.execute(sql):
+            yield {
+                "fact": self._fact_from_row(row, include_evidence=False),
+                "memory_id": row["memory_id"],
+                "memory_content": row["recall_memory_content"],
+                "evidence_count": row["recall_evidence_count"],
+            }
 
     def find_memory(self, memory: Memory | str) -> Optional[Memory]:
         content = memory.content if isinstance(memory, Memory) else str(memory)
@@ -634,20 +932,23 @@ class Database:
     def get_memories(self) -> list[Memory]:
         return self.find_memories()
 
+    @_atomic_write
     def update_memory_content(
         self,
         memory_id: int,
         content: str,
         *,
         now: Optional[datetime | str] = None,
+        commit: bool = True,
     ) -> bool:
+        self._validate_text(content, "memory.content")
         self.cursor.execute(
             "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
             (content, self._now(now), memory_id),
         )
-        self.connection.commit()
         return self.cursor.rowcount > 0
 
+    @_atomic_write
     def touch_memory(
         self,
         memory_id: int,
@@ -664,14 +965,13 @@ class Database:
             """,
             (timestamp, memory_id),
         )
-        if commit:
-            self.connection.commit()
         return self.cursor.rowcount > 0
 
     # ------------------------------------------------------------------
     # Atomic facts, evidence and immutable revisions
     # ------------------------------------------------------------------
 
+    @_atomic_write
     def add_memory_fact(
         self,
         memory_id: int,
@@ -696,6 +996,43 @@ class Database:
         fact_object: Optional[MemoryFact] = None,
     ) -> int:
         """Adiciona uma afirmação sem fundi-la a fatos do mesmo alvo."""
+
+        if evidence is None:
+            evidence_items: list[dict[str, Any] | str] = []
+        elif isinstance(evidence, (str, dict)):
+            evidence_items = [evidence]
+        else:
+            evidence_items = list(evidence)
+        self._validate_text(target, "fact.target")
+        self._validate_text(relation, "fact.relation")
+        for field, text_value in (
+            ("emotion", emotion),
+            ("temporal_context", temporal_context),
+            ("subject", subject),
+            ("status", status),
+            ("source", source),
+        ):
+            self._validate_text(
+                text_value,
+                f"fact.{field}",
+                allow_none=True,
+                allow_blank=True,
+            )
+        if status not in (None, "") and status not in _FACT_STATUSES:
+            raise ValueError("fact.status is not supported")
+        self._validate_text(value, "fact.value", allow_none=True, allow_blank=True)
+        self._validate_text(fact_type, "fact.fact_type", allow_none=True, allow_blank=True)
+        for field, score in (
+            ("emotional_intensity", emotional_intensity),
+            ("confidence", confidence),
+            ("importance", importance),
+        ):
+            self._validate_score(score, f"fact.{field}")
+        self._validate_metadata(metadata, "fact.metadata")
+        for index, item in enumerate(evidence_items):
+            self._validate_evidence(item, f"evidence[{index}]")
+        if fact_object is not None:
+            self._validate_fact(fact_object, 0)
 
         timestamp = self._now(now)
         self.cursor.execute(
@@ -752,7 +1089,7 @@ class Database:
         fact.updated_at = timestamp
         fact.evidence = []
 
-        for item in evidence or []:
+        for item in evidence_items:
             self._add_fact_evidence(
                 fact_id,
                 item,
@@ -764,8 +1101,6 @@ class Database:
         self._write_fact_revision(fact, revision_type="created", recorded_at=timestamp)
         self._sync_graph_for_fact(fact, timestamp)
         self.touch_memory(memory_id, now=timestamp, commit=False)
-        if commit:
-            self.connection.commit()
         return fact_id
 
     def get_memory_facts(
@@ -794,14 +1129,19 @@ class Database:
         target: str,
         *,
         include_inactive: bool = True,
+        limit: Optional[int] = None,
     ) -> list[MemoryFact]:
         sql = "SELECT * FROM memory_facts WHERE LOWER(target) = LOWER(?)"
+        params: list[Any] = [target]
         if not include_inactive:
             sql += " AND status = 'active'"
         sql += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
         return [
             self._fact_from_row(row)
-            for row in self.cursor.execute(sql, (target,)).fetchall()
+            for row in self.cursor.execute(sql, params).fetchall()
         ]
 
     def find_memories_by_target(
@@ -849,6 +1189,7 @@ class Database:
             return None
         return self.get_memory(facts[0].memory_id)
 
+    @_atomic_write
     def update_memory_fact(
         self,
         memory_id: int,
@@ -871,6 +1212,7 @@ class Database:
         reason: Optional[str] = None,
         revision_type: str = "updated",
         now: Optional[datetime | str] = None,
+        commit: bool = True,
     ) -> bool:
         """Atualiza um fato específico e registra uma revisão completa.
 
@@ -932,6 +1274,38 @@ class Database:
                 "{}",
             ),
         }
+        self._validate_text(next_values["target"], "fact.target")
+        self._validate_text(next_values["relation"], "fact.relation")
+        for field in (
+            "emotion",
+            "temporal_context",
+            "subject",
+            "status",
+            "source",
+        ):
+            self._validate_text(
+                next_values[field],
+                f"fact.{field}",
+                allow_blank=True,
+            )
+        self._validate_text(
+            next_values["value"], "fact.value", allow_none=True, allow_blank=True
+        )
+        self._validate_text(
+            next_values["fact_type"],
+            "fact.fact_type",
+            allow_none=True,
+            allow_blank=True,
+        )
+        self._validate_score(next_values["emotional_intensity"], "fact.emotional_intensity")
+        self._validate_score(next_values["confidence"], "fact.confidence")
+        self._validate_score(next_values["importance"], "fact.importance")
+        self._validate_metadata(
+            metadata if metadata is not None else previous.metadata,
+            "fact.metadata",
+        )
+        if next_values["status"] not in _FACT_STATUSES:
+            raise ValueError("fact.status is not supported")
         self.cursor.execute(
             """
             UPDATE memory_facts
@@ -962,7 +1336,8 @@ class Database:
         )
         fact = self.get_fact(fact_id)
         if fact is None:
-            self.connection.rollback()
+            if commit:
+                raise _RollbackWrite(False)
             return False
         self._write_fact_revision(
             fact,
@@ -972,7 +1347,6 @@ class Database:
         )
         self._sync_graph_for_fact(fact, timestamp)
         self.touch_memory(memory_id, now=timestamp, commit=False)
-        self.connection.commit()
         return True
 
     def set_fact_status(
@@ -982,6 +1356,7 @@ class Database:
         *,
         reason: Optional[str] = None,
         now: Optional[datetime | str] = None,
+        commit: bool = True,
     ) -> bool:
         fact = self.get_fact(fact_id)
         if fact is None:
@@ -993,6 +1368,7 @@ class Database:
             reason=reason,
             revision_type="status_changed",
             now=now,
+            commit=commit,
         )
 
     def _write_fact_revision(
@@ -1154,6 +1530,7 @@ class Database:
             for row in rows
         ]
 
+    @_atomic_write
     def _add_fact_evidence(
         self,
         fact_id: int,
@@ -1163,10 +1540,9 @@ class Database:
         write_revision: bool = True,
         commit: bool = True,
     ) -> int:
+        self._validate_evidence(evidence, "evidence")
         item = {"content": evidence} if isinstance(evidence, str) else dict(evidence)
-        content = str(item.get("content", "")).strip()
-        if not content:
-            raise ValueError("A evidência precisa conter texto em 'content'.")
+        content = item["content"].strip()
         timestamp = self._now(now)
         self.cursor.execute(
             """
@@ -1202,9 +1578,28 @@ class Database:
                     recorded_at=timestamp,
                 )
                 self.touch_memory(fact.memory_id, now=timestamp, commit=False)
-        if commit:
-            self.connection.commit()
         return evidence_id
+
+    def _validate_evidence(self, evidence: Any, field: str) -> None:
+        if isinstance(evidence, str):
+            self._validate_text(evidence, field)
+            return
+        if not isinstance(evidence, dict):
+            raise ValueError(f"{field} must be text or an object")
+        self._validate_text(evidence.get("content"), f"{field}.content")
+        for key in ("type", "source"):
+            if key in evidence:
+                self._validate_text(evidence[key], f"{field}.{key}", allow_blank=True)
+        if "confidence" in evidence:
+            self._validate_score(evidence["confidence"], f"{field}.confidence")
+        if "observed_at" in evidence:
+            self._validate_text(
+                evidence["observed_at"],
+                f"{field}.observed_at",
+                allow_none=True,
+                allow_blank=True,
+            )
+        self._validate_metadata(evidence.get("metadata"), f"{field}.metadata")
 
     def add_fact_evidence(
         self,
@@ -1212,8 +1607,14 @@ class Database:
         evidence: dict[str, Any] | str,
         *,
         now: Optional[datetime | str] = None,
+        commit: bool = True,
     ) -> int:
-        return self._add_fact_evidence(fact_id, evidence, now=now)
+        return self._add_fact_evidence(
+            fact_id,
+            evidence,
+            now=now,
+            commit=commit,
+        )
 
     # ------------------------------------------------------------------
     # Conflict and graph persistence
@@ -1259,6 +1660,22 @@ class Database:
             WHERE LOWER(subject) = LOWER(?) AND status = 'active'
         """
         params: list[Any] = [subject]
+        if relation_family == "preference":
+            relations = (
+                "avoid",
+                "dislike",
+                "favorite",
+                "hate",
+                "like",
+                "love",
+                "prefer",
+            )
+            sql += " AND LOWER(relation) IN (" + ", ".join("?" for _ in relations) + ")"
+            params.extend(relations)
+        elif relation_family in {"identity", "working_on", "studies"}:
+            sql += " AND LOWER(relation) = LOWER(?)"
+            params.append(relation_family)
+        sql += " ORDER BY id ASC"
         return [
             fact
             for fact in (
@@ -1268,7 +1685,8 @@ class Database:
             if fact.relation_family == relation_family
         ]
 
-    def ensure_semantic_uniqueness_index(self) -> bool:
+    @_atomic_write
+    def ensure_semantic_uniqueness_index(self, *, commit: bool = True) -> bool:
         """Cria o indice unico semantico para evitar fatos ativos duplicados.
 
         O indice e parcial (WHERE status = 'active' AND fact_type IS NOT NULL),
@@ -1280,13 +1698,12 @@ class Database:
                 ON memory_facts (subject, target, fact_type)
                 WHERE status = 'active' AND fact_type IS NOT NULL
             """)
-            self.connection.commit()
             return True
         except Exception:
-            self.connection.rollback()
             return False
 
-    def normalize_all_fact_targets(self, normalize_fn) -> int:
+    @_atomic_write
+    def normalize_all_fact_targets(self, normalize_fn, *, commit: bool = True) -> int:
         """Corrige targets invalidos heredados de normalizaciones antiguas.
 
         Recorre todos los hechos y aplica ``normalize_fn`` al target,
@@ -1310,11 +1727,14 @@ class Database:
                     (normalized, row["id"]),
                 )
                 fixed += 1
-        if fixed:
-            self.connection.commit()
         return fixed
 
-    def consolidate_duplicate_memories(self) -> dict[str, Any]:
+    @_atomic_write
+    def consolidate_duplicate_memories(
+        self,
+        *,
+        commit: bool = True,
+    ) -> dict[str, Any]:
         """Consolida memorias duplicadas por concepto (chave semantica).
 
         Agrupa hechos por (subject, target, fact_type), elige una memoria
@@ -1374,7 +1794,12 @@ class Database:
                     total_evidence_moved += 1
 
                 if fact.status != "inactive":
-                    self.set_fact_status(fact.id, "inactive", reason="dup consolidada")
+                    self.set_fact_status(
+                        fact.id,
+                        "inactive",
+                        reason="dup consolidada",
+                        commit=False,
+                    )
                 if fact.memory_id and fact.memory_id != canonical_memory_id:
                     if fact.memory_id not in consolidated_memories:
                         consolidated_memories.append(fact.memory_id)
@@ -1384,15 +1809,15 @@ class Database:
                     )
                     total_duplicates += 1
 
-        self.connection.commit()
         return {
             "action": "consolidate",
             "consolidated_memories": total_duplicates,
             "evidence_moved": total_evidence_moved,
         }
 
+    @_atomic_write
     def record_conflict(
-
+        self,
         fact_a_id: int,
         fact_b_id: int,
         *,
@@ -1402,6 +1827,9 @@ class Database:
         now: Optional[datetime | str] = None,
         commit: bool = True,
     ) -> int:
+        if status not in _CONFLICT_STATUSES:
+            raise ValueError("conflict.status is not supported")
+        self._validate_text(reason, "conflict.reason")
         timestamp = self._now(now)
         row = self.cursor.execute(
             "SELECT * FROM memory_fact_conflicts WHERE fact_a_id = ? AND fact_b_id = ? AND status = 'open'",
@@ -1434,10 +1862,9 @@ class Database:
                     conflict_id,
                 ),
             )
-        if commit:
-            self.connection.commit()
         return conflict_id
 
+    @_atomic_write
     def resolve_conflict(
         self,
         conflict_id: int,
@@ -1445,6 +1872,7 @@ class Database:
         *,
         reason: str,
         now: Optional[datetime | str] = None,
+        commit: bool = True,
     ) -> bool:
         self.cursor.execute(
             """
@@ -1455,7 +1883,6 @@ class Database:
             """,
             (winner_fact_id, reason, self._now(now), conflict_id),
         )
-        self.connection.commit()
         return self.cursor.rowcount > 0
 
     def get_conflicts(self, *, fact_id: Optional[int] = None) -> list[dict[str, Any]]:

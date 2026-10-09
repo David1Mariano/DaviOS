@@ -10,7 +10,11 @@ class EmotionAnalyzer:
         text = text.lower()
         context = context or {}
 
-        logger.debug("[EMOTION] text=%s context=%s", text, context)
+        logger.debug(
+            "[EMOTION] input_chars=%d context_fields=%d",
+            len(text),
+            len(context),
+        )
         if any(word in text.split() for word in ("odeio", "detesto")):
             return {
                 "emotion": "dislike",

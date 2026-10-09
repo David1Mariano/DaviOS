@@ -26,6 +26,8 @@ from config.davios_config import DaviosConfig
 from core.hardware_detector import HardwareDetector
 from core.reasoning import ReasoningEngine
 from brain.model_manager import ModelManager
+from voice.voice_manager import VoiceManager
+from voice.config import VoiceConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,6 +147,11 @@ def print_boot_banner(hardware, model_manager, selection, provider, config):
               f"via {health.get('backend', 'llama.cpp')} (localhost, offline).")
         print("Memoria persistente: ativa (SQLite).")
         print()
+    
+    # Status de voz
+    voice_status = "ativada" if config.voice.enabled else "desativada"
+    print(f"Voz: {voice_status} (primário={config.voice.primary_provider}, fallback={config.voice.fallback_provider})")
+    print()
     print("DaviOS: Ola! Sou o DaviOS. Como posso ajudar?")
     print()
 
@@ -163,6 +170,10 @@ def main():
         hardware = None
         selection = None
         model_manager = None
+
+    # Inicializa VoiceManager
+    voice_manager = VoiceManager(config.voice)
+    voice_manager.initialize()
 
     print_boot_banner(hardware, model_manager, selection, provider, config)
 
@@ -196,9 +207,25 @@ def main():
         print(f"DaviOS: {result.response}")
         print()
 
+        # Síntese e reprodução de voz (não bloqueia a conversa em caso de erro)
+        try:
+            if config.voice.enabled:
+                voice_manager.speak(result.response)
+        except Exception as e:
+            logger.exception("Erro no sistema de voz")
+            if config.debug:
+                print(f"[DEBUG] Voice error: {type(e).__name__}: {e}")
+
         if result.should_exit:
             break
 
+    # Aguarda reprodução final terminar antes de sair
+    try:
+        voice_manager.wait_for_playback(timeout=5.0)
+    except Exception:
+        pass
+
+    voice_manager.shutdown()
     if provider is not None:
         provider.unload()
     print("DaviOS encerrado.")

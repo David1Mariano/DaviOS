@@ -28,3 +28,7 @@ bin/
 
 # Backups do banco
 memory.db.backup*
+
+# Segredos / variáveis de ambiente (token do bot Telegram, etc.)
+.env
+*.env

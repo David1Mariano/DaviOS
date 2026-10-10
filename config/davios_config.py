@@ -62,6 +62,17 @@ class DaviosConfig:
     # NÃO significa que ele possa EXECUTÁ-LAS — para isso veja actions_enabled
     # e web_enabled. Nenhum mecanismo de chamada existe nesta etapa.
     tools_visible_to_llm: bool = False
+    # --- Canal Telegram (opt-in, tudo desligado por padrão) ---------------
+    # telegram_enabled:         liga/desliga o canal (default False).
+    # telegram_allowed_user_ids: whitelist de user_ids autorizados. Lista
+    #                           VAZIA = ninguém autorizado (nunca "liberar
+    #                           tudo" por omissão). O token NÃO vive aqui —
+    #                           vem só de os.environ["DAVIOS_TELEGRAM_TOKEN"].
+    # telegram_tools_enabled:   quando False (padrão), o canal opera com as
+    #                           ferramentas (ActionManager/WebAccess) DESLIGADAS.
+    telegram_enabled: bool = False
+    telegram_allowed_user_ids: list[int] = field(default_factory=list)
+    telegram_tools_enabled: bool = False
     web_timeout_seconds: float = 5.0
     web_max_content_bytes: int = 200_000
     agent_server_host: str = "127.0.0.1"

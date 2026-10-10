@@ -199,11 +199,11 @@ class VoiceManager:
             return False
 
     def wait_for_playback(self, timeout: Optional[float] = None) -> bool:
-        """Aguarda reprodução atual terminar."""
-        return self._player.wait_current(timeout)
+        """Aguarda toda a reprodução (fila + atual) terminar."""
+        return self._player.wait_for_playback(timeout)
 
     def stop_playback(self) -> None:
-        """Para reprodução atual."""
+        """Para reprodução atual e limpa fila."""
         self._player.stop()
 
     def get_status(self) -> dict:
@@ -233,5 +233,5 @@ class VoiceManager:
             except Exception:
                 pass
         self._providers.clear()
-        self._player.stop()
+        self._player.shutdown()
         self._initialized = False

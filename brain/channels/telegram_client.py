@@ -12,8 +12,10 @@ O cliente é testável sem rede: ``transport`` é um callable injetável
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
@@ -30,6 +32,12 @@ SEND_TIMEOUT_SECONDS = 30.0
 LONG_POLL_GRACE_SECONDS = 10.0
 
 REDACTED = "***"
+
+# Validação de formato do token do Telegram: <bot_id>:<segredo>. Não confirma
+# que o token é real — só barra lixo óbvio antes de any I/O. [0-9] (não \d,
+# que aceitaria dígitos Unicode) e fullmatch (ancora a string inteira, então um
+# "\n" ao final não é tolerado).
+_TOKEN_RE = re.compile(r"[0-9]{5,}:[A-Za-z0-9_-]{20,}")
 
 Transport = Callable[[str, bytes, float], bytes]
 
@@ -65,7 +73,15 @@ class TelegramClient:
     """
 
     def __init__(self, token: str, transport: Optional[Transport] = None) -> None:
-        self._token = token
+        # D5: o token só existe aqui dentro. Strip tolera "\n"/espaços ao colar
+        # de uma var de ambiente. A mensagem de erro é GENÉRICA e NUNCA contém
+        # o token (nem o valor rejeitado).
+        if not isinstance(token, str):
+            raise ValueError("token do Telegram em formato invalido")
+        cleaned = token.strip()
+        if not _TOKEN_RE.fullmatch(cleaned):
+            raise ValueError("token do Telegram em formato invalido")
+        self._token = cleaned
         self._transport = transport
 
     def __repr__(self) -> str:
@@ -138,7 +154,13 @@ class TelegramClient:
             raise self._api_error(data)
         return data.get("result")
 
-    def _call(self, method: str, payload: dict, transport_timeout: float) -> Any:
+    def _call(
+        self,
+        method: str,
+        payload: dict,
+        transport_timeout: float,
+        success_level: int = logging.INFO,
+    ) -> Any:
         url = self._url(method)  # NUNCA registrar `url` (contém o token).
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         transport = self._transport or self._default_transport
@@ -154,7 +176,17 @@ class TelegramClient:
             raise TelegramAPIError(
                 "Falha de rede ao chamar o Telegram: %s" % reason
             ) from None
-        logger.info("[TG] %s ok", method)
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            # Cobre timeout na leitura (socket.timeout/TimeoutError), conexão
+            # resetada (ConnectionResetError), IncompleteRead (HTTPException) e
+            # InvalidURL (ValueError cuja mensagem inclui a URL com o token).
+            detail = redact(str(exc), self._token)
+            logger.warning("[TG] %s erro de transporte %s", method, type(exc).__name__)
+            raise TelegramAPIError(
+                "%s: %s" % (type(exc).__name__, detail)
+            ) from None
+        # Long polling é barulhento: registra em DEBUG. Envios ficam em INFO.
+        logger.log(success_level, "[TG] %s ok", method)
         return self._decode(raw)
 
 
@@ -176,7 +208,12 @@ class TelegramClient:
         }
         if offset is not None:
             payload["offset"] = offset
-        result = self._call("getUpdates", payload, timeout + LONG_POLL_GRACE_SECONDS)
+        result = self._call(
+            "getUpdates",
+            payload,
+            timeout + LONG_POLL_GRACE_SECONDS,
+            success_level=logging.DEBUG,
+        )
         return result or []
 
     def send_message(self, chat_id: int, text: str) -> Any:
@@ -196,8 +233,8 @@ def chunk_text(text: str, limit: int = 4000) -> list:
     """Divide ``text`` em blocos de no máximo ``limit`` caracteres.
 
     Regras:
-      - texto vazio ou só espaços  -> lista vazia;
-      - nenhum bloco vazio;
+      - texto vazio/``None``/só espaços -> lista vazia;
+      - nenhum bloco VAZIO e nenhum bloco SÓ-WHITESPACE (``c.strip()`` vazio);
       - nenhum bloco acima de ``limit``;
       - preferência de quebra: parágrafo (\\n\\n) > linha (\\n) > espaço, e só
         então corte no meio de uma palavra.
@@ -224,7 +261,9 @@ def chunk_text(text: str, limit: int = 4000) -> list:
         remaining = remaining[cut:]
         if not remaining:
             break
-    return [c for c in chunks if c]
+    # Descarta blocos vazios e blocos que sejam só whitespace (ex.: excesso de
+    # "\n" ou espaços gerado pela quebra depois do separador).
+    return [c for c in chunks if c and c.strip()]
 
 
 def _best_break(window: str) -> int:

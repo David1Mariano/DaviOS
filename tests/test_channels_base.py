@@ -35,19 +35,86 @@ class TestIsAuthorized:
     def test_single_authorized(self):
         assert is_authorized(42, [42]) is True
 
-    def test_wrong_type_string_id_still_matches_int(self):
-        # Tolerante a tipo: "123" (str) casa com 123 (int).
+    def test_string_digits_entry_authorizes_matching_sender(self):
+        # Entrada "123" (str de dígitos) autoriza sender int 123.
         assert is_authorized(123, ["123"]) is True
-        assert is_authorized("123", [123]) is True
 
-    def test_wrong_type_uncoercible_id_does_not_authorize(self):
-        # id de tipo errado e inconversível -> não autoriza.
-        assert is_authorized("abc", [123]) is False
-        assert is_authorized(123, [None, "xyz"]) is False
+    def test_string_sender_is_rejected(self):
+        # ANTIGO: is_authorized("123", [123]) era True (coerção).
+        # NOVO (estrito): sender precisa ser type int; str é rejeitada.
+        assert is_authorized("123", [123]) is False
 
     def test_invalid_entries_are_ignored_not_fatal(self):
-        # Elemento inválido na whitelist é ignorado; id válido ainda casa.
+        # Entradas inválidas são ignoradas; id válido ainda casa.
         assert is_authorized(123, [None, "xyz", 123]) is True
+
+    def test_non_collection_types_authorize_nobody(self):
+        # str/dict/None/int NÃO são whitelists iteráveis válidas.
+        assert is_authorized(123, "123456789") is False
+        assert is_authorized(123, {"id": 123}) is False
+        assert is_authorized(123, 123) is False
+        assert is_authorized(123, None) is False
+
+    def test_string_whitelist_does_not_iterate_char_by_char(self):
+        # REGRESSÃO do bug: "123456789" NÃO pode autorizar 1..9.
+        for sid in range(0, 10):
+            assert is_authorized(sid, "123456789") is False
+
+    # ---- casos exigidos na revisão T3b ----------------------------------- #
+    def test_bool_sender_is_rejected(self):
+        # type(True) is bool, não int -> rejeitado dos dois lados.
+        assert is_authorized(True, [1]) is False
+        assert is_authorized(True, [True]) is False
+        assert is_authorized(False, [0]) is False
+
+    def test_bool_entry_is_rejected(self):
+        assert is_authorized(1, [True]) is False
+        assert is_authorized(0, [False]) is False
+
+    def test_float_sender_and_entry_rejected(self):
+        assert is_authorized(123.0, [123]) is False
+        assert is_authorized(123.7, [123]) is False
+        assert is_authorized(123, [123.0]) is False
+        assert is_authorized(123, [123.7]) is False
+
+    def test_inf_string_and_float_rejected(self):
+        assert is_authorized(float("inf"), [1]) is False
+        assert is_authorized(1, [float("inf")]) is False
+        assert is_authorized(1, ["inf"]) is False
+        assert is_authorized(1, ["1e3"]) is False
+
+    def test_giant_digit_string_entry_does_not_crash(self):
+        # str com mais de ~4300 dígitos: int() levantaria ValueError; precisa ser
+        # capturado e a entrada ignorada (não autoriza, não levanta).
+        giant = "1" * 5000
+        assert is_authorized(1, [giant]) is False
+        # Um gigante que casaria por valor ainda não autoriza (não conversível).
+        assert is_authorized(111111111111111111111111, [str(111111111111111111111111)]) is True
+
+    def test_set_tuple_frozenset_accepted(self):
+        assert is_authorized(123, {123, 456}) is True
+        assert is_authorized(123, (123, 456)) is True
+        assert is_authorized(123, frozenset({123})) is True
+        assert is_authorized(999, {123}) is False
+
+    def test_negative_id(self):
+        assert is_authorized(-5, [-5]) is True
+        assert is_authorized(-5, ["-5"]) is True
+        assert is_authorized(5, [-5]) is False
+
+    def test_string_with_trailing_newline_is_rejected(self):
+        # ANTIGO (com ^...$ + match): "123\n" casaria (match para antes do \n).
+        # NOVO (fullmatch): "123\n" NÃO é dígito puro -> não autoriza.
+        assert is_authorized(123, ["123\n"]) is False
+        assert is_authorized(123, ["123 "]) is False
+        assert is_authorized(123, ["\n123"]) is False
+
+    def test_never_raises_on_weird_inputs(self):
+        for bad in [None, "x", 1.5, float("nan"), object()]:
+            assert is_authorized(bad, [1, 2, 3]) is False
+        for bad_ids in [None, "12", 3.4, {"a": 1}, object()]:
+            assert is_authorized(1, bad_ids) is False
+
 
 
 # --------------------------------------------------------------------------- #

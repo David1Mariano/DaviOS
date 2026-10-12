@@ -7,6 +7,7 @@ alguém tentar chamá-lo de verdade. Todo o tráfego é injetado via um
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
@@ -23,7 +24,7 @@ from brain.channels.telegram_client import (
     redact,
 )
 
-TOKEN = "123456:ABCDEF-secret-token"
+TOKEN = "123456:ABCDEFghij-KLMNOP_qrstuvw01"  # >=20 chars após ":" (válido p/ regex)
 
 
 @pytest.fixture(autouse=True)
@@ -447,4 +448,132 @@ class TestExtractMessages:
         msgs, offset = extract_messages(ups)
         assert [m.text for m in msgs] == ["oi", "tchau"]
         assert offset == 4
+
+
+# --------------------------------------------------------------------------- #
+# Validação do token no construtor (T3b 2a)
+# --------------------------------------------------------------------------- #
+class TestTokenValidation:
+    def test_token_with_newline_and_trailing_spaces_is_accepted_after_strip(self):
+        raw = "  \n123456:ABCDEFghij-KLMNOP_qrstuvw01\n  "
+        client = TelegramClient(raw)
+        assert TOKEN not in repr(client)
+        # Não levanta; token interno é o valor com strip.
+        assert client._token == TOKEN
+
+    def test_malformed_token_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            TelegramClient("nao-e-token")
+
+    def test_token_with_inner_newline_rejected_by_fullmatch(self):
+        # fullmatch ancora a string inteira: newline interno (após o strip das
+        # bordas) não é tolerado, ao contrário de um ^...$ com \d.
+        with pytest.raises(ValueError):
+            TelegramClient("123456:ABCDEFghij-KLMNOP_qr\nstuvw01")
+
+    def test_malformed_token_error_message_is_generic_without_token(self):
+        bad = "123:short-and-wrong-format-value"
+        with pytest.raises(ValueError) as exc:
+            TelegramClient(bad)
+        assert bad not in str(exc.value)
+        assert str(exc.value) == "token do Telegram em formato invalido"
+
+    def test_non_string_token_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            TelegramClient(123456)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            TelegramClient(None)  # type: ignore[arg-type]
+
+    def test_token_too_short_secret_rejected(self):
+        # < 20 chars depois dos dois-pontos
+        with pytest.raises(ValueError):
+            TelegramClient("123456:short")
+
+    def test_error_message_never_echoes_token_value(self):
+        secretish = "999999:" + "X" * 30 + "unique-marker-xyz"
+        # secretish é válido; para torná-lo inválido sem expor, corrompemos o fim
+        invalid = secretish[:-1] + "!"  # '!' não permitido
+        with pytest.raises(ValueError) as exc:
+            TelegramClient(invalid)
+        assert invalid not in str(exc.value)
+        assert "unique-marker-xyz" not in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# Erros de transporte de baixo nível -> TelegramAPIError redigido (T3b 2b)
+# --------------------------------------------------------------------------- #
+class TestTransportLowLevelErrors:
+    def _raiser(self, exc):
+        def _transport(url, body_bytes, timeout):
+            raise exc
+
+        return _transport
+
+    def test_invalid_url_with_token_is_redacted(self):
+        # http.client.InvalidURL (HTTPException) cuja msg inclui a URL/token.
+        exc = http.client.InvalidURL("bad url for %s" % TOKEN)
+        with pytest.raises(TelegramAPIError) as raised:
+            _client(self._raiser(exc)).get_updates()
+        assert TOKEN not in str(raised.value)
+        assert "InvalidURL" in str(raised.value)
+
+    def test_timeout_error_becomes_api_error(self):
+        with pytest.raises(TelegramAPIError) as raised:
+            _client(self._raiser(TimeoutError("timed out %s" % TOKEN))).get_updates()
+        assert TOKEN not in str(raised.value)
+        assert "TimeoutError" in str(raised.value)
+
+    def test_connection_reset_becomes_api_error(self):
+        with pytest.raises(TelegramAPIError) as raised:
+            _client(
+                self._raiser(ConnectionResetError("reset %s" % TOKEN))
+            ).send_message(1, "x")
+        assert TOKEN not in str(raised.value)
+        assert "ConnectionResetError" in str(raised.value)
+
+    def test_incomplete_read_becomes_api_error(self):
+        with pytest.raises(TelegramAPIError) as raised:
+            _client(self._raiser(http.client.IncompleteRead(b""))).get_updates()
+        assert "IncompleteRead" in str(raised.value)
+
+    def test_low_level_errors_do_not_leak_token_in_logs(self, caplog):
+        import logging
+
+        exc = http.client.InvalidURL("url %s invalida" % TOKEN)
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(TelegramAPIError):
+                _client(self._raiser(exc)).get_updates()
+        assert TOKEN not in caplog.text
+        assert TOKEN not in repr(_client())
+
+
+
+# --------------------------------------------------------------------------- #
+# chunk_text: blocos só-whitespace descartados (T3b 2d)
+# --------------------------------------------------------------------------- #
+class TestChunkTextWhitespaceOnly:
+    def test_trailing_spaces_produce_no_whitespace_only_blocks(self):
+        text = "a" + (" " * 9000)
+        chunks = chunk_text(text, 4000)
+        assert all(c.strip() for c in chunks)  # nenhum bloco vazio/só espaço
+        assert all(len(c) <= 4000 for c in chunks)
+        # O primeiro bloco começa com "a"; os de espaço puro foram descartados.
+        assert chunks[0].startswith("a")
+
+    def test_newline_runs_produce_no_whitespace_only_blocks(self):
+        text = "a" + ("\n" * 5000) + "b"
+        chunks = chunk_text(text, 4000)
+        assert all(c.strip() for c in chunks)  # nenhum bloco só "\n"
+        assert all(len(c) <= 4000 for c in chunks)
+        # "a" e "b" (o conteúdo real) sobrevivem em algum bloco.
+        joined = "".join(chunks)
+        assert "a" in joined and "b" in joined
+
+    def test_all_whitespace_input_returns_empty(self):
+        assert chunk_text(" " * 10000, 4000) == []
+        assert chunk_text("\n" * 10000, 4000) == []
+
+    def test_short_text_still_single_chunk(self):
+        assert chunk_text("a" + " " * 100, 4000) == ["a" + " " * 100]
+
 

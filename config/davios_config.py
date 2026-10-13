@@ -57,6 +57,8 @@ class DaviosConfig:
     # agent_server_enabled: levantar socket local para orquestar agentes externos.
     actions_enabled: bool = False
     web_enabled: bool = False
+    phone_read_enabled: bool = False
+    phone_act_enabled: bool = False
     agent_server_enabled: bool = False
     # C3: o LLM SABE que ferramentas existem (listagem informativa no prompt).
     # NÃO significa que ele possa EXECUTÁ-LAS — para isso veja actions_enabled
@@ -66,6 +68,9 @@ class DaviosConfig:
     web_max_content_bytes: int = 200_000
     agent_server_host: str = "127.0.0.1"
     agent_server_port: int = 8765
+    # Phone (celular Termux) — opt-in, desabilitado por padrão
+    phone_base_url: str = ""
+    phone_timeout: float = 10.0
     # Model management
     active_model_id: Optional[str] = None  # ID do modelo ativo no catálogo
     models_dir: str = "models"

@@ -247,6 +247,14 @@ class ToolExecutionOrchestrator:
             if bool(getattr(self.config, "web_enabled", False)):
                 return True, ""
             return False, "categoria 'web' desabilitada"
+        if category == "phone_read":
+            if bool(getattr(self.config, "phone_read_enabled", False)):
+                return True, ""
+            return False, "categoria 'phone_read' desabilitada"
+        if category == "phone_act":
+            if bool(getattr(self.config, "phone_act_enabled", False)):
+                return True, ""
+            return False, "categoria 'phone_act' desabilitada"
         # Categoria vazia/desconhecida: default seguro — nunca executa.
         return False, f"categoria nao auto-executavel: '{category or 'vazia'}'"
 

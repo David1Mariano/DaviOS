@@ -82,7 +82,9 @@ def build_engine(config: DaviosConfig):
             print("[PROVIDER] Para instrucoes de instalacao, veja docs/LLM_SETUP.")
 
     # Router (AUTO): online primeiro com fallback local.
-    if config.router.enabled and config.network_policy != "offline":
+    # Respeita offline_mode e network_policy (consistente com OnlineRouter.is_network_allowed).
+    network_allowed = config.router.enabled and not config.offline_mode and config.network_policy != "offline"
+    if network_allowed:
         provider = HybridLLMProvider(
             config=config, local_provider=provider, router=OnlineRouter(config=config)
         )

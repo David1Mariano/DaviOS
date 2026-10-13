@@ -91,7 +91,8 @@ DaviOS/
 │   ├── prompt_builder.py
 │   ├── response_generator.py
 │   └── providers/
-│       └── local_llama_cpp_provider.py
+│       ├── local_llama_cpp_provider.py
+│       └── online_router.py
 │
 ├── core/
 │   ├── hardware_detector.py
@@ -456,6 +457,7 @@ terminal irrestrito
 - [x] ModelManager
 - [x] Detecção de hardware
 - [x] Fallback sem modelo
+- [x] Roteador híbrido online/offline (OpenAI-compatible, `urllib` + fallback local)
 
 ### Fase 2 • Cérebro local
 - [ ] Finalizar `LocalLlamaCppProvider`
@@ -547,9 +549,22 @@ O DaviOS já possui uma base funcional de:
 - detecção de hardware;
 - arquitetura para LLM local;
 - fallback sem modelo;
+- roteador híbrido online/offline (compatível OpenAI, via `urllib`);
 - suíte de testes automatizados.
 
 O próximo grande marco é conectar o cérebro generativo local ao sistema através do `LocalLlamaCppProvider`.
+
+---
+
+## 🔌 Provedor online (OpenAI-compatible)
+
+O DaviOS roteia chamadas para provedores compatíveis com OpenAI de forma
+**opt-in e offline-first**: sem `remote_providers` configurados (ou com
+`offline_mode: true` / `network_policy: "offline"`) o assistente continua 100%
+local. O fallback para o modelo Qwen local (GGUF) é sempre garantido no modo `auto`.
+
+Veja `docs/ROUTER.md` para configurar credenciais via variáveis de ambiente,
+ativar o router e validar contra um provedor real.
 
 ---
 

@@ -101,7 +101,7 @@ class XTTSProvider(TTSProvider):
             available=True,
             reason="",
             voice_name="xtts-v2-clone",
-            sample_rate=24000,  # XTTS-v2 usa 24kHz
+                                    sample_rate=22050,  # sample rate nativo do checkpoint XTTS-v2 (config.json: audio.sample_rate=22050)
         )
 
     def _load_model(self) -> bool:

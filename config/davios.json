@@ -31,10 +31,33 @@
     "sapi5_voice_name": "",
     "sapi5_rate": 0,
     "sapi5_volume": 100,
+    "xtts_enabled": false,
+    "xtts_model_path": "models/voice/xtts-v2",
+    "xtts_reference_audio": "models/voice/references/reference.wav",
+    "xtts_language": "pt",
+    "xtts_speaker_wav": "",
+    "xtts_temperature": 0.7,
+    "xtts_length_penalty": 1.0,
+            "xtts_repetition_penalty": 5.0,
+    "xtts_top_k": 50,
+    "xtts_top_p": 0.85,
+    "xtts_gpt_cond_len": 64,
+    "xtts_gpt_cond_chunk_len": 4,
+    "xtts_gpt_batch_size": 1,
+    "xtts_low_mem": false,
+    "xtts_use_cuda": false,
     "synthesis_timeout_seconds": 10.0,
     "playback_timeout_seconds": 30.0,
     "block_on_playback": false,
     "skip_empty_text": true,
     "log_synthesis_errors": true
+  },
+  "remote_providers": [],
+  "router": {
+    "enabled": true,
+    "mode": "auto",
+    "timeout_seconds": 8.0,
+    "retry_count": 2,
+    "retry_backoff_seconds": 1.0
   }
 }

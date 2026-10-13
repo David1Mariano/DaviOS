@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+from dataclasses import asdict
 
 # UTF-8 de ponta a ponta no Windows: sem isso o console usa codepage
 # 437/850 e acentos como "ç" e "ã" corrompem no print()/input() (mojibake).
@@ -22,6 +23,7 @@ from brain.providers.local_llama_cpp_provider import (
     LocalLlamaCppProvider,
     LLAMA_CPP_INSTRUCTIONS as LLAMA_STANDALONE_INSTRUCTIONS,
 )
+from brain.providers.online_router import HybridLLMProvider, OnlineRouter
 from config.davios_config import DaviosConfig
 from core.hardware_detector import HardwareDetector
 from core.reasoning import ReasoningEngine
@@ -78,6 +80,13 @@ def build_engine(config: DaviosConfig):
         else:
             print("[BACKEND] Nenhum backend LLM disponivel; usando modo regras.")
             print("[PROVIDER] Para instrucoes de instalacao, veja docs/LLM_SETUP.")
+
+    # Router (AUTO): online primeiro com fallback local.
+    if config.router.enabled and config.network_policy != "offline":
+        provider = HybridLLMProvider(
+            config=config, local_provider=provider, router=OnlineRouter(config=config)
+        )
+        print("[ROUTER] modo auto: online primeiro, fallback local ativo.")
 
     from brain.cognitive_core import CognitiveCore
 
@@ -171,8 +180,11 @@ def main():
         selection = None
         model_manager = None
 
-    # Inicializa VoiceManager
-    voice_manager = VoiceManager(config.voice)
+    # Inicializa VoiceManager. A fonte de verdade de comportamento e a classe
+    # rica voice.config.VoiceConfig (expoe get_provider_config); convertemos o
+    # dataclass do config carregado nesse unico ponto. Nao altera providers
+    # XTTS/SAPI5/piper, parametros de voz ou arquivos de modelo.
+    voice_manager = VoiceManager(VoiceConfig.from_dict(asdict(config.voice)))
     voice_manager.initialize()
 
     print_boot_banner(hardware, model_manager, selection, provider, config)

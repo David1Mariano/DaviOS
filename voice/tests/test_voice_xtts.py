@@ -152,7 +152,7 @@ def test_availability_full_ready(fake_deps):
     assert info.available is True
     assert info.name == "xtts"
     assert info.voice_name == "xtts-v2-clone"
-    assert info.sample_rate == 24000
+    assert info.sample_rate == 22050  # sample rate nativo do checkpoint XTTS-v2 (config.json: audio.sample_rate=22050)
 
 
 class _FakeHighLevelTTS:

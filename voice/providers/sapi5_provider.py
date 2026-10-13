@@ -10,6 +10,11 @@ import time
 import threading
 from typing import Optional
 
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
+
 from voice.providers.base import TTSProvider, TTSProviderInfo
 
 
@@ -149,7 +154,13 @@ class SAPI5Provider(TTSProvider):
         result_container = {"audio_data": None, "error": None, "completed": False}
 
         def _synthesize_in_thread():
+            # Inicializa COM nesta thread
+            com_initialized = False
             try:
+                if pythoncom is not None:
+                    pythoncom.CoInitialize()
+                    com_initialized = True
+                
                 engine = win32com.client.Dispatch("SAPI.SpVoice")
                 
                 # Seleciona voz se especificada
@@ -198,6 +209,12 @@ class SAPI5Provider(TTSProvider):
                 logger.exception("[%s] Erro na síntese", self.provider_name)
                 result_container["error"] = str(e)
             finally:
+                # Finaliza COM nesta thread se foi inicializado
+                if com_initialized and pythoncom is not None:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
                 result_container["completed"] = True
                 # Libera o slot de síntese COM quando a thread termina (sucesso, erro ou exceção)
                 with self._com_condition:

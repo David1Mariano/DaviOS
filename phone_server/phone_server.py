@@ -26,8 +26,9 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Dict
 import hmac  # importado aqui para uso em _check_token
+import logging  # para logging de erros inesperados
 
 # Timeouts dos comandos (em segundos)
 TIMEOUT_LOCATION = 8  # termux-location pode demorar
@@ -97,6 +98,13 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
     # Injetável para testes
     runner: RunnerType = default_runner
 
+    def __init__(self, *args, commands: Optional[Dict[str, List[str]]] = None, runner: Optional[RunnerType] = None, **kwargs):
+        # Se commands for None, usa a allowlist padrão
+        self.commands = commands if commands is not None else COMMANDS
+        # Se runner for None, usa o atributo de classe (que pode ter sido sobrescrito por testes)
+        self.runner = runner if runner is not None else type(self).runner
+        super().__init__(*args, **kwargs)
+
     # Endpoints permitidos e seus métodos
     _endpoints = {
         "/battery": {"GET"},
@@ -129,45 +137,50 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
         self._handle_request("PATCH")
 
     def _handle_request(self, method: str):
-        # Verifica token
-        if not _check_token(self.headers):
-            # Sem token ou token inválido: retorna 401 com corpo vazio
-            self.send_response(401)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+        try:
+            # Verifica token
+            if not _check_token(self.headers):
+                # Sem token ou token inválido: retorna 401 com corpo vazio
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
-        # Rota e método
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
+            # Rota e método
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
 
-        # Verifica se o caminho é um endpoint conhecido
-        if path not in self._endpoints:
-            self.send_error(404)
-            return
+            # Verifica se o caminho é um endpoint conhecido
+            if path not in self._endpoints:
+                self.send_error(404)
+                return
 
-        # Verifica se o método é permitido para esse endpoint
-        if method not in self._endpoints[path]:
-            self.send_error(405)
-            return
+            # Verifica se o método é permitido para esse endpoint
+            if method not in self._endpoints[path]:
+                self.send_error(405)
+                return
 
-        # Agora podemos tratar o método e caminho específicos
-        if method == "GET" and path == "/battery":
-            self._handle_battery()
-        elif method == "GET" and path == "/location":
-            self._handle_location()
-        elif method == "GET" and path == "/device":
-            self._handle_device()
-        elif method == "POST" and path == "/tts/speak":
-            self._handle_speak()
-        elif method == "POST" and path == "/vibrate":
-            self._handle_vibrate()
-        else:
-            # Não deve chegar aqui por causa das verificações acima
-            self.send_error(500)
+            # Agora podemos tratar o método e caminho específicos
+            if method == "GET" and path == "/battery":
+                self._handle_battery()
+            elif method == "GET" and path == "/location":
+                self._handle_location()
+            elif method == "GET" and path == "/device":
+                self._handle_device()
+            elif method == "POST" and path == "/tts/speak":
+                self._handle_speak()
+            elif method == "POST" and path == "/vibrate":
+                self._handle_vibrate()
+            else:
+                # Não deve chegar aqui por causa das verificações acima
+                self.send_error(500)
+        except Exception as e:
+            # Log apenas o tipo da exceção (sem token nem corpo)
+            logging.warning("[PHONE] Erro inesperado em %s: %s", path, type(e).__name__)
+            self._send_json_error("Erro interno")
 
     def _handle_battery(self):
-        code, stdout, stderr = self.runner(COMMANDS["battery"], TIMEOUT_DEFAULT)
+        code, stdout, stderr = self.runner(self.commands["battery"], TIMEOUT_DEFAULT)
         if code != 0:
             self._send_json_error("Falha ao obter bateria")
             return
@@ -181,7 +194,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error("Resposta inválida do comando de bateria")
 
     def _handle_location(self):
-        code, stdout, stderr = self.runner(COMMANDS["location"], TIMEOUT_LOCATION)
+        code, stdout, stderr = self.runner(self.commands["location"], TIMEOUT_LOCATION)
         if code != 0:
             self._send_json_error("Localização indisponível")
             return
@@ -195,7 +208,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error("Localização indisponível")
 
     def _handle_device(self):
-        code, stdout, stderr = self.runner(COMMANDS["device"], TIMEOUT_DEFAULT)
+        code, stdout, stderr = self.runner(self.commands["device"], TIMEOUT_DEFAULT)
         if code != 0:
             self._send_json_error("Falha ao obter informações do dispositivo")
             return

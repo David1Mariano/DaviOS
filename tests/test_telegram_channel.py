@@ -56,6 +56,7 @@ class FakeEngine:
         self.long_response = long_response
         self.processed = []           # textos chegados em process()
         self.reset_count = 0
+        self.closed = False
         self.process_thread_ids = set()
         self.init_thread_id = threading.get_ident()
 
@@ -79,6 +80,12 @@ class FakeEngine:
 
     def reset_context(self):
         self.reset_count += 1
+
+    def close(self):
+        # Fecha a conexão SQLite criada nesta thread. Se rodar em outra thread,
+        # o sqlite3 levanta ProgrammingError (detecta uso cross-thread).
+        self._conn.close()
+        self.closed = True
 
 
 class FakeClient:
@@ -156,6 +163,50 @@ class FakeClient:
         self.actions.append((chat_id, action))
 
 
+class RaisingSendClient(FakeClient):
+    """``send_message`` SEMPRE levanta ``error`` (conta tentativas em send_count).
+
+    Usa a semântica normal de ``get_updates`` (herdada); só o envio falha.
+    """
+
+    def __init__(self, error, **kw):
+        super().__init__(**kw)
+        self._error = error
+        self.send_count = 0
+
+    def send_message(self, chat_id, text):
+        self.send_count += 1
+        raise self._error
+
+
+class SeqSendErrorClient(FakeClient):
+    """``send_message`` levanta os erros de ``errors`` em ordem; depois, sucesso.
+
+    Registra apenas envios BEM-sucedidos em ``sent`` (como o FakeClient).
+    """
+
+    def __init__(self, errors, **kw):
+        super().__init__(**kw)
+        self._errors = list(errors or [])
+
+    def send_message(self, chat_id, text):
+        if self._errors:
+            raise self._errors.pop(0)
+        self.sent.append((chat_id, text))
+
+
+class BadActionClient(FakeClient):
+    """``send_chat_action`` SEMPRE levanta ``error`` (após registrar a action)."""
+
+    def __init__(self, error, **kw):
+        super().__init__(**kw)
+        self._error = error
+
+    def send_chat_action(self, chat_id, action="typing"):
+        self.actions.append((chat_id, action))
+        raise self._error
+
+
 class FakeSleep:
     """Relógio falso: registra as esperas sem dormir de verdade."""
 
@@ -208,7 +259,7 @@ def channel_factory():
 
     def _make(allowed_user_ids=ALLOWED, queue_max=20, chunk_limit=4000,
               poll_timeout=30, engine_kwargs=None, client=None,
-              engine_factory=None, now=None):
+              engine_factory=None, now=None, engine_cleanup=None):
         client = client if client is not None else FakeClient()
         holder = {"engine": None}
         engine_kwargs = engine_kwargs or {}
@@ -222,6 +273,9 @@ def channel_factory():
         if engine_factory is not None:
             factory = engine_factory
 
+        extra = {}
+        if engine_cleanup is not None:
+            extra["engine_cleanup"] = engine_cleanup
         ch = TelegramChannel(
             client=client,
             engine_factory=factory,
@@ -231,6 +285,7 @@ def channel_factory():
             chunk_limit=chunk_limit,
             sleep=FakeSleep(),
             now=now,
+            **extra,
         )
         ch._test_holder = holder  # type: ignore[attr-defined]
         ch._test_engines = created["engines"]  # type: ignore[attr-defined]
@@ -662,17 +717,44 @@ class TestPollerErrors:
         waits = ch._sleep.waits
         assert 1.0 in waits and 2.0 in waits and 4.0 in waits
 
-    def test_backoff_capped_at_60(self, channel_factory):
-        # _poll_error_wait é puro: verifico o teto direto.
-        ch = channel_factory()
-        _, grow = ch._poll_error_wait(
-            TelegramAPIError("x", error_code=500), backoff=60.0
-        )
-        wait, grow2 = ch._poll_error_wait(
-            TelegramAPIError("x", error_code=500), backoff=100.0
-        )
-        # backoff alto é passado direto; o teto é aplicado no loop via min().
-        assert wait == 100.0 and grow2 is True
+    def test_backoff_sequence_main_loop(self, channel_factory):
+        # 8 erros genéricos seguidos -> esperas EXATAS (teto em 60).
+        err = TelegramAPIError("network down", error_code=500)
+        client = FakeClient(script=[err] * 8 + [[]])  # 8 erros, depois sucesso
+        ch = channel_factory(client=client)
+        ch.start()
+        try:
+            assert _wait_for(lambda: len(ch._sleep.waits) >= 8)
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert ch._sleep.waits == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+
+    def test_backoff_resets_after_success(self, channel_factory):
+        # erro, sucesso, erro -> após o sucesso o backoff volta a 1.0.
+        err = TelegramAPIError("network down", error_code=500)
+        client = FakeClient(script=[err, [], err, []])
+        ch = channel_factory(client=client)
+        ch.start()
+        try:
+            assert _wait_for(lambda: len(ch._sleep.waits) >= 2)
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert ch._sleep.waits[:2] == [1.0, 1.0]
+
+    def test_backoff_sequence_discard_loop(self, channel_factory):
+        # MESMA sequência exata no laço de descarte (_startup_backlog_offset).
+        err = TelegramAPIError("network down", error_code=500)
+        client = FakeClient(discard_effects=[err] * 8, script=[[]])
+        ch = channel_factory(client=client)
+        ch.start()
+        try:
+            assert _wait_for(lambda: len(ch._sleep.waits) >= 8)
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert ch._sleep.waits == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
 
 
 
@@ -1158,4 +1240,306 @@ class TestUnauthorizedThrottleLimit:
         assert 999999 in ch._unauth_last_logged
         assert 0 not in ch._unauth_last_logged  # o mais antigo foi removido
 
+
+
+
+# --------------------------------------------------------------------------- #
+# T4c-1: 429 no ENVIO (_send_with_retry): teto 30 s, UMA nova tentativa, sem
+#        levantar; só loga o error_code.
+# --------------------------------------------------------------------------- #
+class TestSendRetryOn429:
+    def _chan(self, channel_factory, retry_after):
+        err = TelegramAPIError("Too Many", error_code=429, retry_after=retry_after)
+        client = RaisingSendClient(err)  # send_message SEMPRE levanta 429
+        return channel_factory(client=client), client
+
+    def test_send_retry_max_seconds_is_30(self, channel_factory):
+        from brain.channels.telegram_channel import SEND_RETRY_MAX_SECONDS
+        assert SEND_RETRY_MAX_SECONDS == 30.0
+
+    def test_retry_after_99_capped_at_30(self, channel_factory):
+        ch, client = self._chan(channel_factory, 99)
+        ch._send_with_retry(555, "oi")  # não deve levantar
+        assert ch._sleep.waits == [30.0]
+
+    def test_retry_after_5_uses_5(self, channel_factory):
+        ch, client = self._chan(channel_factory, 5)
+        ch._send_with_retry(555, "oi")
+        assert ch._sleep.waits == [5.0]
+
+    def test_exactly_two_send_attempts(self, channel_factory):
+        ch, client = self._chan(channel_factory, 5)
+        ch._send_with_retry(555, "oi")
+        assert client.send_count == 2
+
+    def test_second_failure_does_not_raise(self, channel_factory):
+        ch, client = self._chan(channel_factory, 5)
+        # A segunda falha é engolida (só loga o código); não propaga.
+        ch._send_with_retry(555, "oi")
+        assert client.send_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# T4c-2: _reply_safe (aviso "ocupado" do poller) NUNCA dorme: UMA tentativa,
+#        sem retry e sem sleep, engolindo qualquer exceção.
+# --------------------------------------------------------------------------- #
+class TestReplySafeNeverSleeps:
+    def test_busy_notice_never_sleeps_or_retries(self, channel_factory):
+        err = TelegramAPIError("Conflict", error_code=429, retry_after=30)
+        client = RaisingSendClient(err)
+        ch = channel_factory(client=client)
+        ch._reply_safe(555, BUSY_MESSAGE)  # não deve levantar
+        assert ch._sleep.waits == []       # poller NUNCA dorme no envio
+        assert client.send_count == 1      # UMA única tentativa
+
+    def test_poller_keeps_consuming_when_busy_send_429(self, channel_factory):
+        import time as _time
+
+        class SlowEngine(FakeEngine):
+            def process(self, text):
+                _time.sleep(0.3)
+                return super().process(text)
+
+        ups = [_private(i, 111, 555, "m%d" % i) for i in range(1, 4)]
+        client = RaisingSendClient(
+            TelegramAPIError("Conflict", error_code=429, retry_after=30),
+            script=[ups, [], []],
+        )
+        ch = channel_factory(client=client, queue_max=1, engine_factory=SlowEngine)
+        ch.start()
+        try:
+            # o poller continua chamando get_updates (não trava nem dorme no envio)
+            assert _wait_for(lambda: len(client.get_updates_calls) >= 3)
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert ch.is_failed is False
+
+
+# --------------------------------------------------------------------------- #
+# T4c-4: /reset protegido — reset_context() em try/except; loga só o tipo e
+#        responde PROCESS_ERROR_MESSAGE.
+# --------------------------------------------------------------------------- #
+class TestResetCommandGuarded:
+    def test_reset_exception_replies_process_error(self, channel_factory, caplog):
+        import logging
+
+        class ResetFailEngine(FakeEngine):
+            def reset_context(self):
+                raise RuntimeError("nao deu para limpar o contexto")
+
+        client = FakeClient(script=[[_private(1, 111, 555, "/reset")]])
+        ch = channel_factory(client=client, engine_factory=ResetFailEngine)
+        with caplog.at_level(logging.DEBUG):
+            ch.start()
+            try:
+                assert _wait_for(
+                    lambda: any(t == PROCESS_ERROR_MESSAGE for _, t in client.sent)
+                )
+            finally:
+                ch.stop()
+                ch.join(2.0)
+        assert any(t == PROCESS_ERROR_MESSAGE for _, t in client.sent)
+        # loga só o TIPO; a mensagem interna não vaza.
+        assert "RuntimeError" in caplog.text
+        assert "nao deu para limpar o contexto" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# T4c-5: result.response não-string (None/int/objeto) => NO_RESPONSE_MESSAGE.
+# --------------------------------------------------------------------------- #
+class TestNonStringResponse:
+    def _result_engine(self, value):
+        class _Engine(FakeEngine):
+            def process(self, text):
+                self._conn.execute("INSERT INTO t VALUES (1)")
+                self._conn.commit()
+                self.processed.append(text)
+
+                class _R:
+                    pass
+
+                r = _R()
+                r.response = value
+                r.should_exit = False
+                return r
+
+        return _Engine
+
+    def test_none_response(self, channel_factory):
+        client = FakeClient(script=[[_private(1, 111, 555, "oi")]])
+        ch = channel_factory(client=client, engine_factory=self._result_engine(None))
+        ch.start()
+        try:
+            assert _wait_for(
+                lambda: any(t == NO_RESPONSE_MESSAGE for _, t in client.sent)
+            )
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert any(t == NO_RESPONSE_MESSAGE for _, t in client.sent)
+
+    def test_int_response(self, channel_factory):
+        client = FakeClient(script=[[_private(1, 111, 555, "oi")]])
+        ch = channel_factory(client=client, engine_factory=self._result_engine(123))
+        ch.start()
+        try:
+            assert _wait_for(
+                lambda: any(t == NO_RESPONSE_MESSAGE for _, t in client.sent)
+            )
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert any(t == NO_RESPONSE_MESSAGE for _, t in client.sent)
+
+    def test_object_response(self, channel_factory):
+        client = FakeClient(script=[[_private(1, 111, 555, "oi")]])
+        ch = channel_factory(client=client, engine_factory=self._result_engine(object()))
+        ch.start()
+        try:
+            assert _wait_for(
+                lambda: any(t == NO_RESPONSE_MESSAGE for _, t in client.sent)
+            )
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        assert any(t == NO_RESPONSE_MESSAGE for _, t in client.sent)
+
+
+# --------------------------------------------------------------------------- #
+# T4c-6: engine_cleanup roda no finally do worker, na thread do engine, uma
+#        vez; não roda se a factory falhou; erro de cleanup nunca trava.
+# --------------------------------------------------------------------------- #
+class TestEngineCleanup:
+    def test_cleanup_runs_on_stop(self, channel_factory):
+        client = FakeClient(default_updates=[])
+        calls = []
+        ch = channel_factory(
+            client=client, engine_cleanup=lambda e: calls.append(("ok", threading.get_ident()))
+        )
+        ch.start()
+        ch.stop()
+        ch.join(3.0)
+        assert calls == [("ok", ch._test_holder["engine"].init_thread_id)]
+
+    def test_cleanup_runs_after_later_fail(self, channel_factory, caplog):
+        import logging
+
+        class BoomFactory(FakeEngine):
+            pass
+
+        created = {}
+
+        def factory():
+            created["e"] = FakeEngine()
+            return created["e"]
+
+        def cleanup(e):
+            created["e"].close()
+
+        # poller falha (erro genérico no get_updates) -> canal failed; o worker,
+        # ao ser parado, roda o cleanup uma vez.
+        client = FakeClient(script=[RuntimeError("boom")])
+        ch = channel_factory(client=client, engine_factory=factory, engine_cleanup=cleanup)
+        with caplog.at_level(logging.DEBUG):
+            ch.start()
+            try:
+                assert _wait_for(lambda: ch.is_failed)
+            finally:
+                ch.stop()
+                ch.join(3.0)
+        assert created["e"].closed is True
+
+    def test_cleanup_not_run_if_factory_failed(self, channel_factory):
+        calls = []
+
+        def bad_factory():
+            raise RuntimeError("falha ao construir")
+
+        client = FakeClient(default_updates=[])
+        ch = channel_factory(client=client, engine_factory=bad_factory,
+                             engine_cleanup=lambda e: calls.append(1))
+        ch.start()
+        try:
+            assert _wait_for(lambda: ch.is_failed)
+        finally:
+            ch.join(3.0)
+        assert calls == []
+
+    def test_cleanup_exception_does_not_block_shutdown(self, channel_factory, caplog):
+        import logging
+
+        client = FakeClient(default_updates=[])
+        ch = channel_factory(client=client,
+                             engine_cleanup=lambda e: (_ for _ in ()).throw(RuntimeError("boom no cleanup")))
+        with caplog.at_level(logging.DEBUG):
+            ch.start()
+            ch.stop()
+            ch.join(3.0)
+        # encerrou normalmente (threads mortas) e logou só o tipo.
+        assert all(not t.is_alive() for t in ch._threads)
+        assert "RuntimeError" in caplog.text
+
+    def test_cleanup_runs_in_engine_thread(self, channel_factory):
+        client = FakeClient(default_updates=[])
+        holder = {}
+
+        def cleanup(e):
+            e.close()  # fecha sqlite criado na thread do engine
+
+        ch = channel_factory(client=client, engine_cleanup=cleanup)
+        ch.start()
+        ch.stop()
+        ch.join(3.0)
+        engine = ch._test_holder["engine"]
+        assert engine is not None
+        assert engine.closed is True  # close() na MESMA thread (senão ProgrammingError)
+
+
+# --------------------------------------------------------------------------- #
+# T4c-7: (a) send_chat_action levantando é engolida e a resposta sai;
+#        (b) send_message com 400 loga só o código e os blocos seguintes saem.
+# --------------------------------------------------------------------------- #
+class TestSendEdgeCases:
+    def test_send_chat_action_error_swallowed_response_sent(self, channel_factory):
+        client = BadActionClient(
+            RuntimeError("sem acao"), script=[[_private(1, 111, 555, "oi")]]
+        )
+        ch = channel_factory(client=client, engine_kwargs={"response": "ola"})
+        ch.start()
+        try:
+            assert _wait_for(lambda: any(t == "ola" for _, t in client.sent))
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        # a resposta foi enviada mesmo com o erro da action.
+        assert any(t == "ola" for _, t in client.sent)
+        assert (555, "typing") in client.actions
+
+    def test_send_400_logs_code_not_text_and_continues(self, channel_factory, caplog):
+        import logging
+
+        errors = [
+            TelegramAPIError("Bad Request", error_code=400),
+            TelegramAPIError("Bad Request", error_code=400),
+        ]
+        client = SeqSendErrorClient(
+            errors,
+            script=[[_private(1, 111, 555, "fala muito")]],
+        )
+        ch = channel_factory(client=client,
+                             engine_kwargs={"long_response": " ".join("b%d" % i for i in range(2000))})
+        with caplog.at_level(logging.DEBUG):
+            ch.start()
+            try:
+                # espera até algum bloco posterior ter sido entregue
+                assert _wait_for(lambda: len(client.sent) >= 1)
+            finally:
+                ch.stop()
+                ch.join(2.0)
+        # um bloco seguinte foi enviado apesar dos dois 400.
+        assert len(client.sent) >= 1
+        # logou o código 400, mas NÃO o texto da mensagem.
+        assert "400" in caplog.text
+        assert "b0" not in caplog.text  # fragmento do texto não vazou
 

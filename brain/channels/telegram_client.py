@@ -172,7 +172,9 @@ class TelegramClient:
             raise error from None
         except urllib.error.URLError as exc:
             reason = redact(str(exc.reason), self._token)
-            logger.warning("[TG] %s falha de rede", method)
+            logger.warning(
+                "[TG] %s falha de rede error_type=%s", method, type(exc).__name__
+            )
             raise TelegramAPIError(
                 "Falha de rede ao chamar o Telegram: %s" % reason
             ) from None
@@ -224,6 +226,15 @@ class TelegramClient:
     def send_chat_action(self, chat_id: int, action: str = "typing") -> Any:
         payload = {"chat_id": chat_id, "action": action}
         return self._call("sendChatAction", payload, SEND_TIMEOUT_SECONDS)
+
+    def get_me(self) -> Any:
+        """Valida o token contra ``getMe`` (usado por ``run_telegram --check``).
+
+        Reusa ``_call``: a URL (que embute o token) NUNCA é registrada e qualquer
+        erro já vem redigido (sem token). Devolve o dict do bot (id, username…).
+        Levanta ``TelegramAPIError`` se o token for inválido ou a rede falhar.
+        """
+        return self._call("getMe", {}, SEND_TIMEOUT_SECONDS)
 
 
 # --------------------------------------------------------------------------- #

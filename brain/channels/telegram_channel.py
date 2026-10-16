@@ -54,6 +54,9 @@ UNAUTHORIZED_LOG_MAX_ENTRIES = 256
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
 
+# Teto do retry do ENVIO (429): distinto do backoff do poller.
+SEND_RETRY_MAX_SECONDS = 30.0
+
 
 def effective_channel_config(config: DaviosConfig) -> DaviosConfig:
     """Devolve a config que o engine do canal deve usar (D3).
@@ -97,6 +100,7 @@ class TelegramChannel(Channel):
         sleep: Optional[Callable[[float], None]] = None,
         logger: Optional[logging.Logger] = None,
         now: Optional[Callable[[], float]] = None,
+        engine_cleanup: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self._client = client
         self._engine_factory = engine_factory
@@ -120,6 +124,10 @@ class TelegramChannel(Channel):
 
         # Relógio injetável para o throttle de log (default: time.monotonic).
         self._now = now or time.monotonic
+
+        # Hook de limpeza do engine: chamado UMA vez, no finally do worker, na
+        # MESMA thread que construiu o engine (protegido; nunca propaga).
+        self._engine_cleanup = engine_cleanup
 
         # Espera injetável: por padrão, espera no stop_event (acordando antes se
         # stop() for chamado). Assinatura (segundos) -> bool/None.
@@ -352,21 +360,34 @@ class TelegramChannel(Channel):
             self._fail("engine_factory falhou")
             return
 
-        while not self._stop_event.is_set():
-            try:
-                msg = self._queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if msg is None:  # sentinela de stop()
-                break
-            try:
-                self._handle_message(msg)
-            except Exception as exc:  # noqa: BLE001 - nunca derruba o worker
-                self._log.error(
-                    "[TG] erro inesperado no worker error_type=%s", type(exc).__name__
-                )
-            finally:
-                self._queue.task_done()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    msg = self._queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if msg is None:  # sentinela de stop()
+                    break
+                try:
+                    self._handle_message(msg)
+                except Exception as exc:  # noqa: BLE001 - nunca derruba o worker
+                    self._log.error(
+                        "[TG] erro inesperado no worker error_type=%s",
+                        type(exc).__name__,
+                    )
+                finally:
+                    self._queue.task_done()
+        finally:
+            # Limpeza do engine: UMA vez, na MESMA thread que o construiu.
+            # Só chegamos aqui se a factory teve sucesso (senão já retornamos).
+            if self._engine is not None and self._engine_cleanup is not None:
+                try:
+                    self._engine_cleanup(self._engine)
+                except Exception as exc:  # noqa: BLE001 - nunca propaga
+                    self._log.error(
+                        "[TG] erro no engine_cleanup error_type=%s",
+                        type(exc).__name__,
+                    )
 
     def _handle_message(self, msg: IncomingMessage) -> None:
         # 1) indicador "digitando..." em best-effort (exceção engolida).
@@ -394,7 +415,8 @@ class TelegramChannel(Channel):
             return
 
         response = getattr(result, "response", "") or ""
-        if not response.strip():
+        # Resposta não-string (None/int/objeto) não deve explodir: trata como vazia.
+        if not isinstance(response, str) or not response.strip():
             self._reply(msg.chat_id, NO_RESPONSE_MESSAGE)
             return
         self._send_chunks(msg.chat_id, response)
@@ -406,7 +428,15 @@ class TelegramChannel(Channel):
         if cmd == "start":
             self._reply(chat_id, START_MESSAGE)
         elif cmd == "reset":
-            self._engine.reset_context()  # chamado no worker (mesma thread do engine)
+            try:
+                self._engine.reset_context()  # chamado no worker (mesma thread do engine)
+            except Exception as exc:  # noqa: BLE001
+                self._log.error(
+                    "[TG] falha ao reiniciar o contexto error_type=%s",
+                    type(exc).__name__,
+                )
+                self._reply(chat_id, PROCESS_ERROR_MESSAGE)
+                return
             self._reply(chat_id, RESET_MESSAGE)
         else:
             self._reply(chat_id, UNKNOWN_COMMAND_MESSAGE)
@@ -424,7 +454,7 @@ class TelegramChannel(Channel):
             self._client.send_message(chat_id, text)
         except TelegramAPIError as exc:
             if exc.error_code == 429:
-                wait = min(float(exc.retry_after or 1.0), BACKOFF_MAX_SECONDS)
+                wait = min(float(exc.retry_after or 1.0), SEND_RETRY_MAX_SECONDS)
                 self._sleep(wait)
                 try:
                     self._client.send_message(chat_id, text)  # UMA nova tentativa
@@ -442,11 +472,17 @@ class TelegramChannel(Channel):
         self._send_with_retry(chat_id, text)
 
     def _reply_safe(self, chat_id: int, text: str) -> None:
-        """Como _reply, mas engole qualquer erro (usado no poller)."""
+        """Como _reply, mas UMA tentativa, sem retry e sem sleep (usado pelo poller).
+
+        O poller NUNCA deve dormir por causa do envio (nem travar). Engole
+        qualquer exceção; loga só o tipo.
+        """
         try:
-            self._send_with_retry(chat_id, text)
-        except Exception:  # noqa: BLE001
-            pass
+            self._client.send_message(chat_id, text)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "[TG] falha ao enviar (reply_safe) error_type=%s", type(exc).__name__
+            )
 
     def _typing(self, chat_id: int) -> None:
         """send_chat_action('typing') em best-effort (exceção engolida)."""

@@ -43,6 +43,12 @@ class VoiceConfig:
     skip_empty_text: bool = True
     log_synthesis_errors: bool = True
 
+    # Telegram: envio ocasional de mensagens de voz (sendVoice)
+    telegram_voice_enabled: bool = False          # opt-in: desligado por padrão
+    telegram_voice_probability: float = 0.35      # chance por resposta elegível
+    telegram_voice_min_chars: int = 3             # tamanho mínimo do texto (caracteres)
+    telegram_voice_max_chars: int = 300           # tamanho máximo do texto (caracteres)
+
 
 @dataclass
 class DaviosConfig:

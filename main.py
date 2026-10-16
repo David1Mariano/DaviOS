@@ -29,9 +29,11 @@ from brain.model_manager import ModelManager
 from voice.voice_manager import VoiceManager
 from voice.config import VoiceConfig
 
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    filename=os.path.join(os.path.dirname(__file__), "logs", "conversation.log"),
+    filename=os.path.join(log_dir, "conversation.log"),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("davios.main")

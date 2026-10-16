@@ -20,7 +20,6 @@ from phone_server.phone_server import (
     default_runner,
     TIMEOUT_LOCATION,
     TIMEOUT_DEFAULT,
-    COMMANDS,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,14 +49,11 @@ class FakeRunner:
 
 
 class _TestServer:
-    def __init__(self, handler_class, token="test-token", commands=None, **handler_kwargs):
+    def __init__(self, handler_class, token="test-token", **handler_kwargs):
         # Define a variável de ambiente para o token apenas se fornecido
         if token is not None:
             os.environ["DAVIOS_PHONE_TOKEN"] = token
         self.token = token
-        # Store commands to pass to handler via handler_kwargs
-        if commands is not None:
-            handler_kwargs.setdefault("commands", commands)
         self.server = HTTPServer(
             ("127.0.0.1", 0), lambda *a, **kw: handler_class(*a, **handler_kwargs, **kw)
         )
@@ -673,90 +669,50 @@ def test_contrato_com_phone_client_real(server, fake_runner):
     assert res["vibrated"] is True
 
 
-# ---------------------------------------------------------------------------
-# Teste de reprodução do bug do runner (usando default_runner real)
-# ---------------------------------------------------------------------------
+def test_battery_com_runner_injetado_no_construtor():
+    """Endpoint /battery com runner injetado via construtor, sem tocar atributo de classe compartilhado."""
+    def runner_controlado(cmd, timeout):
+        assert cmd == ["termux-battery-status"]
+        assert isinstance(timeout, int)
+        return 0, json.dumps({"percentage": 75, "status": "CHARGING"}).encode(), b""
 
+    class _ServerComRunner(_TestServer):
+        def __init__(self):
+            super().__init__(PhoneRequestHandler, token="test-token", runner=runner_controlado)
 
-def test_runner_bug_reproducao():
-    """Reproduz o bug: default_runner recebe três argumentos quando chamado via self.runner."""
-    # Vamos criar um servidor sem injetar runner falso, mas com comandos injetáveis
-    # que são inofensivos (usando sys.executable para imprimir JSON).
-    # Se o bug existir, a chamada ao default_runner receberá três argumentos e lançará TypeError.
-    # Vamos capturar essa falha e verificar que a mensagem de erro contém o TypeError esperado.
-
-    # Comandos inofensivos que produzem JSON válido para cada endpoint.
-    # Usamos o mesmo python interpreter para imprimir JSON.
-    import shlex
-
-    def make_print_json_command(json_str):
-        # Retorna uma lista de argumentos que, quando executada, imprime o json_str e sai com código 0.
-        # Usamos: [sys.executable, "-c", f"print({json_str!r})"]
-        return [sys.executable, "-c", f"print({json_str!r})"]
-
-    # Comandos para cada endpoint
-    commands = {
-        "battery": make_print_json_command('{"percentage": 50, "status": "CHARGING"}'),
-        "location": make_print_json_command('{"latitude": -12.34, "longitude": -56.78, "accuracy": 10.0}'),
-        "device": make_print_json_command('Galaxy A30S\n11'),  # note: sem aspas externas porque queremos duas linhas
-        # Para speak e vibrate, os argumentos são montados dinamicamente, então não precisamos aqui.
-    }
-
-    # Criamos um servidor sem injetar runner falso (ou seja, usando default_runner real)
-    # passando os comandos injetáveis via construtor.
-    class _TestServerBug(_TestServer):
-        def __init__(self, token="test-token"):
-            # Não definimos token no ambiente aqui porque o _TestServer já faz isso.
-            # Passamos os comandos injetáveis.
-            super().__init__(PhoneRequestHandler, token=token, commands=commands)
-
-    # Instanciamos o servidor
-    server = _TestServerBug()
+    server = _ServerComRunner()
     try:
-        # Fazemos uma requisição simples a qualquer endpoint, por exemplo /battery
-        status, _, body = _make_request(
+        status, headers, body = _make_request(
             "GET", f"{server.base_url}/battery", token=server.token
         )
-        # Se chegarmos aqui, o bug não ocorreu (ou seja, o runner foi chamado corretamente).
-        # Nesse caso, vamos verificar que a resposta é sucesso.
-        # Mas o objetivo do teste é mostrar que o bug ocorre, então esperamos que a chamada acima
-        # lance uma exceção (que será convertida em um erro HTTP 500 ou algo similar).
-        # No entanto, como estamos usando o default_runner real, ele deve funcionar corretamente
-        # porque os comandos inofensivos devem retornar JSON válido e código 0.
-        # Wait: O bug é que o runner recebe três argumentos. Se o bug existir, o default_runner
-        # receberá três argumentos (self, cmd, timeout) e lançará TypeError porque ele espera dois.
-        # Essa exceção será capturada pelo handler? Atualmente, o handler não tem um catch-all
-        # para exceções inesperadas no _handle_request (vamos adicionar depois). Por enquanto,
-        # a exceção provavelmente subirá e causará uma resposta 500 sem corpo JSON? Vamos ver.
-        # Na verdade, o erro ocorrerá dentro de _handle_battery ao chamar self.runner(...).
-        # Como não há tratamento de exceção lá, a exceção subirá para o servidor HTTP,
-        # que provavelmente retornará uma resposta 500 com mensagem de erro padrão (não JSON).
-        # Vamos verificar que o status é 500 e o corpo não é o JSON esperado de sucesso.
-        # Se o bug NÃO existir (ou seja, depois que corrigirmos), a chamada terá sucesso e
-        # retornaremos 200 com JSON de sucesso.
-        # Este teste deve falhar antes da correção e passar depois.
-        if status == 200:
-            data = json.loads(body)
-            assert data["ok"] is True
-            assert data["level"] == 50
-            assert data["charging"] is True
-        else:
-            # Se não for 200, então o bug ocorreu e recebemos um erro.
-            # Vamos registrar que o teste falhou como esperado antes da correção.
-            # Para o propósito deste teste, vamos apenas afirmar que o status não é 200
-            # e que o corpo contém alguma indicação de erro.
-            assert status != 200
-            # Não fazemos mais asserções porque o formato do erro pode variar.
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json"
+        data = json.loads(body)
+        assert data["ok"] is True
+        assert data["level"] == 75
+        assert data["charging"] is True
     finally:
         server.shutdown()
 
 
-# ---------------------------------------------------------------------------
-# Teste de catch-all para exceções inesperadas (a ser implementado após correção)
-# ---------------------------------------------------------------------------
+def test_runner_levanta_runtime_error_retorna_500_json():
+    """Runner levanta RuntimeError → HTTP 500 com JSON {'ok': False, 'error': 'Erro interno'}."""
+    def runner_que_levanta(cmd, timeout):
+        raise RuntimeError("erro inesperado do runner")
 
+    class _ServerComRunnerErro(_TestServer):
+        def __init__(self):
+            super().__init__(PhoneRequestHandler, token="test-token", runner=runner_que_levanta)
 
-def test_catch_all_excecao_inesperada():
-    """Qualquer exceção inesperada dentro de _handle_request deve resultar em HTTP 500 com JSON {'ok': False, 'error': 'Erro interno'}."""
-    # Este teste será implementado após adicionarmos o catch-all.
-    pass
+    server = _ServerComRunnerErro()
+    try:
+        status, headers, body = _make_request(
+            "GET", f"{server.base_url}/battery", token=server.token
+        )
+        assert status == 500
+        assert headers.get("Content-Type") == "application/json"
+        data = json.loads(body)
+        assert data["ok"] is False
+        assert data["error"] == "Erro interno"
+    finally:
+        server.shutdown()

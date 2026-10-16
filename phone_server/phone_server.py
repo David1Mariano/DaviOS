@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Servidor HTTP simples para expor APIs do Termux:API.
 
 Variáveis de ambiente:
@@ -26,7 +26,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import time
-from typing import Callable, List, Optional, Tuple, Dict
+from typing import Callable, Dict, List, Optional, Tuple
 import hmac  # importado aqui para uso em _check_token
 import logging  # para logging de erros inesperados
 
@@ -98,11 +98,16 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
     # Injetável para testes
     runner: RunnerType = default_runner
 
-    def __init__(self, *args, commands: Optional[Dict[str, List[str]]] = None, runner: Optional[RunnerType] = None, **kwargs):
+    def __init__(self, *args,
+                 commands: Optional[Dict[str, List[str]]] = None,
+                 runner: Optional[RunnerType] = None,
+                 **kwargs):
         # Se commands for None, usa a allowlist padrão
         self.commands = commands if commands is not None else COMMANDS
         # Se runner for None, usa o atributo de classe (que pode ter sido sobrescrito por testes)
         self.runner = runner if runner is not None else type(self).runner
+        # Flag to know if headers have been sent (to avoid double-write on error)
+        self._headers_sent = False
         super().__init__(*args, **kwargs)
 
     # Endpoints permitidos e seus métodos
@@ -137,30 +142,33 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
         self._handle_request("PATCH")
 
     def _handle_request(self, method: str):
+        # Verifica token
+        if not _check_token(self.headers):
+            # Sem token ou token inválido: retorna 401 com corpo vazio
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self._headers_sent = True
+            return
+
+        # Rota e método
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        # Verifica se o caminho é um endpoint conhecido
+        if path not in self._endpoints:
+            self.send_error(404)
+            self._headers_sent = True
+            return
+
+        # Verifica se o método é permitido para esse endpoint
+        if method not in self._endpoints[path]:
+            self.send_error(405)
+            self._headers_sent = True
+            return
+
+        # Agora podemos tratar o método e caminho específicos
         try:
-            # Verifica token
-            if not _check_token(self.headers):
-                # Sem token ou token inválido: retorna 401 com corpo vazio
-                self.send_response(401)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-
-            # Rota e método
-            parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
-
-            # Verifica se o caminho é um endpoint conhecido
-            if path not in self._endpoints:
-                self.send_error(404)
-                return
-
-            # Verifica se o método é permitido para esse endpoint
-            if method not in self._endpoints[path]:
-                self.send_error(405)
-                return
-
-            # Agora podemos tratar o método e caminho específicos
             if method == "GET" and path == "/battery":
                 self._handle_battery()
             elif method == "GET" and path == "/location":
@@ -174,10 +182,14 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             else:
                 # Não deve chegar aqui por causa das verificações acima
                 self.send_error(500)
+                self._headers_sent = True
         except Exception as e:
             # Log apenas o tipo da exceção (sem token nem corpo)
             logging.warning("[PHONE] Erro inesperado em %s: %s", path, type(e).__name__)
-            self._send_json_error("Erro interno")
+            if not self._headers_sent:
+                self._send_json_error("Erro interno", status=500)
+                self._headers_sent = True
+            # Se os cabeçalhos já foram enviados, não tentamos enviar outra resposta
 
     def _handle_battery(self):
         code, stdout, stderr = self.runner(self.commands["battery"], TIMEOUT_DEFAULT)
@@ -302,9 +314,9 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
         status, headers, body = _json_response({"ok": True, **data})
         self._send_response(status, headers, body)
 
-    def _send_json_error(self, msg: str):
-        status, headers, body = _error_response(msg)
-        self._send_response(status, headers, body)
+    def _send_json_error(self, msg: str, status: int = 200):
+        http_status, headers, body = _error_response(msg, status)
+        self._send_response(http_status, headers, body)
 
     def _send_response(
         self, status: int, headers: dict[str, str], body: bytes
@@ -314,6 +326,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+        self._headers_sent = True
 
     def log_message(self, format, *args):
         # Não logar token nem corpo de requisição, apenas método, path, status

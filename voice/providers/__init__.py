@@ -3,18 +3,21 @@
 from voice.providers.base import TTSProvider, TTSProviderInfo
 from voice.providers.piper_provider import PiperProvider
 from voice.providers.sapi5_provider import SAPI5Provider
+from voice.providers.xtts_provider import XTTSProvider
 
 __all__ = [
     "TTSProvider",
     "TTSProviderInfo",
     "PiperProvider",
     "SAPI5Provider",
+    "XTTSProvider",
 ]
 
 # Registry de providers disponíveis
 AVAILABLE_PROVIDERS = {
     "piper": PiperProvider,
     "sapi5": SAPI5Provider,
+    "xtts": XTTSProvider,
 }
 
 

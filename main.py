@@ -5,7 +5,6 @@ import logging
 import os
 import sys
 from dataclasses import asdict
-
 from dotenv import load_dotenv
 
 # UTF-8 de ponta a ponta no Windows: sem isso o console usa codepage
@@ -29,6 +28,7 @@ from brain.providers.local_llama_cpp_provider import (
     LocalLlamaCppProvider,
     LLAMA_CPP_INSTRUCTIONS as LLAMA_STANDALONE_INSTRUCTIONS,
 )
+from brain.providers.online_router import HybridLLMProvider, OnlineRouter
 from config.davios_config import DaviosConfig
 from core.hardware_detector import HardwareDetector
 from core.reasoning import ReasoningEngine
@@ -87,6 +87,15 @@ def build_engine(config: DaviosConfig):
         else:
             print("[BACKEND] Nenhum backend LLM disponivel; usando modo regras.")
             print("[PROVIDER] Para instrucoes de instalacao, veja docs/LLM_SETUP.")
+
+    # Router (AUTO): online primeiro com fallback local.
+    # Respeita offline_mode e network_policy (consistente com OnlineRouter.is_network_allowed).
+    network_allowed = config.router.enabled and not config.offline_mode and config.network_policy != "offline"
+    if network_allowed:
+        provider = HybridLLMProvider(
+            config=config, local_provider=provider, router=OnlineRouter(config=config)
+        )
+        print("[ROUTER] modo auto: online primeiro, fallback local ativo.")
 
     from brain.cognitive_core import CognitiveCore
 
@@ -261,23 +270,24 @@ def main(argv=None):
         print("DaviOS iniciado com recursos reduzidos.")
         if config.debug:
             print(f"[DEBUG] {type(exc).__name__}: {exc}")
+
         try:
-            runtime.shutdown()  # voz ainda nao anexada: nao toca na voz
+            runtime.shutdown()  # Encerra o nucleo apos falha no boot.
         except Exception:
             logger.exception("Falha ao parar o nucleo apos boot com erro")
+
         extras = {}
-        # Modo regras: engine simples TAMBEM criado na thread core — o
-        # console nunca mais toca no engine diretamente.
+
+        # Modo regras: o engine tambem roda na thread do CoreRuntime.
+        # O console nao acessa o engine diretamente.
         runtime = CoreRuntime(lambda: ConversationEngine())
         runtime.start()
 
-    # Inicializa VoiceManager (mesmo padrao de antes: config.voice vem de
-    # config/davios_config.py; VoiceManager espera voice.config.VoiceConfig,
-    # que tem get_provider_config. Converte preservando os campos identicos).
-    # Anexado ao runtime DEPOIS do start de proposito: um boot falho nunca
-    # derruba a voz nem o fallback de regras precisa reconstrui-la.
+    # Inicializa a voz e a conecta ao runtime unificado.
+    # A conversao preserva os campos da configuracao de voz.
     voice_config = VoiceConfig.from_dict(asdict(config.voice))
     voice_manager = VoiceManager(voice_config)
+
     voice_manager.initialize()
     runtime.voice_manager = voice_manager
 

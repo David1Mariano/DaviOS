@@ -1,14 +1,10 @@
-# DaviOS 🧠
->>>>>>> f99f37c60619c406d4bafcdabbd919c04890b0b3
+DaviOS 🧠
+Assistente pessoal de IA local, com memória persistente, personalidade e arquitetura preparada para agentes e ferramentas.
 
-> Assistente pessoal de IA local, com memória persistente, personalidade e arquitetura preparada para agentes e ferramentas.
-
-## 📌 Sobre o projeto
-
-O **DaviOS** é um projeto pessoal de assistente de inteligência artificial desenvolvido em Python.
+📌 Sobre o projeto
+O DaviOS é um projeto pessoal de assistente de inteligência artificial desenvolvido em Python.
 
 A visão do projeto é transformar o DaviOS em um assistente principal capaz de:
-
 - conversar naturalmente;
 - lembrar informações importantes sobre o usuário;
 - compreender contexto;
@@ -18,16 +14,9 @@ A visão do projeto é transformar o DaviOS em um assistente principal capaz de:
 - funcionar sem depender de Wi-Fi durante a execução;
 - auxiliar no desenvolvimento de projetos;
 - futuramente utilizar ferramentas locais de forma controlada.
-
 O projeto está sendo construído em camadas para que o núcleo continue funcionando mesmo quando componentes avançados, como um modelo local, não estejam disponíveis.
-
----
-
-## 🎯 Objetivo
-
+🎯 Objetivo
 A arquitetura futura do DaviOS segue aproximadamente este fluxo:
-
-```text
                     ┌──────────────┐
                     │    Usuário   │
                     └──────┬───────┘
@@ -54,11 +43,7 @@ A arquitetura futura do DaviOS segue aproximadamente este fluxo:
                          │
                          ▼
                  Modelo local/offline
-```
-
 A longo prazo:
-
-```text
 DaviOS
  ├── Conversação
  ├── Memória
@@ -71,15 +56,8 @@ DaviOS
  ├── Terminal controlado
  ├── Testes
  └── Ferramentas autorizadas
-```
-
----
-
-## 🏗️ Arquitetura atual
-
+🏗️ Arquitetura atual
 O projeto é dividido em módulos com responsabilidades específicas.
-
-```text
 DaviOS/
 │
 ├── brain/
@@ -91,7 +69,8 @@ DaviOS/
 │   ├── prompt_builder.py
 │   ├── response_generator.py
 │   └── providers/
-│       └── local_llama_cpp_provider.py
+│       ├── local_llama_cpp_provider.py
+│       └── online_router.py
 │
 ├── core/
 │   ├── hardware_detector.py
@@ -126,30 +105,22 @@ DaviOS/
 ├── main.py
 ├── requirements.txt
 └── README.md
-```
+Responsabilidades principais
+Módulo	Responsabilidade
+brain/	Inteligência, conversação, contexto e integração com modelos
+memory/	Memória persistente e fatos do usuário
+core/	Serviços fundamentais e detecção do ambiente
+personality/	Personalidade e comportamento do DaviOS
+config/	Configurações e perfis de execução
+models/	Modelos locais, separados por perfil de hardware
+tests/	Testes automatizados
+docs/	Documentação técnica
 
-### Responsabilidades principais
 
-| Módulo | Responsabilidade |
-|---|---|
-| `brain/` | Inteligência, conversação, contexto e integração com modelos |
-| `memory/` | Memória persistente e fatos do usuário |
-| `core/` | Serviços fundamentais e detecção do ambiente |
-| `personality/` | Personalidade e comportamento do DaviOS |
-| `config/` | Configurações e perfis de execução |
-| `models/` | Modelos locais, separados por perfil de hardware |
-| `tests/` | Testes automatizados |
-| `docs/` | Documentação técnica |
-
----
-
-## 🧠 Sistema de memória
-
+🧠 Sistema de memória
 A memória do DaviOS utiliza SQLite e trabalha com fatos estruturados.
 
 Um fato pode conter informações como:
-
-```text
 target
 relation
 emotion
@@ -169,11 +140,7 @@ last_accessed_at
 access_count
 evidence
 metadata
-```
-
 Exemplo:
-
-```text
 Usuário:
 "eu não gosto mais de pizza"
 
@@ -183,10 +150,7 @@ relation = dislike
 negation = true
 temporal_context = current
 status = active
-```
-
 O sistema também possui tratamento para:
-
 - repetição de informações;
 - reforço de memórias existentes;
 - contradições;
@@ -196,18 +160,11 @@ O sistema também possui tratamento para:
 - histórico;
 - evidências;
 - prevenção de duplicação de fatos ativos.
-
 A ideia é que o DaviOS não simplesmente acumule frases em um banco de dados. Ele deve construir uma memória estruturada e atualizável.
-
----
-
-## 💬 Conversação
-
-O `ConversationEngine` funciona como a porta de entrada da conversa.
+💬 Conversação
+O ConversationEngine funciona como a porta de entrada da conversa.
 
 Ele diferencia situações como:
-
-```text
 GREETING
 FAREWELL
 COMMAND
@@ -216,13 +173,9 @@ MEMORY_STATEMENT
 GENERAL_QUESTION
 OPINION
 CONVERSATION
-```
-
 O fluxo pode direcionar cada tipo de interação para o componente adequado.
 
 Por exemplo:
-
-```text
 "Meu nome é Davi"
         ↓
 MemoryInterpreter
@@ -230,11 +183,7 @@ MemoryInterpreter
 MemoryManager
         ↓
 Banco de memória
-```
-
 Enquanto:
-
-```text
 "O que é Python?"
         ↓
 ConversationEngine
@@ -244,25 +193,14 @@ CognitiveCore
 LLMProvider
         ↓
 Modelo local
-```
-
----
-
-## 🤖 Modelo de IA local
-
+🤖 Modelo de IA local
 O DaviOS foi projetado para não depender de um único backend.
 
 A interface:
-
-```text
 LLMProvider
-```
-
 permite trocar o mecanismo de inferência sem reescrever o restante do sistema.
 
 A estratégia atual para execução local utiliza:
-
-```text
 DaviOS
    ↓
 LocalLlamaCppProvider
@@ -272,66 +210,38 @@ llama-server.exe
 HTTP 127.0.0.1
    ↓
 modelo GGUF
-```
-
-A comunicação com `127.0.0.1` ocorre localmente na própria máquina e não representa uma dependência de Internet.
-
-### Fallback
-
+A comunicação com 127.0.0.1 ocorre localmente na própria máquina e não representa uma dependência de Internet.
+Fallback
 Quando um modelo local não estiver disponível, o DaviOS deve continuar funcionando através do mecanismo de regras existente.
 
 A ausência do modelo não deve inutilizar o sistema inteiro.
-
----
-
-## 🖥️ Hardware
-
+🖥️ Hardware
 O projeto foi pensado para ser portátil entre máquinas diferentes.
 
 O hardware é detectado dinamicamente e o sistema possui perfis de modelo:
-
-```text
 models/
 ├── light/
 ├── balanced/
 └── performance/
-```
-
 A máquina principal de desenvolvimento possui atualmente:
-
-```text
 CPU: Ryzen 5 5600
 RAM: 16 GB
 GPU: Radeon RX 6600 8 GB
 Sistema: Windows 11 64-bit
-```
-
 Essas características servem como referência de desenvolvimento, mas não devem ser tratadas como requisitos fixos do projeto.
-
----
-
-## 🔌 Offline First
-
+🔌 Offline First
 Uma das metas centrais do DaviOS é:
-
-> **Depois de instalado e configurado, o assistente deve conseguir funcionar sem Wi-Fi e sem assinatura.**
+Depois de instalado e configurado, o assistente deve conseguir funcionar sem Wi-Fi e sem assinatura.
 
 Isso significa separar:
-
-### Instalação
-
+Instalação
 Pode exigir Internet para:
-
 - baixar dependências;
 - baixar o backend;
 - baixar modelos;
 - atualizar componentes.
-
-### Execução
-
+Execução
 Deve poder funcionar localmente:
-
-```text
 Internet OFF
      ↓
 DaviOS
@@ -341,87 +251,44 @@ Memória local
 Modelo local
      ↓
 Resposta
-```
-
 Nenhum componente de conversação deve depender obrigatoriamente de uma API externa.
-
----
-
-## 🧪 Testes
-
+🧪 Testes
 O projeto possui uma suíte automatizada para preservar o comportamento existente durante a evolução.
 
 Execute:
-
-```powershell
 .venv\Scripts\python.exe -m pytest tests -q
-```
-
 Antes de fazer alterações estruturais importantes, os testes devem ser executados.
 
 Novas funcionalidades devem preferencialmente receber testes próprios.
+Princípio
+Evoluir o DaviOS sem quebrar o que já funciona.
 
-### Princípio
-
-> Evoluir o DaviOS sem quebrar o que já funciona.
-
----
-
-## 🚀 Como executar
-
+🚀 Como executar
 Ative o ambiente virtual:
-
-```powershell
 .venv\Scripts\activate
-```
-
 Execute:
-
-```powershell
 python main.py
-```
-
 Caso o modelo local ainda não esteja instalado, o DaviOS deve continuar utilizando o modo de fallback disponível.
-
----
-
-## 🧰 Desenvolvimento
-
+🧰 Desenvolvimento
 Dependências Python são mantidas em:
-
-```text
 requirements.txt
-```
-
 O ambiente virtual recomendado é:
-
-```text
 .venv/
-```
-
 O ambiente virtual não deve ser versionado no Git.
 
 Modelos GGUF também não devem ser enviados para o repositório, devido ao tamanho dos arquivos.
-
----
-
-## 🔐 Princípios de segurança
-
+🔐 Princípios de segurança
 O DaviOS futuramente poderá utilizar ferramentas locais, mas acesso ao sistema operacional deve ser implementado de forma controlada.
 
 A arquitetura deve evitar:
-
 - execução arbitrária de comandos sem autorização;
 - alterações destrutivas sem confirmação;
 - exclusão de arquivos sem controle;
 - acesso desnecessário a dados pessoais;
 - execução silenciosa de ações potencialmente perigosas.
-
 A evolução planejada é utilizar ferramentas explícitas e permissões específicas.
 
 Exemplo:
-
-```text
 DaviOS
    ↓
 Tool Registry
@@ -429,21 +296,12 @@ Tool Registry
 Ferramenta autorizada
    ↓
 Ação
-```
-
 Em vez de:
-
-```text
 IA
  ↓
 terminal irrestrito
-```
-
----
-
-## 🗺️ Roadmap
-
-### Fase 1 • Núcleo
+🗺️ Roadmap
+Fase 1 • Núcleo
 - [x] Estrutura modular
 - [x] Banco SQLite
 - [x] Sistema de memória
@@ -452,13 +310,13 @@ terminal irrestrito
 - [x] Intent classification
 - [x] CognitiveCore
 - [x] PromptBuilder
-- [x] Abstração `LLMProvider`
+- [x] Abstração LLMProvider
 - [x] ModelManager
 - [x] Detecção de hardware
 - [x] Fallback sem modelo
-
-### Fase 2 • Cérebro local
-- [ ] Finalizar `LocalLlamaCppProvider`
+- [x] Roteador híbrido online/offline (OpenAI-compatible, urllib + fallback local)
+Fase 2 • Cérebro local
+- [ ] Finalizar LocalLlamaCppProvider
 - [ ] Instalar backend standalone llama.cpp
 - [ ] Instalar primeiro modelo GGUF
 - [ ] Integrar inferência local
@@ -466,8 +324,7 @@ terminal irrestrito
 - [ ] Testar aceleração GPU quando disponível
 - [ ] Benchmark de velocidade
 - [ ] Ajustar contexto e parâmetros
-
-### Fase 3 • Memória avançada
+Fase 3 • Memória avançada
 - [ ] Embeddings
 - [ ] Busca semântica
 - [ ] RAG
@@ -475,8 +332,7 @@ terminal irrestrito
 - [ ] Memória de longo prazo
 - [ ] Resumo automático de conversas
 - [ ] Gerenciamento de contexto
-
-### Fase 4 • Agente
+Fase 4 • Agente
 - [ ] Tool Registry
 - [ ] Leitura controlada de arquivos
 - [ ] Acesso a projetos
@@ -485,8 +341,7 @@ terminal irrestrito
 - [ ] Terminal com permissões
 - [ ] Planejamento de tarefas
 - [ ] Verificação de resultados
-
-### Fase 5 • Assistente principal
+Fase 5 • Assistente principal
 - [ ] Sessões persistentes
 - [ ] Contexto entre sessões
 - [ ] Personalidade adaptativa
@@ -496,22 +351,11 @@ terminal irrestrito
 - [ ] Monitoramento e logs
 - [ ] Sistema de permissões
 - [ ] Recuperação de erros
-
----
-
-## 📁 Filosofia de desenvolvimento
-
+📁 Filosofia de desenvolvimento
 O DaviOS deve crescer como um sistema modular.
-
-### Evitar
-
-```text
+Evitar
 Uma IA gigante fazendo tudo.
-```
-
-### Preferir
-
-```text
+Preferir
 ┌──────────────────────┐
 │ ConversationEngine   │
 ├──────────────────────┤
@@ -525,18 +369,11 @@ Uma IA gigante fazendo tudo.
 ├──────────────────────┤
 │ Tools                │
 └──────────────────────┘
-```
-
 Cada camada possui uma responsabilidade clara.
 
 Isso facilita testes, manutenção, troca de modelos e evolução do projeto.
-
----
-
-## 📜 Status atual
-
+📜 Status atual
 O DaviOS já possui uma base funcional de:
-
 - memória persistente;
 - interpretação de fatos;
 - atualização de memórias;
@@ -547,73 +384,40 @@ O DaviOS já possui uma base funcional de:
 - detecção de hardware;
 - arquitetura para LLM local;
 - fallback sem modelo;
+- roteador híbrido online/offline (compatível OpenAI, via urllib);
 - suíte de testes automatizados.
-
-O próximo grande marco é conectar o cérebro generativo local ao sistema através do `LocalLlamaCppProvider`.
-
----
-
-## 🔑 Configuracao do token do Telegram (DAVIOS_TELEGRAM_TOKEN)
-
-O canal Telegram requer o token do bot, obtido junto ao [@BotFather](https://t.me/botfather) no Telegram.
-
-### Opcao 1: variavel de ambiente do sistema (PowerShell)
-
-Defina a variavel apenas para a sessao atual:
-
-```powershell
+O próximo grande marco é conectar o cérebro generativo local ao sistema através do LocalLlamaCppProvider.
+🔑 Configuração do token do Telegram (DAVIOS_TELEGRAM_TOKEN)
+O canal Telegram requer o token do bot, obtido junto ao @BotFather no Telegram.
+Opção 1: variável de ambiente do sistema (PowerShell)
+Defina a variável apenas para a sessão atual:
 $env:DAVIOS_TELEGRAM_TOKEN = "SEU_TOKEN_AQUI"
-```
-
-Ou defina de forma persistente (usuario):
-
-```powershell
+Ou defina de forma persistente para o usuário:
 [System.Environment]::SetEnvironmentVariable("DAVIOS_TELEGRAM_TOKEN", "SEU_TOKEN_AQUI", "User")
-```
-
-### Opcao 2: arquivo `.env` (recomendado para uso local)
-
-Crie um arquivo `.env` na raiz do projeto (ao lado de `run_telegram.py`):
-
-```powershell
+Opção 2: arquivo .env (recomendado para uso local)
+Crie um arquivo .env na raiz do projeto, ao lado de run_telegram.py:
 Copy-Item .env.example .env
-```
-
-Edite o arquivo `.env` e substitua o marcador pelo seu token real:
-
-```
+Edite o arquivo .env e substitua o marcador pelo seu token real:
 DAVIOS_TELEGRAM_TOKEN=SEU_TOKEN_DO_BOT_AQUI
-```
-
-O arquivo `.env` ja esta ignorado pelo Git (veja `.gitignore`) e nunca deve ser commitado.
-
-### Prioridade
-
-Se a variavel de ambiente `DAVIOS_TELEGRAM_TOKEN` ja estiver definida, ela tem prioridade sobre o valor do `.env`.
-
-### Validacao (sem iniciar o bot)
-
-Para validar o token sem iniciar o bot:
-
-```powershell
+O arquivo .env deve estar ignorado pelo Git e nunca deve ser commitado.
+Prioridade
+Se a variável de ambiente DAVIOS_TELEGRAM_TOKEN já estiver definida, ela tem prioridade sobre o valor do .env.
+Validação sem iniciar o bot
 python run_telegram.py --check
-```
-
 Nunca compartilhe seu token real nem o cole em chats, issues ou logs.
+🔌 Provedor online (OpenAI-compatible)
+O DaviOS roteia chamadas para provedores compatíveis com OpenAI de forma opt-in e offline-first: sem remote_providers configurados, ou com offline_mode: true ou network_policy: "offline", o assistente continua 100% local.
 
-## 👨‍💻 Desenvolvimento
+O fallback para o modelo Qwen local (GGUF) é sempre garantido no modo auto.
 
-Projeto pessoal desenvolvido por **Davi** com foco em aprendizado, experimentação e construção de um assistente de IA local.
+Veja docs/ROUTER.md para configurar credenciais por variáveis de ambiente, ativar o router e validar contra um provedor real.
+👨‍💻 Desenvolvimento
+Projeto pessoal desenvolvido por Davi com foco em aprendizado, experimentação e construção de um assistente de IA local.
 
 O objetivo não é apenas criar um chatbot.
 
-O objetivo é construir, passo a passo, um **assistente pessoal de IA que realmente consiga trabalhar junto com seu criador**.
-
----
-
-## ⭐ Visão
-
-```text
+O objetivo é construir, passo a passo, um assistente pessoal de IA que realmente consiga trabalhar junto com seu criador.
+⭐ Visão
 Hoje:
 
 Você → DaviOS → memória + regras
@@ -640,4 +444,3 @@ Privado.
 Sem assinatura.
 Independente de Wi-Fi.
 Evoluindo junto com você.
-```

@@ -34,6 +34,23 @@ class VoiceConfig:
     sapi5_rate: int = 0         # -10 a 10
     sapi5_volume: int = 100     # 0 a 100
     
+    # XTTS-v2 (voice cloning)
+    xtts_enabled: bool = False
+    xtts_model_path: str = "models/voice/xtts-v2"
+    xtts_reference_audio: str = "models/voice/references/reference.wav"
+    xtts_language: str = "pt"
+    xtts_speaker_wav: str = ""
+    xtts_temperature: float = 0.7
+    xtts_length_penalty: float = 1.0
+    xtts_repetition_penalty: float = 1.0
+    xtts_top_k: int = 50
+    xtts_top_p: float = 0.85
+    xtts_gpt_cond_len: int = 64
+    xtts_gpt_cond_chunk_len: int = 4
+    xtts_gpt_batch_size: int = 1
+    xtts_low_mem: bool = False
+    xtts_use_cuda: bool = False
+    
     # Timeouts
     synthesis_timeout_seconds: float = 10.0
     playback_timeout_seconds: float = 30.0
@@ -48,6 +65,30 @@ class VoiceConfig:
     telegram_voice_probability: float = 0.35      # chance por resposta elegível
     telegram_voice_min_chars: int = 3             # tamanho mínimo do texto (caracteres)
     telegram_voice_max_chars: int = 300           # tamanho máximo do texto (caracteres)
+
+
+@dataclass
+class RemoteProvider:
+    """Provedor remoto compatível com a API OpenAI (/v1/chat/completions)."""
+
+    name: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: float = 8.0
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    enabled: bool = True
+
+
+@dataclass
+class RouterConfig:
+    """Camada de roteamento entre provedores remotos e o provedor local."""
+
+    enabled: bool = True
+    mode: str = "auto"
+    timeout_seconds: float = 8.0
+    retry_count: int = 2
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass
@@ -118,6 +159,11 @@ class DaviosConfig:
     max_recent_messages: int = 6
     max_history_messages: int = 20
     max_memories_in_prompt: int = 5
+    # Provedores remotos (OpenAI-compatible): de davios.json ou
+    # DAVIOS_PROVIDER_N_* (credenciais em variáveis de ambiente).
+    remote_providers: list[RemoteProvider] = field(default_factory=list)
+    # Roteamento: online primeiro + fallback local.
+    router: RouterConfig = field(default_factory=RouterConfig)
     # Voice/TTS
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     # system_prompt usado quando tools_visible_to_llm=False (padrao). Contem
@@ -179,19 +225,87 @@ class DaviosConfig:
         if env_gpu is not None:
             self.use_gpu = env_gpu == "1"
 
-        # Telefone (servidor Termux Android) — opt-in via ambiente
+
+        # Telefone (servidor Termux Android) | opt-in via ambiente
         env_phone_read = os.environ.get("DAVIOS_PHONE_READ_ENABLED")
         if env_phone_read is not None:
             self.phone_read_enabled = env_phone_read == "1"
+
         env_phone_act = os.environ.get("DAVIOS_PHONE_ACT_ENABLED")
         if env_phone_act is not None:
             self.phone_act_enabled = env_phone_act == "1"
+
         env_phone_base_url = os.environ.get("DAVIOS_PHONE_BASE_URL")
         if env_phone_base_url:
             self.phone_base_url = env_phone_base_url
+
         env_phone_timeout = os.environ.get("DAVIOS_PHONE_TIMEOUT")
         if env_phone_timeout:
             self.phone_timeout = float(env_phone_timeout)
+
+        # Configura modo offline e política de rede via ambiente
+        # ONLINE exige offline_mode=0 e network_policy=auto.
+        env_offline = os.environ.get("DAVIOS_OFFLINE_MODE")
+        if env_offline is not None:
+            self.offline_mode = env_offline == "1"
+
+        env_policy = os.environ.get("DAVIOS_NETWORK_POLICY")
+        if env_policy:
+            self.network_policy = env_policy.lower()
+
+        env_router_enabled = os.environ.get("DAVIOS_ROUTER_ENABLED")
+        if env_router_enabled is not None:
+            self.router.enabled = env_router_enabled == "1"
+
+        env_router_mode = os.environ.get("DAVIOS_ROUTER_MODE")
+        if env_router_mode:
+            self.router.mode = env_router_mode.lower()
+
+        env_router_timeout = os.environ.get("DAVIOS_ROUTER_TIMEOUT")
+        if env_router_timeout:
+            self.router.timeout_seconds = float(env_router_timeout)
+
+        env_router_retry = os.environ.get("DAVIOS_ROUTER_RETRY_COUNT")
+        if env_router_retry:
+            self.router.retry_count = int(env_router_retry)
+
+        env_router_backoff = os.environ.get("DAVIOS_ROUTER_BACKOFF_SECONDS")
+        if env_router_backoff:
+            self.router.retry_backoff_seconds = float(env_router_backoff)
+
+        # Provedores remotos via DAVIOS_PROVIDER_N_
+        # A lista termina quando BASE_URL estiver ausente ou vazia.
+        env_provider_index = 0
+        while True:
+            prefix = "DAVIOS_PROVIDER_" + str(env_provider_index) + "_"
+            base_url = os.environ.get(prefix + "BASE_URL")
+            if not base_url:
+                break
+
+            headers_raw = os.environ.get(prefix + "HEADERS") or ""
+            headers: dict[str, str] = {}
+
+            for item in headers_raw.split(","):
+                if ":" in item:
+                    key, value = item.split(":", 1)
+                    headers[key.strip()] = value.strip()
+
+            self.remote_providers.append(
+                RemoteProvider(
+                    name=os.environ.get(prefix + "NAME")
+                    or "provider_" + str(env_provider_index),
+                    base_url=base_url,
+                    api_key=os.environ.get(prefix + "API_KEY") or "",
+                    model=os.environ.get(prefix + "MODEL") or "",
+                    timeout_seconds=float(
+                        os.environ.get(prefix + "TIMEOUT_SECONDS")
+                        or self.router.timeout_seconds
+                    ),
+                    extra_headers=headers,
+                    enabled=os.environ.get(prefix + "ENABLED") != "0",
+                )
+            )
+            env_provider_index += 1
 
     def profiles_path(self) -> Path:
         return CONFIG_DIR / self.profiles_file

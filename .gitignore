@@ -1,5 +1,6 @@
 # Ambiente virtual
 .venv/
+.venv_xtts/
 
 # Cache do Python
 __pycache__/
@@ -10,6 +11,8 @@ __pycache__/
 
 # Logs
 logs/
+*.log
+_*.log
 
 # Configurações do VS Code
 .vscode/
@@ -17,10 +20,13 @@ logs/
 # Arquivos do sistema
 .DS_Store
 Thumbs.db
-# Modelos locais (GGUF) e caches de inferencia
+
+# Modelos locais (GGUF) e caches de inferência
 models/**/*.gguf
 models/**/*.bin
+models/**/*.pth
 models/**/cache/
+models/voice/xtts-v2/
 *.cache/
 *.part
 *.lock
@@ -29,6 +35,26 @@ bin/
 # Backups do banco
 memory.db.backup*
 
-# Segredos / variáveis de ambiente (token do bot Telegram, etc.)
+# Segredos / variáveis de ambiente (token do bot Telegram etc.)
 .env
 *.env
+
+# Áudio de referência para clonagem de voz (não versionar)
+models/voice/references/
+*.wav
+*.mp3
+*.flac
+
+# Arquivos temporários e de desenvolvimento
+tmp/
+.kilo/
+*.egg-info/
+
+# Scripts de diagnóstico/teste na raiz
+debug_*.py
+run_*.py
+test_*.py
+_smoke.py
+
+# Configuração do agente/extensão
+.kilocode/

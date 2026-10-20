@@ -30,6 +30,23 @@ class VoiceConfig:
     sapi5_rate: int = 0         # -10 a 10
     sapi5_volume: int = 100     # 0 a 100
     
+    # XTTS-v2 (voice cloning)
+    xtts_enabled: bool = False
+    xtts_model_path: str = "models/voice/xtts-v2"
+    xtts_reference_audio: str = "models/voice/references/reference.wav"
+    xtts_language: str = "pt"
+    xtts_speaker_wav: str = ""
+    xtts_temperature: float = 0.7
+    xtts_length_penalty: float = 1.0
+    xtts_repetition_penalty: float = 5.0  # valor default do checkpoint XTTS-v2 (config.json); 1.0 causa super-geracao
+    xtts_top_k: int = 50
+    xtts_top_p: float = 0.85
+    xtts_gpt_cond_len: int = 64
+    xtts_gpt_cond_chunk_len: int = 4
+    xtts_gpt_batch_size: int = 1
+    xtts_low_mem: bool = False
+    xtts_use_cuda: bool = False
+    
     # Timeouts
     synthesis_timeout_seconds: float = 10.0
     playback_timeout_seconds: float = 30.0
@@ -61,6 +78,21 @@ class VoiceConfig:
             "sapi5_voice_name": self.sapi5_voice_name,
             "sapi5_rate": self.sapi5_rate,
             "sapi5_volume": self.sapi5_volume,
+            "xtts_enabled": self.xtts_enabled,
+            "xtts_model_path": self.xtts_model_path,
+            "xtts_reference_audio": self.xtts_reference_audio,
+            "xtts_language": self.xtts_language,
+            "xtts_speaker_wav": self.xtts_speaker_wav,
+            "xtts_temperature": self.xtts_temperature,
+            "xtts_length_penalty": self.xtts_length_penalty,
+            "xtts_repetition_penalty": self.xtts_repetition_penalty,
+            "xtts_top_k": self.xtts_top_k,
+            "xtts_top_p": self.xtts_top_p,
+            "xtts_gpt_cond_len": self.xtts_gpt_cond_len,
+            "xtts_gpt_cond_chunk_len": self.xtts_gpt_cond_chunk_len,
+            "xtts_gpt_batch_size": self.xtts_gpt_batch_size,
+            "xtts_low_mem": self.xtts_low_mem,
+            "xtts_use_cuda": self.xtts_use_cuda,
             "synthesis_timeout_seconds": self.synthesis_timeout_seconds,
             "playback_timeout_seconds": self.playback_timeout_seconds,
             "block_on_playback": self.block_on_playback,
@@ -97,6 +129,25 @@ class VoiceConfig:
                 "voice_name": self.sapi5_voice_name,
                 "rate": self.sapi5_rate,
                 "volume": self.sapi5_volume,
+                "timeout_seconds": self.synthesis_timeout_seconds,
+            }
+        elif provider_name == "xtts":
+            return {
+                "enabled": self.xtts_enabled,
+                "model_path": self.xtts_model_path,
+                "reference_audio": self.xtts_reference_audio,
+                "language": self.xtts_language,
+                "speaker_wav": self.xtts_speaker_wav,
+                "temperature": self.xtts_temperature,
+                "length_penalty": self.xtts_length_penalty,
+                "repetition_penalty": self.xtts_repetition_penalty,
+                "top_k": self.xtts_top_k,
+                "top_p": self.xtts_top_p,
+                "gpt_cond_len": self.xtts_gpt_cond_len,
+                "gpt_cond_chunk_len": self.xtts_gpt_cond_chunk_len,
+                "gpt_batch_size": self.xtts_gpt_batch_size,
+                "low_mem": self.xtts_low_mem,
+                "use_cuda": self.xtts_use_cuda,
                 "timeout_seconds": self.synthesis_timeout_seconds,
             }
         return {}

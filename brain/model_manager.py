@@ -37,6 +37,7 @@ from config.davios_config import CONFIG_DIR, DaviosConfig
 from core.hardware_detector import HardwareDetector, HardwareProfile
 from brain.model_catalog import (
     LEGACY_TIER_MAP,
+    gguf_header_error,
     TIERS as CATALOG_TIERS,
     TIER_LABELS,
     ModelCatalog,
@@ -285,17 +286,32 @@ class ModelManager:
             return {}
 
     def discover_models(self) -> list[LocalModelInfo]:
-        """Varre models/{tier}/*.gguf e extrai metadados."""
+        """Varre models/{tier}/*.gguf (e, se configurado, um diretório externo
+        de modelos) e extrai metadados."""
         models: list[LocalModelInfo] = []
         root = self.config.models_path()
-        if not root.exists():
-            return models
-        for tier in TIERS:
-            tier_dir = root / tier
-            if not tier_dir.is_dir():
-                continue
-            for file in sorted(tier_dir.glob("*.gguf")):
-                models.append(self._info_from_file(file, tier))
+        if root.exists():
+            for tier in TIERS:
+                tier_dir = root / tier
+                if not tier_dir.is_dir():
+                    continue
+                for file in sorted(tier_dir.glob("*.gguf")):
+                    models.append(self._info_from_file(file, tier))
+
+        # Diretório externo de modelos (opcional, nunca padrão obrigatório).
+        # Útil para reutilizar uma instalação existente do DaviOS em outra
+        # pasta sem copiar arquivos grandes. O tier é inferido do nome do
+        # subdiretório pai (ex.: models/balanced/... -> "balanced").
+        external_dir = self.config.external_models_dir
+        if external_dir:
+            ext_root = Path(external_dir)
+            if ext_root.exists():
+                for file in sorted(ext_root.rglob("*.gguf")):
+                    tier = file.parent.name.lower()
+                    if tier not in TIERS:
+                        tier = "balanced"
+                    models.append(self._info_from_file(file, tier))
+
         return models
 
     @staticmethod
@@ -344,6 +360,14 @@ class ModelManager:
         Sin parámetros declarados no hay cómo estimar → se acepta. El archivo
         NUNCA se borra: solo se excluye de la selección y se loguea el aviso.
         """
+        header_error = gguf_header_error(model.path)
+        if header_error:
+            model.invalid_reason = header_error
+            logger.warning(
+                "Modelo %s ignorado: %s", model.name, header_error
+            )
+            return False
+
         expected_mb = self._expected_size_mb(model)
         if expected_mb is None:
             return True
@@ -417,19 +441,9 @@ class ModelManager:
 
         usable = [m for m in candidates if self._is_compatible(m, max_size, hardware)]
         if not usable:
-            invalid = [
-                m.invalid_reason for m in candidates if m.invalid_reason
-            ]
-            if invalid:
-                reason = (
-                    "Modelos encontrados parecen invalidos: "
-                    + "; ".join(sorted(set(invalid)))
-                )
-            else:
-                reason = (
-                    "Modelos encontrados excedem os recursos do perfil "
-                    f"{profile_name}."
-                )
+            reason = self._unusable_reason(
+                candidates, max_size, hardware, profile_name
+            )
             return ModelSelection(
                 profile=profile_name,
                 reason=reason,
@@ -448,21 +462,83 @@ class ModelManager:
             generation=profile.get("generation", {}),
         )
 
+    def _unusable_reason(
+        self,
+        candidates: list[LocalModelInfo],
+        max_size_gb: Optional[float],
+        hardware: HardwareProfile,
+        profile_name: str,
+    ) -> str:
+        """Explica POR QUE nenhum candidato é utilizável.
+
+        Antes a mensagem era só "excedem os recursos", escondendo o motivo
+        real (RAM insuficiente, tamanho acima do teto do perfil, arquivo
+        truncado). Agora cada bloqueio é nomeado, com os números na mesa.
+        """
+        invalid = [m.invalid_reason for m in candidates if m.invalid_reason]
+        blocked: list[str] = []
+        for m in candidates:
+            if m.invalid_reason:
+                continue
+            why = self._incompatibility_reason(m, max_size_gb, hardware)
+            if why:
+                blocked.append(why)
+        parts: list[str] = []
+        if invalid:
+            parts.append(
+                "Modelos encontrados parecen invalidos: "
+                + "; ".join(sorted(set(invalid)))
+            )
+        if blocked:
+            parts.append(
+                "Modelos bloqueados por recursos: "
+                + "; ".join(sorted(set(blocked)))
+            )
+        if not parts:
+            # Nada objetivamente errado com os arquivos: o recorte do perfil
+            # (tier/tamanho) é que não deixou sobrar candidato.
+            parts.append(
+                "Modelos encontrados excedem os recursos do perfil "
+                f"{profile_name}."
+            )
+        return " | ".join(parts)
+
+    def _incompatibility_reason(
+        self,
+        model: LocalModelInfo,
+        max_size_gb: Optional[float],
+        hardware: HardwareProfile,
+    ) -> str:
+        """Por que este modelo está fora? "" = elegível.
+
+        Mantém as MESMAS regras de _is_compatible(), mas explica cada
+        bloqueio — em especial a RAM, que antes ficava invisível na mensagem
+        de seleção (o usuário via só "excedem os recursos").
+        """
+        if not self._file_is_plausible(model):
+            return model.invalid_reason or "archivo corrompido/incompleto"
+        if max_size_gb is not None and model.size_gb > max_size_gb:
+            return (
+                f"{model.name}: {model.size_gb} GB excede o limite de "
+                f"{max_size_gb} GB do perfil"
+            )
+        available = hardware.ram_available_gb
+        # GGUF e mapeado em memoria; exigimos ~1.4x o tamanho em RAM livre
+        required = round(model.size_gb * 1.4, 2)
+        if available is not None and required > available:
+            return (
+                f"{model.name}: precisa de ~{required:.2f} GB livres de RAM "
+                f"(disponivel: {available:.2f} GB)"
+            )
+        return ""
+
     def _is_compatible(
         self,
         model: LocalModelInfo,
         max_size_gb: Optional[float],
         hardware: HardwareProfile,
     ) -> bool:
-        if not self._file_is_plausible(model):
-            return False
-        if max_size_gb is not None and model.size_gb > max_size_gb:
-            return False
-        available = hardware.ram_available_gb
-        # GGUF e mapeado em memoria; exigimos ~1.4x o tamanho em RAM livre
-        if available is not None and model.size_gb * 1.4 > available:
-            return False
-        return True
+        return self._incompatibility_reason(model, max_size_gb, hardware) == ""
 
     def status_summary(self, selection: ModelSelection) -> str:
         """Linha de status para o boot."""

@@ -288,6 +288,62 @@ def normalize_sha256(value: Any, model_id: str = "") -> Optional[str]:
 
 
 # =============================================================================
+# VALIDAÇÃO DE ARQUIVO GGUF
+# =============================================================================
+
+# Assinatura GGUF. Todo arquivo GGUF começa com estes 4 bytes ("GGUF"). Sem
+# esse cabeçalho o arquivo NÃO é um GGUF — pode ser um HTML de erro, um
+# download truncado, ou um modelo salvo em outro formato. Detectar isso cedo
+# evita o sintoma confuso de "modelo não encontrado" para um arquivo que
+# existe de fato.
+GGUF_MAGIC = b"GGUF"
+GGUF_MAGIC_SIZE = len(GGUF_MAGIC)
+
+
+def read_gguf_magic(path: Path) -> Optional[bytes]:
+    """Lê os 4 primeiros bytes do arquivo. None se não puder ler."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(GGUF_MAGIC_SIZE)
+    except OSError:
+        return None
+
+
+def gguf_header_error(path: Path) -> str:
+    """Motivo acionável se `path` NÃO é um GGUF válido. "" se tudo certo.
+
+    A mensagem é escrita para o usuário final: diz o que foi encontrado e o
+    que era esperado, em vez de um genérico "modelo inválido".
+    """
+    try:
+        if not path.is_file():
+            return f"arquivo não encontrado: {path}"
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"arquivo inacessível: {exc}"
+
+    if size == 0:
+        return "arquivo vazio (0 bytes)"
+
+    magic = read_gguf_magic(path)
+    if magic is None:
+        return "não foi possível ler o cabeçalho do arquivo"
+    if magic != GGUF_MAGIC:
+        found = magic.decode("latin-1", errors="replace")
+        return (
+            f"cabeçalho inválido: esperado 'GGUF', encontrado '{found}' "
+            "(o arquivo não é um GGUF — pode estar corrompido ou ter sido "
+            "salvo em outro formato)"
+        )
+    return ""
+
+
+def is_valid_gguf(path: Path) -> bool:
+    """True se `path` existe e tem o cabeçalho GGUF válido."""
+    return gguf_header_error(path) == ""
+
+
+# =============================================================================
 # CATÁLOGO DE MODELOS (camada de dados)
 # =============================================================================
 
@@ -471,14 +527,92 @@ class ModelCatalog:
         Esta é a verificação canônica de "instalado". Um download parcial NÃO
         conta como instalado: o arquivo temporário (.part) fica fora do caminho
         final, e o downloader só renomeia depois de validar o arquivo.
+
+        Além do caminho canônico do catálogo (models/ do projeto), o diretório
+        externo configurado (config.external_models_dir) também conta como
+        instalado: os arquivos podem viver fora do repo (ex.: outra instalação
+        do DaviOS) sem cópia — sem isso, status/downloader mentem enquanto o
+        runtime enxerga o modelo.
         """
-        path = self.model_file_path(model)
+        path = self.installed_file_path(model)
         if not path or not str(path):
             return False
+        return self._file_is_usable(path)
+
+    @staticmethod
+    def _file_is_usable(path: Path) -> bool:
+        """True se `path` existe como arquivo regular, não vazio E é um GGUF.
+
+        A verificação do cabeçalho "GGUF" é o que separa "modelo ausente" de
+        "modelo presente mas inválido". Sem ela, um arquivo corrompido (ou
+        salvo em outro formato) aparece como "não instalado", e o usuário é
+        mandado baixar de novo um arquivo que ele JÁ TEM no disco.
+        """
         try:
-            return path.is_file() and path.stat().st_size > 0
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
         except OSError:
             return False
+        return is_valid_gguf(path)
+
+    def installation_error(self, model: ModelInfo) -> str:
+        """Motivo acionável para um modelo que NÃO está utilizável.
+
+        "" quando o modelo está instalado e válido. Caso contrário, explica o
+        que houve: arquivo ausente, vazio ou com cabeçalho GGUF inválido.
+        """
+        path = self.installed_file_path(model)
+        if not path or not str(path):
+            return "caminho do modelo não definido"
+        canonical = self.model_file_path(model)
+        if canonical and str(canonical):
+            canonical_error = gguf_header_error(canonical)
+            if canonical_error:
+                # O arquivo canônico existe mas é inválido: reporta o motivo
+                # real em vez de "não encontrado".
+                try:
+                    exists = canonical.is_file()
+                except OSError:
+                    exists = False
+                if exists:
+                    return canonical_error
+        error = gguf_header_error(path)
+        if error:
+            return error
+        return ""
+
+    def installed_file_path(self, model: ModelInfo) -> Path:
+        """Caminho REAL em que o .gguf do modelo está no disco.
+
+        Ordem de procura: (1) caminho canônico do catálogo (models/ do
+        projeto); (2) external_models_dir — primeiro em {tier}/{arquivo},
+        depois na raiz e por fim recursivamente, espelhando a mesma
+        flexibilidade da descoberta do ModelManager. Se nada existir,
+        devolve o caminho canônico (inexistente), para que "não instalado"
+        continue apontando para o destino esperado de download.
+        """
+        canonical = self.model_file_path(model)
+        if canonical and str(canonical) and self._file_is_usable(canonical):
+            return canonical
+        name = Path(model.path).name if model.path else ""
+        external_root = getattr(self.config, "external_models_dir", None)
+        if name and external_root:
+            root = Path(external_root)
+            try:
+                if root.is_dir():
+                    for base in (root / (model.tier or ""), root):
+                        candidate = base / name
+                        if self._file_is_usable(candidate):
+                            return candidate
+                    nested = next(
+                        (p for p in root.rglob(name) if self._file_is_usable(p)),
+                        None,
+                    )
+                    if nested is not None:
+                        return nested
+            except OSError:
+                pass
+        return canonical
 
     def get_installed_models(self) -> List[ModelInfo]:
         """Modelos cujo arquivo .gguf existe no disco."""

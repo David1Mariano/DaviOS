@@ -65,6 +65,58 @@ def get_llama_bin_dir(project_root: Optional[Path] = None) -> Path:
     return project_root / "bin" / "llama.cpp"
 
 
+def get_llama_bin_candidates(project_root: Optional[Path] = None) -> list[Path]:
+    """Lista ordenada de diretorios onde o llama.cpp pode JA estar instalado.
+
+    Ordem de preferencia:
+
+    1. ``<raiz do projeto>/bin/llama.cpp`` — a instalacao deste projeto;
+    2. ``<raiz do projeto>/../DaviOS/bin/llama.cpp`` — a instalacao IRMA do
+       DaviOS. O DaviOS e o DaviOS-telegram sao projetos separados que
+       convivem no mesmo disco: o binario costuma ser baixado uma vez na
+       instalacao principal e o projeto telegram nao o repete. Sem esta
+        busca, o provider cairia em "llama-server.exe nao encontrado" mesmo
+       com o binario presente no disco;
+    3. ``<raiz do projeto>/../DaviOS-telegram/bin/llama.cpp`` e demais
+       pastas irmas com prefixo ``DaviOS`` — mesma razao do item 2.
+
+    A lista NAO cria diretorios: apenas aponta caminhos possiveis. A
+    verificacao de existencia fica a cargo de quem chama.
+    """
+    if project_root is None:
+        project_root = Path(__file__).resolve().parent.parent
+    root = Path(project_root).resolve()
+    candidates: list[Path] = [root / "bin" / "llama.cpp"]
+    try:
+        parent = root.parent
+    except (OSError, IndexError):
+        parent = None
+    if parent and parent.is_dir():
+        for sibling in sorted(parent.iterdir()):
+            if not sibling.is_dir() or sibling == root:
+                continue
+            if sibling.name.lower().startswith("davios"):
+                candidates.append(sibling / "bin" / "llama.cpp")
+    return candidates
+
+
+def find_llama_server_exe(project_root: Optional[Path] = None) -> Optional[Path]:
+    """Localiza ``llama-server.exe`` no proprio projeto ou em installacoes irmas.
+
+    Devolve None se em nenhum lugar houver o executavel. Nao consulta o PATH
+    (isso e responsabilidade do provider, que tambem aceita binarios
+    instalados pelo sistema).
+    """
+    for bin_dir in get_llama_bin_candidates(project_root):
+        candidate = bin_dir / "llama-server.exe"
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 class LlamaBinaryDownloader:
     """Baixa e extrai o binario llama.cpp pre-compilado."""
 

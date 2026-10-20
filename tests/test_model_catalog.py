@@ -35,6 +35,7 @@ from brain.model_catalog import (
     resolve_model_path,
     tier_from_legacy,
 )
+from config.davios_config import DaviosConfig
 
 
 @pytest.fixture
@@ -87,7 +88,10 @@ def _touch_model(tmp_path, entry, size=64):
     """Cria o arquivo .gguf correspondente à entrada, dentro de tmp_path."""
     target = tmp_path / entry["path"]
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"\0" * size)
+    if size >= 4:
+        target.write_bytes(b"GGUF" + b"\0" * (size - 4))
+    else:
+        target.write_bytes(b"\0" * size)
     return target
 
 
@@ -341,6 +345,102 @@ class TestInstalledDetection:
         if catalog.model_file_path(model).is_file():
             assert catalog.is_installed("qwen3-4b-q4km") is True
             assert "qwen3-4b-q4km" in [m.id for m in catalog.get_installed_models()]
+
+
+class TestInstalledViaExternalDir:
+    """Modelos no external_models_dir contam como instalados.
+
+    O DaviOS permite manter os .gguf num diretório externo (ex.: outra
+    instalação) apontado pela config, sem copiar para models/ do repo. A
+    detecção de instalado precisa enxergar esse diretório — senão
+    status/downloader reportam "não instalado" enquanto o runtime usa o
+    arquivo.
+    """
+
+    def _catalog_with_external(self, tmp_path, models, external):
+        """Catálogo isolado com config apontando para o diretório externo."""
+        config = DaviosConfig()
+        config.external_models_dir = str(external)
+        path = _write_catalog(tmp_path, models)
+        return ModelCatalog(
+            config=config, catalog_path=str(path), project_root=tmp_path
+        )
+
+    def test_external_tier_dir_marks_installed(self, tmp_path):
+        """Arquivo em {externo}/{tier}/{arquivo} = instalado."""
+        entry = _model_entry("fora-do-repo", "balanced")
+        external = tmp_path / "externo"
+        target = external / "balanced" / entry["filename"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"GGUF" + b"\0" * 60)
+        cat = self._catalog_with_external(tmp_path, [entry], external)
+
+        model = cat.get_model_by_id("fora-do-repo")
+        assert cat.installed_file_path(model) == target
+        assert cat.is_model_installed(model) is True
+        assert cat.is_installed("fora-do-repo") is True
+        assert [m.id for m in cat.get_installed_models()] == ["fora-do-repo"]
+        assert cat.get_known_not_installed_models() == []
+
+    def test_external_flat_dir_marks_installed(self, tmp_path):
+        """Arquivo direto na raiz do externo (sem subpasta de tier) também vale."""
+        entry = _model_entry("flat-externo", "light")
+        external = tmp_path / "externo"
+        external.mkdir()
+        target = external / entry["filename"]
+        target.write_bytes(b"GGUF" + b"\0" * 60)
+        cat = self._catalog_with_external(tmp_path, [entry], external)
+
+        assert cat.is_installed("flat-externo") is True
+
+    def test_external_nested_dir_marks_installed(self, tmp_path):
+        """Subpasta arbitrária dentro do externo: a varredura recursiva
+        espelha a descoberta do ModelManager."""
+        entry = _model_entry("aninhado", "performance")
+        external = tmp_path / "externo"
+        deep = external / "qualquer" / "subpasta"
+        deep.mkdir(parents=True)
+        (deep / entry["filename"]).write_bytes(b"GGUF" + b"\0" * 60)
+        cat = self._catalog_with_external(tmp_path, [entry], external)
+
+        assert cat.is_installed("aninhado") is True
+
+    def test_canonical_path_wins_over_external(self, tmp_path):
+        """Com o arquivo nos dois lugares, o canônico do catálogo é o real."""
+        entry = _model_entry("duplicado", "light")
+        canonical = _touch_model(tmp_path, entry)
+        external = tmp_path / "externo"
+        target = external / "light" / entry["filename"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"GGUF" + b"\0" * 60)
+        cat = self._catalog_with_external(tmp_path, [entry], external)
+
+        model = cat.get_model_by_id("duplicado")
+        assert cat.installed_file_path(model) == canonical.resolve()
+
+    def test_zero_byte_external_file_is_not_installed(self, tmp_path):
+        """Download abortado no externo (0 byte) NÃO conta como instalado."""
+        entry = _model_entry("externo-vazio", "balanced")
+        external = tmp_path / "externo"
+        target = external / "balanced" / entry["filename"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"")
+        cat = self._catalog_with_external(tmp_path, [entry], external)
+
+        assert cat.is_installed("externo-vazio") is False
+
+    def test_missing_everywhere_returns_canonical(self, tmp_path):
+        """Sem arquivo em lugar nenhum: aponta o canônico (destino de download)."""
+        entry = _model_entry("nenhum-lugar", "balanced")
+        external = tmp_path / "externo"
+        external.mkdir()
+        cat = self._catalog_with_external(tmp_path, [entry], external)
+
+        model = cat.get_model_by_id("nenhum-lugar")
+        assert cat.installed_file_path(model) == resolve_model_path(
+            entry["path"], tmp_path
+        )
+        assert cat.is_installed("nenhum-lugar") is False
 
 
 class TestAliasResolution:

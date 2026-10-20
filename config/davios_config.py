@@ -60,6 +60,12 @@ class VoiceConfig:
     skip_empty_text: bool = True
     log_synthesis_errors: bool = True
 
+    # Telegram: envio ocasional de mensagens de voz (sendVoice)
+    telegram_voice_enabled: bool = False          # opt-in: desligado por padrão
+    telegram_voice_probability: float = 0.35      # chance por resposta elegível
+    telegram_voice_min_chars: int = 3             # tamanho mínimo do texto (caracteres)
+    telegram_voice_max_chars: int = 300           # tamanho máximo do texto (caracteres)
+
 
 @dataclass
 class RemoteProvider:
@@ -99,10 +105,39 @@ class DaviosConfig:
     actions_enabled: bool = False
     web_enabled: bool = False
     agent_server_enabled: bool = False
-    # C3: o LLM SABE que ferramentas existem (listagem informativa no prompt).
-    # NÃO significa que ele possa EXECUTÁ-LAS — para isso veja actions_enabled
+    # Telefone (servidor Termux Android) — opt-in, desabilitado por padrão
+    phone_read_enabled: bool = False
+    phone_act_enabled: bool = False
+    phone_base_url: str = ""
+    phone_timeout: float = 10.0
+    # VectorCraft (criação de imagens vetoriais) — opt-in, desabilitado por padrão
+    vectorcraft_enabled: bool = False
+    vectorcraft_cli_path: str = ""
+    vectorcraft_mode: str = "headless"
+    vectorcraft_timeout: float = 60.0
+    vectorcraft_output_dir: str = ""
     # e web_enabled. Nenhum mecanismo de chamada existe nesta etapa.
     tools_visible_to_llm: bool = False
+    # --- Canal Telegram (opt-in, tudo desligado por padrão) ---------------
+    telegram_enabled: bool = False
+    #                           liga/desliga o canal (default False).
+    #                           run_telegram.py recusa iniciar o bot quando
+    #                           False (apenas --check continua permitido).
+    telegram_allowed_user_ids: list[int] = field(default_factory=list)
+    #                           VAZIA = ninguém autorizado (nunca "liberar
+    #                           tudo" por omissão). O token NÃO vive aqui —
+    #                           vem só de os.environ["DAVIOS_TELEGRAM_TOKEN"].
+    telegram_tools_enabled: bool = False
+    #                           ferramentas (ActionManager/WebAccess) DESLIGADAS.
+    owner_user_id: Optional[int] = None
+    # Caminho opcional do llama-server.exe (backend standalone). Quando None,
+    # o provedor resolve os locais padrão (bin/llama.cpp/ e depois o PATH).
+    llama_server_exe: Optional[str] = None
+    # Diretório externo de modelos (opcional). Quando informado, o
+    # ModelManager.discover_models() também varre esse diretório em busca de
+    # arquivos .gguf. Nunca é padrão obrigatório; None desativa a varredura
+    # externa.
+    external_models_dir: Optional[str] = None
     web_timeout_seconds: float = 5.0
     web_max_content_bytes: int = 200_000
     agent_server_host: str = "127.0.0.1"
@@ -122,6 +157,7 @@ class DaviosConfig:
     gpu_layers: int = 0  # 0 = CPU; >0 = offload se o backend suportar
     use_gpu: bool = False
     max_recent_messages: int = 6
+    max_history_messages: int = 20
     max_memories_in_prompt: int = 5
     # Provedores remotos (OpenAI-compatible): de davios.json ou
     # DAVIOS_PROVIDER_N_* (credenciais em variáveis de ambiente).
@@ -189,11 +225,30 @@ class DaviosConfig:
         if env_gpu is not None:
             self.use_gpu = env_gpu == "1"
 
-        # Togglar offline/network_policy via ambiente (sem precisar editar JSON).
-        # Offline-first por definicao: ONLINE exige offline_mode=0 e policy=auto.
+
+        # Telefone (servidor Termux Android) | opt-in via ambiente
+        env_phone_read = os.environ.get("DAVIOS_PHONE_READ_ENABLED")
+        if env_phone_read is not None:
+            self.phone_read_enabled = env_phone_read == "1"
+
+        env_phone_act = os.environ.get("DAVIOS_PHONE_ACT_ENABLED")
+        if env_phone_act is not None:
+            self.phone_act_enabled = env_phone_act == "1"
+
+        env_phone_base_url = os.environ.get("DAVIOS_PHONE_BASE_URL")
+        if env_phone_base_url:
+            self.phone_base_url = env_phone_base_url
+
+        env_phone_timeout = os.environ.get("DAVIOS_PHONE_TIMEOUT")
+        if env_phone_timeout:
+            self.phone_timeout = float(env_phone_timeout)
+
+        # Configura modo offline e política de rede via ambiente
+        # ONLINE exige offline_mode=0 e network_policy=auto.
         env_offline = os.environ.get("DAVIOS_OFFLINE_MODE")
         if env_offline is not None:
             self.offline_mode = env_offline == "1"
+
         env_policy = os.environ.get("DAVIOS_NETWORK_POLICY")
         if env_policy:
             self.network_policy = env_policy.lower()
@@ -201,36 +256,44 @@ class DaviosConfig:
         env_router_enabled = os.environ.get("DAVIOS_ROUTER_ENABLED")
         if env_router_enabled is not None:
             self.router.enabled = env_router_enabled == "1"
+
         env_router_mode = os.environ.get("DAVIOS_ROUTER_MODE")
         if env_router_mode:
             self.router.mode = env_router_mode.lower()
+
         env_router_timeout = os.environ.get("DAVIOS_ROUTER_TIMEOUT")
         if env_router_timeout:
             self.router.timeout_seconds = float(env_router_timeout)
+
         env_router_retry = os.environ.get("DAVIOS_ROUTER_RETRY_COUNT")
         if env_router_retry:
             self.router.retry_count = int(env_router_retry)
+
         env_router_backoff = os.environ.get("DAVIOS_ROUTER_BACKOFF_SECONDS")
         if env_router_backoff:
             self.router.retry_backoff_seconds = float(env_router_backoff)
 
-        # Provedores remotos via DAVIOS_PROVIDER_N_* (index-based, nenhum
-        # provedor hard-coded). base_url vazia para um índice N encerra a lista.
+        # Provedores remotos via DAVIOS_PROVIDER_N_
+        # A lista termina quando BASE_URL estiver ausente ou vazia.
         env_provider_index = 0
         while True:
             prefix = "DAVIOS_PROVIDER_" + str(env_provider_index) + "_"
             base_url = os.environ.get(prefix + "BASE_URL")
             if not base_url:
                 break
+
             headers_raw = os.environ.get(prefix + "HEADERS") or ""
             headers: dict[str, str] = {}
+
             for item in headers_raw.split(","):
                 if ":" in item:
                     key, value = item.split(":", 1)
                     headers[key.strip()] = value.strip()
+
             self.remote_providers.append(
                 RemoteProvider(
-                    name=os.environ.get(prefix + "NAME") or "provider_" + str(env_provider_index),
+                    name=os.environ.get(prefix + "NAME")
+                    or "provider_" + str(env_provider_index),
                     base_url=base_url,
                     api_key=os.environ.get(prefix + "API_KEY") or "",
                     model=os.environ.get(prefix + "MODEL") or "",

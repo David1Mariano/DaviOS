@@ -291,6 +291,7 @@ class Database:
             ("last_accessed_at", "TEXT"),
             ("access_count", "INTEGER DEFAULT 0"),
             ("metadata", "TEXT DEFAULT '{}'"),
+            ("user_id", "INTEGER"),
         ):
             self._ensure_column("memories", column, definition)
 
@@ -310,6 +311,7 @@ class Database:
             ("last_accessed_at", "TEXT"),
             ("access_count", "INTEGER DEFAULT 0"),
             ("metadata", "TEXT DEFAULT '{}'"),
+            ("user_id", "INTEGER"),
         ):
             self._ensure_column("memory_facts", column, definition)
 
@@ -515,7 +517,8 @@ class Database:
                 created_at = COALESCE(created_at, ?),
                 updated_at = COALESCE(updated_at, created_at, ?),
                 access_count = COALESCE(access_count, 0),
-                metadata = COALESCE(metadata, '{}')
+                metadata = COALESCE(metadata, '{}'),
+                user_id = COALESCE(user_id, NULL)
             """,
             (now, now),
         )
@@ -532,7 +535,8 @@ class Database:
                 created_at = COALESCE(created_at, ?),
                 updated_at = COALESCE(updated_at, created_at, ?),
                 access_count = COALESCE(access_count, 0),
-                metadata = COALESCE(metadata, '{}')
+                metadata = COALESCE(metadata, '{}'),
+                user_id = COALESCE(user_id, NULL)
             """,
             (now, now),
         )
@@ -757,6 +761,7 @@ class Database:
             last_accessed_at=row["last_accessed_at"],
             access_count=row["access_count"],
             metadata=self._load(row["metadata"], {}),
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             facts=facts,
         )
 
@@ -769,6 +774,7 @@ class Database:
         fact = MemoryFact(
             id=row["id"],
             memory_id=row["memory_id"],
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             subject=row["subject"] or "user",
             target=row["target"],
             relation=row["relation"],
@@ -824,8 +830,8 @@ class Database:
             INSERT INTO memories (
                 content, memory_type, importance, emotion, emotional_intensity,
                 base_importance, confidence, status, created_at, updated_at,
-                last_accessed_at, access_count, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_accessed_at, access_count, metadata, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.content,
@@ -841,6 +847,7 @@ class Database:
                 memory.last_accessed_at,
                 memory.access_count,
                 self._dump(memory.metadata, "{}"),
+                memory.user_id,
             ),
         )
         memory_id = self.cursor.lastrowid
@@ -853,6 +860,7 @@ class Database:
             fact_evidence = fact.evidence or evidence_items
             self.add_memory_fact(
                 memory_id=memory_id,
+                user_id=fact.user_id or memory.user_id,
                 target=fact.target,
                 relation=fact.relation,
                 emotion=fact.emotion,
@@ -874,18 +882,25 @@ class Database:
             )
         return memory_id
 
-    def get_memory(self, memory_id: int) -> Optional[Memory]:
-        row = self.cursor.execute(
-            "SELECT * FROM memories WHERE id = ?", (memory_id,)
-        ).fetchone()
+    def get_memory(self, memory_id: int, user_id: Optional[int] = None) -> Optional[Memory]:
+        if user_id is not None:
+            row = self.cursor.execute(
+                "SELECT * FROM memories WHERE id = ? AND user_id = ?",
+                (memory_id, user_id),
+            ).fetchone()
+        else:
+            row = self.cursor.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
         if row is None:
             return None
-        return self._memory_from_row(row, facts=self.get_memory_facts(memory_id))
+        return self._memory_from_row(row, facts=self.get_memory_facts(memory_id, user_id=user_id))
 
     def find_recall_candidates(
         self,
         *,
         include_inactive: bool = False,
+        user_id: Optional[int] = None,
     ) -> Iterable[dict[str, Any]]:
         sql = """
             SELECT f.*, m.content AS recall_memory_content,
@@ -894,13 +909,18 @@ class Database:
             FROM memory_facts f
             INNER JOIN memories m ON m.id = f.memory_id
         """
+        conditions = []
+        params: list[Any] = []
         if not include_inactive:
-            sql += """
-                WHERE (m.status IS NULL OR m.status != 'archived')
-                  AND COALESCE(f.status, 'active') IN ('active', 'conflicted')
-            """
+            conditions.append("(m.status IS NULL OR m.status != 'archived')")
+            conditions.append("COALESCE(f.status, 'active') IN ('active', 'conflicted')")
+        if user_id is not None:
+            conditions.append("m.user_id = ?")
+            params.append(user_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY f.created_at ASC, f.id ASC"
-        for row in self.cursor.execute(sql):
+        for row in self.cursor.execute(sql, params):
             yield {
                 "fact": self._fact_from_row(row, include_evidence=False),
                 "memory_id": row["memory_id"],
@@ -908,29 +928,47 @@ class Database:
                 "evidence_count": row["recall_evidence_count"],
             }
 
-    def find_memory(self, memory: Memory | str) -> Optional[Memory]:
+    def find_memory(self, memory: Memory | str, user_id: Optional[int] = None) -> Optional[Memory]:
         content = memory.content if isinstance(memory, Memory) else str(memory)
-        row = self.cursor.execute(
-            "SELECT * FROM memories WHERE content = ? ORDER BY id DESC LIMIT 1",
-            (content,),
-        ).fetchone()
+        if user_id is not None:
+            row = self.cursor.execute(
+                "SELECT * FROM memories WHERE content = ? AND user_id = ? ORDER BY id DESC LIMIT 1",
+                (content, user_id),
+            ).fetchone()
+        else:
+            row = self.cursor.execute(
+                "SELECT * FROM memories WHERE content = ? ORDER BY id DESC LIMIT 1",
+                (content,),
+            ).fetchone()
         if row is None:
             return None
-        return self._memory_from_row(row, facts=self.get_memory_facts(row["id"]))
+        return self._memory_from_row(row, facts=self.get_memory_facts(row["id"], user_id=user_id))
 
-    def find_memories(self, *, include_archived: bool = True) -> list[Memory]:
+    def find_memories(
+        self,
+        *,
+        include_archived: bool = True,
+        user_id: Optional[int] = None,
+    ) -> list[Memory]:
         sql = "SELECT * FROM memories"
+        conditions = []
+        params: list[Any] = []
         if not include_archived:
-            sql += " WHERE status = 'active'"
+            conditions.append("status = 'active'")
+        if user_id is not None:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC, id DESC"
-        rows = self.cursor.execute(sql).fetchall()
+        rows = self.cursor.execute(sql, params).fetchall()
         return [
-            self._memory_from_row(row, facts=self.get_memory_facts(row["id"]))
+            self._memory_from_row(row, facts=self.get_memory_facts(row["id"], user_id=user_id))
             for row in rows
         ]
 
-    def get_memories(self) -> list[Memory]:
-        return self.find_memories()
+    def get_memories(self, user_id: Optional[int] = None) -> list[Memory]:
+        return self.find_memories(user_id=user_id)
 
     @_atomic_write
     def update_memory_content(
@@ -977,6 +1015,7 @@ class Database:
         memory_id: int,
         target: str,
         relation: str,
+        user_id: Optional[int] = None,
         emotion: str = "neutral",
         emotional_intensity: float = 0.0,
         temporal_context: str = "current",
@@ -1038,14 +1077,15 @@ class Database:
         self.cursor.execute(
             """
             INSERT INTO memory_facts (
-                memory_id, target, relation, emotion, emotional_intensity,
+                memory_id, user_id, target, relation, emotion, emotional_intensity,
                 temporal_context, negation, subject, value, confidence,
                 importance, status, source, fact_type, created_at, updated_at,
                 last_accessed_at, access_count, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
+                user_id,
                 target,
                 relation,
                 emotion or "neutral",
@@ -1070,6 +1110,7 @@ class Database:
         fact = fact_object or MemoryFact(
             target=target,
             relation=relation,
+            user_id=user_id,
             emotion=emotion or "neutral",
             emotional_intensity=emotional_intensity or 0.0,
             temporal_context=temporal_context or "unknown",
@@ -1085,6 +1126,7 @@ class Database:
         )
         fact.id = fact_id
         fact.memory_id = memory_id
+        fact.user_id = user_id
         fact.created_at = timestamp
         fact.updated_at = timestamp
         fact.evidence = []
@@ -1108,20 +1150,31 @@ class Database:
         memory_id: int,
         *,
         include_inactive: bool = True,
+        user_id: Optional[int] = None,
     ) -> list[MemoryFact]:
         sql = "SELECT * FROM memory_facts WHERE memory_id = ?"
+        params: list[Any] = [memory_id]
         if not include_inactive:
             sql += " AND status = 'active'"
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         sql += " ORDER BY created_at ASC, id ASC"
         return [
             self._fact_from_row(row)
-            for row in self.cursor.execute(sql, (memory_id,)).fetchall()
+            for row in self.cursor.execute(sql, params).fetchall()
         ]
 
-    def get_fact(self, fact_id: int) -> Optional[MemoryFact]:
-        row = self.cursor.execute(
-            "SELECT * FROM memory_facts WHERE id = ?", (fact_id,)
-        ).fetchone()
+    def get_fact(self, fact_id: int, user_id: Optional[int] = None) -> Optional[MemoryFact]:
+        if user_id is not None:
+            row = self.cursor.execute(
+                "SELECT * FROM memory_facts WHERE id = ? AND user_id = ?",
+                (fact_id, user_id),
+            ).fetchone()
+        else:
+            row = self.cursor.execute(
+                "SELECT * FROM memory_facts WHERE id = ?", (fact_id,)
+            ).fetchone()
         return self._fact_from_row(row) if row is not None else None
 
     def find_facts_by_target(
@@ -1130,11 +1183,15 @@ class Database:
         *,
         include_inactive: bool = True,
         limit: Optional[int] = None,
+        user_id: Optional[int] = None,
     ) -> list[MemoryFact]:
         sql = "SELECT * FROM memory_facts WHERE LOWER(target) = LOWER(?)"
         params: list[Any] = [target]
         if not include_inactive:
             sql += " AND status = 'active'"
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         sql += " ORDER BY created_at DESC, id DESC"
         if limit is not None:
             sql += " LIMIT ?"
@@ -1149,6 +1206,7 @@ class Database:
         target: str,
         *,
         include_archived: bool = True,
+        user_id: Optional[int] = None,
     ) -> list[Memory]:
         sql = """
             SELECT DISTINCT m.id
@@ -1156,14 +1214,17 @@ class Database:
             INNER JOIN memory_facts f ON f.memory_id = m.id
             WHERE LOWER(f.target) = LOWER(?)
         """
+        params: list[Any] = [target]
         if not include_archived:
             sql += " AND m.status = 'active'"
-        ids = [row["id"] for row in self.cursor.execute(sql, (target,)).fetchall()]
-        return [memory for memory_id in ids if (memory := self.get_memory(memory_id))]
+        if user_id is not None:
+            sql += " AND m.user_id = ?"
+            params.append(user_id)
+        ids = [row["id"] for row in self.cursor.execute(sql, params).fetchall()]
+        return [memory for memory_id in ids if (memory := self.get_memory(memory_id, user_id=user_id))]
 
-    def find_memory_by_fact_target(self, target: str) -> Optional[Memory]:
-        memories = self.find_memories_by_target(target)
-        return memories[0] if memories else None
+    def find_memory_by_fact_target(self, target: str, user_id: Optional[int] = None) -> Optional[Memory]:
+        memories = self.find_memories_by_target(target, user_id=user_id)
         return memories[0] if memories else None
 
     def find_memory_by_semantic_key(
@@ -1173,6 +1234,7 @@ class Database:
         relation_family: str,
         *,
         include_inactive: bool = True,
+        user_id: Optional[int] = None,
     ) -> Optional[Memory]:
         """Localiza uma memória baseada na chave semântica.
 
@@ -1184,10 +1246,11 @@ class Database:
             target,
             relation_family,
             include_inactive=include_inactive,
+            user_id=user_id,
         )
         if not facts:
             return None
-        return self.get_memory(facts[0].memory_id)
+        return self.get_memory(facts[0].memory_id, user_id=user_id)
 
     @_atomic_write
     def update_memory_fact(
@@ -1628,6 +1691,7 @@ class Database:
         *,
         include_inactive: bool = False,
         exclude_fact_id: Optional[int] = None,
+        user_id: Optional[int] = None,
     ) -> list[MemoryFact]:
         sql = """
             SELECT * FROM memory_facts
@@ -1639,6 +1703,9 @@ class Database:
         if exclude_fact_id is not None:
             sql += " AND id != ?"
             params.append(exclude_fact_id)
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         facts = [
             self._fact_from_row(row)
             for row in self.cursor.execute(sql, params).fetchall()
@@ -1649,6 +1716,8 @@ class Database:
         self,
         subject: str = "user",
         relation_family: str = "preference",
+        *,
+        user_id: Optional[int] = None,
     ) -> list[MemoryFact]:
         """Busca todos os fatos ativos de uma familia semantica.
 
@@ -1675,6 +1744,9 @@ class Database:
         elif relation_family in {"identity", "working_on", "studies"}:
             sql += " AND LOWER(relation) = LOWER(?)"
             params.append(relation_family)
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         sql += " ORDER BY id ASC"
         return [
             fact

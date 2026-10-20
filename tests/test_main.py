@@ -165,7 +165,7 @@ def _install_boot_fakes(monkeypatch, tmp_path, *, standalone_succeeds: bool) -> 
     class FakeConversationEngine:
         instances: list["FakeConversationEngine"] = []
 
-        def __init__(self, *, cognitive_core, model_manager=None) -> None:
+        def __init__(self, *, cognitive_core, model_manager=None, config=None, tool_router=None) -> None:
             self.cognitive_core = cognitive_core
             # Etapa 6: o boot tambem injeta o ModelManager no engine, para que
             # pedidos de troca de modelo cheguem a switch_active_model().

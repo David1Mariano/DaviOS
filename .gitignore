@@ -12,6 +12,7 @@ __pycache__/
 # Logs
 logs/
 *.log
+_*.log
 
 # Configurações do VS Code
 .vscode/
@@ -20,7 +21,7 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Modelos locais (GGUF) e caches de inferencia
+# Modelos locais (GGUF) e caches de inferência
 models/**/*.gguf
 models/**/*.bin
 models/**/*.pth
@@ -33,6 +34,10 @@ bin/
 
 # Backups do banco
 memory.db.backup*
+
+# Segredos / variáveis de ambiente (token do bot Telegram etc.)
+.env
+*.env
 
 # Áudio de referência para clonagem de voz (não versionar)
 models/voice/references/
@@ -50,7 +55,6 @@ debug_*.py
 run_*.py
 test_*.py
 _smoke.py
-_*.log
 
 # Configuração do agente/extensão
 .kilocode/

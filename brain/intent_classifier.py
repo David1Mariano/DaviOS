@@ -46,6 +46,9 @@ class Intent(str, Enum):
     MODEL_REQUIREMENTS = "model_requirements"
     MODEL_CONFIRM_DOWNLOAD = "model_confirm_download"
     MODEL_CANCEL = "model_cancel"
+    # --- Telefone (servidor Termux Android) ------------------------------
+    PHONE_READ = "phone_read"
+    PHONE_ACT = "phone_act"
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,38 @@ MODEL_CANCEL_MARKERS = (
     "nao", "não", "cancela", "cancelar", "abort", "abortar",
     "parar", "pare", "não quero", "não quero baixar",
     "espera", "wait", "stop", "suspender", "pausa",
+)
+
+# Telefone (servidor Termux Android)
+PHONE_READ_MARKERS = (
+    "bateria", "nivel de bateria", "carga", "carregando",
+    "localizacao", "onde esta o celular", "onde esta o celular",
+    "gps", "informacoes do dispositivo",
+    "modelo do celular", "versao do android",
+    "status do celular", "estado do celular",
+)
+PHONE_ACT_MARKERS = (
+    "vibrar", "vibre", "vibrar o celular", "falar", "diga", "fale",
+    "tts", "texto para fala",
+)
+SPEAK_TEXT_MARKERS = (
+    "diga ", "fale ", "falar ", "dizer ", "disser ",
+)
+import re as _re
+PHONE_NEGATION_RE = _re.compile(
+    r"\b(?:"
+    r"nao\s+(?:saber|conseguir|poder|querer|precisar)|"
+    r"nao\s+tenho\s+celular|"
+    r"nao\s+tenho\s+telefone|"
+    r"sem\s+celular|"
+    r"sem\s+telefone|"
+    r"como\s+faco\s+para|"
+    r"como\s+posso|"
+    r"voce\s+consegue|"
+    r"voce\s+pode|"
+    r"consegue\s+me|"
+    r"posso\s+fazer"
+    r")\b"
 )
 
 # Perguntas sobre modelos específicos
@@ -627,6 +662,11 @@ class IntentClassifier:
             return Intent.MEMORY_QUERY
         if self.is_memory_statement(normalized):
             return Intent.MEMORY_STATEMENT
+        # Telefone: ler ou agir no celular. Antes de GENERAL_QUESTION.
+        if self.is_phone_act_request(text):
+            return Intent.PHONE_ACT
+        if self.is_phone_read_request(text):
+            return Intent.PHONE_READ
         if self.is_general_question(normalized, original=original):
             return Intent.GENERAL_QUESTION
         return Intent.CONVERSATION
@@ -882,6 +922,51 @@ class IntentClassifier:
         if self._matches_any(text, MODEL_CANCEL_MARKERS):
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Telefone (servidor Termux Android)
+    # ------------------------------------------------------------------
+
+    def is_phone_read_request(self, text: str) -> bool:
+        folded = _fold(text)
+        if not self._matches_any(folded, PHONE_READ_MARKERS):
+            return False
+        if PHONE_NEGATION_RE.search(folded):
+            return False
+        return True
+
+    def is_phone_act_request(self, text: str) -> bool:
+        folded = _fold(text)
+        if PHONE_NEGATION_RE.search(folded):
+            return False
+        if self._matches_any(folded, ("vibrar", "vibre", "vibrar o celular", "tts", "texto para fala")):
+            return True
+        for marker in ("falar", "fale", "diga", "dizer", "disser"):
+            if folded.startswith(marker):
+                remainder = folded[len(marker):].strip(" .,!?")
+                if remainder:
+                    return True
+        return False
+
+    def is_phone_speak_request(self, text: str) -> bool:
+        folded = _fold(text)
+        if not self.is_phone_act_request(text):
+            return False
+        for marker in SPEAK_TEXT_MARKERS:
+            if marker in folded:
+                idx = folded.find(marker)
+                remainder = folded[idx + len(marker):].strip(" .,!?")
+                if remainder:
+                    return True
+        return False
+
+    def is_phone_vibrate_request(self, text: str) -> bool:
+        folded = _fold(text)
+        if not self.is_phone_act_request(text):
+            return False
+        if self.is_phone_speak_request(text):
+            return False
+        return any(m in folded for m in ("vibrar", "vibre", "vibrar o celular"))
 
     def is_general_question(self, text: str, original: str = "") -> bool:
         if self._matches_any(text, GENERAL_QUESTION_HINTS):

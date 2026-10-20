@@ -132,7 +132,7 @@ class MemoryManager:
     # Backwards-compatible discovery helpers
     # ------------------------------------------------------------------
 
-    def recall(self, target: Optional[str] = None):
+    def recall(self, target: Optional[str] = None, user_id: Optional[int] = None):
         """Retorna todos os fatos de um alvo ou todas as memórias.
 
         ``recall_relevant`` é a API recomendada quando houver uma consulta a
@@ -140,20 +140,21 @@ class MemoryManager:
         """
 
         if target is not None:
-            return self.database.find_facts_by_target(target)
-        return self.database.find_memories()
+            return self.database.find_facts_by_target(target, user_id=user_id)
+        return self.database.find_memories(user_id=user_id)
 
     def find_memories_for_facts(
         self,
         facts: Iterable[MemoryFact],
         *,
         limit: int = 10,
+        user_id: Optional[int] = None,
     ) -> list[Memory]:
         targets = [self.normalize_fact_target(fact.target) for fact in facts]
         targets = [target for target in targets if target]
         if not targets:
             return []
-        ranked = self.recall_relevant(" ".join(targets), limit=limit)
+        ranked = self.recall_relevant(" ".join(targets), limit=limit, user_id=user_id)
         memories: list[Memory] = []
         seen: set[int] = set()
         for item in ranked:
@@ -163,18 +164,23 @@ class MemoryManager:
                 memories.append(memory)
         return memories
 
-    def find_memory_for_facts(self, facts: Iterable[MemoryFact]) -> Optional[Memory]:
+    def find_memory_for_facts(
+        self,
+        facts: Iterable[MemoryFact],
+        user_id: Optional[int] = None,
+    ) -> Optional[Memory]:
         """Wrapper legado: devolve a melhor memória, não a primeira do banco."""
 
-        memories = self.find_memories_for_facts(facts, limit=1)
+        memories = self.find_memories_for_facts(facts, limit=1, user_id=user_id)
         return memories[0] if memories else None
 
     def match_memory_for_facts(
         self,
         facts: Iterable[MemoryFact],
+        user_id: Optional[int] = None,
     ) -> dict[str, Optional[MemoryFact | Memory]]:
         facts = list(facts)
-        existing_memory = self.find_memory_for_facts(facts)
+        existing_memory = self.find_memory_for_facts(facts, user_id=user_id)
         matching_fact = None
         if existing_memory is not None and facts:
             matching_fact = self._find_matching_fact_in_database(
@@ -362,6 +368,7 @@ class MemoryManager:
         self,
         existing_memory: Optional[Memory],
         new_fact: MemoryFact,
+        user_id: Optional[int] = None,
     ) -> Optional[MemoryFact]:
         if existing_memory is None:
             return None
@@ -373,6 +380,7 @@ class MemoryManager:
             self.normalize_fact_target(new_fact.target),
             new_fact.relation_family,
             include_inactive=False,
+            user_id=user_id,
         )
         return next(
             (
@@ -541,6 +549,7 @@ class MemoryManager:
             for fact, _ in matches:
                 fact_id = self.database.add_memory_fact(
                     memory_id=existing_memory.id,
+                    user_id=fact.user_id or existing_memory.user_id,
                     target=fact.target,
                     relation=fact.relation,
                     emotion=fact.emotion,
@@ -721,6 +730,7 @@ class MemoryManager:
                     fact.target,
                     fact.relation_family,
                     include_inactive=False,
+                    user_id=memory.user_id,
                 )
                 equivalent = next(
                     (candidate for candidate in candidates if self.facts_are_identical(candidate, fact)),
@@ -778,6 +788,7 @@ class MemoryManager:
                 status=memory.status,
                 metadata=memory.metadata,
                 facts=new_facts,
+                user_id=memory.user_id,
             )
             memory_id = self.database.save_memory(
                 record,
@@ -991,6 +1002,7 @@ class MemoryManager:
             fact.relation_family,
             include_inactive=False,
             exclude_fact_id=fact.id,
+            user_id=fact.user_id,
         )
         resolutions = []
         scope = (
@@ -1209,6 +1221,7 @@ class MemoryManager:
         limit: int = 10,
         include_inactive: bool = False,
         now: Optional[datetime | str] = None,
+        user_id: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         """Recupera fatos ranqueados com uma explicação de relevância."""
 
@@ -1231,7 +1244,8 @@ class MemoryManager:
 
         ranked: list[dict[str, Any]] = []
         candidates = self.database.find_recall_candidates(
-            include_inactive=include_inactive
+            include_inactive=include_inactive,
+            user_id=user_id,
         )
         for candidate in candidates:
             fact = candidate["fact"]

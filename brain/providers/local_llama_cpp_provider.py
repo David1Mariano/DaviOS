@@ -27,6 +27,7 @@ from brain.llm_provider import (
     LLMResponse,
     LLMUnavailableError,
 )
+from brain.model_catalog import gguf_header_error
 from brain.model_manager import ModelManager, ModelSelection
 from config.davios_config import DaviosConfig
 
@@ -160,6 +161,22 @@ class LocalLlamaCppProvider(LLMProvider):
             self.diagnostics["[BACKEND]"] = "indisponivel: modelo ausente."
             logger.warning("[LLM] Modelo nao encontrado: %s", model_path)
             return False
+
+        # O arquivo EXISTE, mas pode nao ser um GGUF valido (cabecalho
+        # diferente de "GGUF"): nesse caso o llama-server falharia ao carregar
+        # e o erro real ficaria escondido atras de "modelo nao encontrado".
+        # Reportamos o motivo real.
+        header_error = gguf_header_error(model_path)
+        if header_error:
+            self.diagnostics["[MODEL]"] = (
+                f"{self.selection.model.name}: {header_error} ({model_path})"
+            )
+            self.diagnostics["[BACKEND]"] = "indisponivel: arquivo .gguf invalido."
+            logger.warning(
+                "[LLM] Arquivo de modelo invalido: %s (%s)",
+                model_path, header_error,
+            )
+            return False
         self.diagnostics["[MODEL]"] = (
             f"{self.selection.model.name} ({self.selection.model.size_gb} GB)"
         )
@@ -292,14 +309,41 @@ class LocalLlamaCppProvider(LLMProvider):
         return False
 
     def _find_server_exe(self) -> Optional[Path]:
-        """Localiza llama-server.exe no sistema de arquivos."""
-        from utils.llama_binary_downloader import get_llama_bin_dir
+        """Localiza llama-server.exe no sistema de arquivos.
 
+        Ordem de prioridade:
+        1. caminho explícito em ``config.llama_server_exe`` (se existir);
+        2. ``<raiz do projeto>/bin/llama.cpp/llama-server.exe`` (padrão);
+        3. instalações IRMÃS do DaviOS (``../DaviOS/bin/llama.cpp/...``) — o
+           binário costuma ser baixado uma única vez, na instalação principal,
+           e reaproveitado pelo projeto telegram;
+        4. ``llama-server.exe`` no PATH do sistema.
+        """
+        from utils.llama_binary_downloader import (
+            find_llama_server_exe,
+            get_llama_bin_dir,
+        )
+
+        # 1. Caminho externo explícito via configuração (nunca padrão obrigatório).
+        candidate = getattr(self.config, "llama_server_exe", None)
+        if candidate:
+            path = Path(candidate)
+            if path.exists():
+                return path
+
+        # 2. Local padrão dentro do projeto.
         bin_dir = get_llama_bin_dir()
         server = bin_dir / "llama-server.exe"
         if server.exists():
             return server
 
+        # 3. Instalações irmãs do DaviOS (ex.: ../DaviOS/bin/llama.cpp).
+        sibling = find_llama_server_exe()
+        if sibling is not None:
+            logger.info("[LLM] llama-server.exe encontrado em instalacao irma: %s", sibling)
+            return sibling
+
+        # 4. Executável disponível no PATH do sistema.
         found = shutil.which("llama-server.exe")
         if found:
             return Path(found)

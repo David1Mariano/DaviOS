@@ -67,8 +67,15 @@ class TestHardwareDetector:
 
 
 def _write_gguf(directory, name, size_mb=10):
+    """Cria um .gguf FALSO mas com cabecalho GGUF valido.
+
+    A validacao de cabecalho (4 bytes "GGUF") e feita pelo ModelManager e
+    pelo ModelCatalog: um arquivo sem a assinatura seria rejeitado como
+    invalido, e o teste mediria outra coisa que nao a pretendida.
+    """
     path = os.path.join(directory, name)
     with open(path, "wb") as f:
+        f.write(b"GGUF")
         # Escreve em chunks de 1 MB para evitar MemoryError
         chunk = b"\0" * (1024 * 1024)
         for _ in range(size_mb):
@@ -87,6 +94,8 @@ def models_tree(tmp_path):
 def config_with_models(models_tree):
     config = DaviosConfig.load()
     config.models_dir = str(models_tree)
+    # Isola os testes do diretório externo configurado em davios.json local.
+    config.external_models_dir = None
     config.profile_override = None
     return config
 
@@ -160,6 +169,29 @@ class TestModelManager:
         assert selection.model.quantization == "Q4_K_M"
         assert selection.compatible is True
 
+    def test_discover_models_includes_external_dir(self, tmp_path):
+        """external_models_dir é escaneado recursivamente; tier inferido do
+        subdiretório pai. Não afeta a varredura local padrão."""
+        from config.davios_config import DaviosConfig
+
+        external = tmp_path / "external_models"
+        (external / "balanced").mkdir(parents=True)
+        (external / "light").mkdir(parents=True)
+        _write_gguf(external / "balanced", "Qwen3-4B-Q4_K_M.gguf", size_mb=10)
+        _write_gguf(external / "light", "tiny-Q8_0.gguf", size_mb=5)
+
+        config = DaviosConfig()
+        config.models_dir = str(tmp_path / "local_models")  # vazio
+        config.external_models_dir = str(external)
+
+        models = ModelManager(config).discover_models()
+        names = {m.name for m in models}
+        assert "Qwen3-4B-Q4_K_M" in names
+        assert "tiny-Q8_0" in names
+        by_name = {m.name: m for m in models}
+        assert by_name["Qwen3-4B-Q4_K_M"].tier == "balanced"
+        assert by_name["tiny-Q8_0"].tier == "light"
+
 
 class TestModelSelection:
     def test_select_model_prefers_tier(self, config_with_models, models_tree):
@@ -184,6 +216,31 @@ class TestModelSelection:
         hardware = HardwareProfile(ram_total_gb=8.0, ram_available_gb=1.0, cpu_cores=4)
         selection = ModelManager(config_with_models).select_model(hardware)
         assert selection.model is None
+
+    def test_ram_blocked_reason_is_explicit(self, config_with_models, models_tree):
+        """Mesmo cenario de RAM insuficiente, mas a razao agora nomeia o
+        modelo e a conta de GB (gap anterior: so 'excedem os recursos')."""
+        _write_gguf(models_tree / "balanced", "huge-Q4_K_M.gguf", size_mb=800)
+        hardware = HardwareProfile(ram_total_gb=8.0, ram_available_gb=1.0, cpu_cores=4)
+        selection = ModelManager(config_with_models).select_model(hardware)
+        assert selection.model is None
+        assert "huge-Q4_K_M" in selection.reason
+        assert "livres de RAM" in selection.reason
+        assert "disponivel: 1.00 GB" in selection.reason
+
+    def test_incompatibility_reason_reports_size_cap(self, config_with_models, models_tree):
+        """_incompatibility_reason explica o bloqueio por teto de tamanho do
+        perfil e devolve vazio quando o modelo e elegivel."""
+        _write_gguf(models_tree / "balanced", "mid-Q4_K_M.gguf", size_mb=30)
+        manager = ModelManager(config_with_models)
+        model = manager.discover_models()[0]
+        hardware = HardwareProfile(ram_total_gb=16.0, ram_available_gb=8.0, cpu_cores=8)
+
+        why = manager._incompatibility_reason(model, max_size_gb=0.01, hardware=hardware)
+        assert "excede o limite" in why
+        assert "mid-Q4_K_M" in why
+        # Sem teto e com RAM de sobra: elegivel.
+        assert manager._incompatibility_reason(model, None, hardware) == ""
 
     def test_status_summary_without_model(self, config_with_models):
         hardware = HardwareProfile(ram_total_gb=16.0, cpu_cores=8)

@@ -410,7 +410,7 @@ class FakeProcess:
 def make_gguf(tmp_path, name):
     """Cria um arquivo .gguf falso em disco."""
     path = tmp_path / name
-    path.write_bytes(b"fake gguf")
+    path.write_bytes(b"GGUFfake gguf")
     return path
 
 
@@ -829,3 +829,118 @@ class TestSwitchModel:
         assert results == [True, True]
         assert state["max_active"] == 1  # nunca houve execucao simultanea
         assert all(not thread.is_alive() for thread in threads)
+
+
+class TestFindServerExe:
+    """Resolução do executável llama-server.exe via config e fallback."""
+
+    def test_uses_config_override(self, tmp_path):
+        """llama_server_exe configurado tem prioridade sobre locais padrão."""
+        from config.davios_config import DaviosConfig
+        from brain.providers.local_llama_cpp_provider import LocalLlamaCppProvider
+
+        fake_exe = tmp_path / "bin" / "llama.cpp" / "llama-server.exe"
+        fake_exe.parent.mkdir(parents=True)
+        fake_exe.write_bytes(b"fake-exe")
+
+        config = DaviosConfig()
+        config.llama_server_exe = str(fake_exe)
+
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(config=config)
+
+        assert provider._find_server_exe() == fake_exe
+
+    def test_config_path_inexistente_cai_para_padrao(self, tmp_path, monkeypatch):
+        """Caminho configurado que não existe não quebra: cai para padrão/PATH."""
+        import shutil
+        from config.davios_config import DaviosConfig
+        from brain.providers.local_llama_cpp_provider import LocalLlamaCppProvider
+        import utils.llama_binary_downloader as downloader_mod
+
+        config = DaviosConfig()
+        config.llama_server_exe = str(tmp_path / "nao_existe.exe")
+
+        # Padrão do projeto: aponta para diretório inexistente
+        monkeypatch.setattr(
+            downloader_mod,
+            "get_llama_bin_dir",
+            lambda project_root=None: tmp_path / "bin" / "llama.cpp",
+        )
+        # PATH: sem llama-server.exe
+        monkeypatch.setattr(shutil, "which", lambda *args, **kwargs: None)
+        # Installacoes irmas: nenhuma (o disco da maquina de teste pode ter
+        # uma, e isso nao deve interferir no cenario testado).
+        monkeypatch.setattr(
+            downloader_mod,
+            "find_llama_server_exe",
+            lambda project_root=None: None,
+        )
+
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(config=config)
+
+        assert provider._find_server_exe() is None
+
+    def test_config_none_usa_local_do_projeto(self, tmp_path, monkeypatch):
+        """llama_server_exe=None usa o local padrão dentro do projeto."""
+        import utils.llama_binary_downloader as downloader_mod
+        from config.davios_config import DaviosConfig
+        from brain.providers.local_llama_cpp_provider import LocalLlamaCppProvider
+
+        default_exe = tmp_path / "bin" / "llama.cpp" / "llama-server.exe"
+        default_exe.parent.mkdir(parents=True)
+        default_exe.write_bytes(b"default-exe")
+
+        config = DaviosConfig()  # llama_server_exe = None (default)
+        monkeypatch.setattr(
+            downloader_mod,
+            "get_llama_bin_dir",
+            lambda project_root=None: tmp_path / "bin" / "llama.cpp",
+        )
+        monkeypatch.setattr("shutil.which", lambda *args, **kwargs: None)
+
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(config=config)
+
+        assert provider._find_server_exe() == default_exe
+
+    def test_config_double_sem_atributo_nao_crasha(self, tmp_path, monkeypatch):
+        """Regressao da causa raiz: config SEM ``llama_server_exe`` nao pode
+        levantar AttributeError em ``_find_server_exe`` (matava o boot do bot)."""
+        import types
+
+        import utils.llama_binary_downloader as downloader_mod
+        from config.davios_config import DaviosConfig  # noqa: F401 - garante o import do modulo
+        from brain.providers.local_llama_cpp_provider import LocalLlamaCppProvider
+
+        default_exe = tmp_path / "bin" / "llama.cpp" / "llama-server.exe"
+        default_exe.parent.mkdir(parents=True)
+        default_exe.write_bytes(b"default-exe")
+
+        config = types.SimpleNamespace()  # deliberadamente SEM o atributo
+        monkeypatch.setattr(
+            downloader_mod,
+            "get_llama_bin_dir",
+            lambda project_root=None: tmp_path / "bin" / "llama.cpp",
+        )
+        monkeypatch.setattr("shutil.which", lambda *args, **kwargs: None)
+
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(config=config)
+
+        assert provider._find_server_exe() == default_exe
+
+    def test_config_real_do_projeto_nunca_levanta_attribute_error(self):
+        """Config real (JSON do projeto) carrega o campo e resolve o exe."""
+        from config.davios_config import DaviosConfig
+        from brain.providers.local_llama_cpp_provider import LocalLlamaCppProvider
+
+        config = DaviosConfig.load()
+        assert hasattr(config, "llama_server_exe")
+
+        with patch("brain.providers.local_llama_cpp_provider.ModelManager"):
+            provider = LocalLlamaCppProvider(config=config)
+
+        exe = provider._find_server_exe()  # sem AttributeError
+        assert exe is None or exe.exists()

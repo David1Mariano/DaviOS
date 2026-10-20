@@ -55,16 +55,18 @@ class FakeEngine:
         self.raise_on_process = raise_on_process
         self.long_response = long_response
         self.processed = []           # textos chegados em process()
+        self.processed_sender_ids = []  # sender_ids chegados em process()
         self.reset_count = 0
         self.closed = False
         self.process_thread_ids = set()
         self.init_thread_id = threading.get_ident()
 
-    def process(self, text):
+    def process(self, text, sender_id=None):
         # Toca o SQLite: só funciona na thread que criou a conexão.
         self._conn.execute("INSERT INTO t VALUES (1)")
         self._conn.commit()
         self.processed.append(text)
+        self.processed_sender_ids.append(sender_id)
         self.process_thread_ids.add(threading.get_ident())
         if self.raise_on_process is not None:
             raise self.raise_on_process
@@ -314,6 +316,37 @@ class TestEngineThreadIsolation:
         assert engine.processed == ["oi"]
         assert engine.init_thread_id in engine.process_thread_ids
 
+    def test_sender_id_propagated_to_engine(self, channel_factory):
+        """Verifica que sender_id chega ao engine.process() via _handle_message."""
+        client = FakeClient(script=[[_private(1, 111, 111, "oi")],
+                                    [_private(2, 999, 999, "hello")]])
+        ch = channel_factory(client=client, allowed_user_ids=[111, 999])
+        ch.start()
+        try:
+            assert _wait_for(lambda: ch._test_holder["engine"] is not None
+                            and len(ch._test_holder["engine"].processed_sender_ids) == 2)
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        engine = ch._test_holder["engine"]
+        assert engine.processed == ["oi", "hello"]
+        assert engine.processed_sender_ids == [111, 999]
+
+    def test_unauthorized_sender_not_processed(self, channel_factory):
+        """Sender nao autorizado nao chega ao engine.process()."""
+        client = FakeClient(script=[[_private(1, 99999, 99999, "oi")]])
+        ch = channel_factory(client=client, allowed_user_ids=ALLOWED)
+        ch.start()
+        try:
+            import time
+            time.sleep(0.5)
+        finally:
+            ch.stop()
+            ch.join(2.0)
+        # Engine foi criado mas process() nunca foi chamado com a mensagem nao autorizada
+        for eng in ch._test_engines:
+            assert not eng.processed  # lista vazia
+
     def test_poller_never_touches_engine(self, channel_factory):
         # Muitas mensagens: o poller só enfileira; process() ocorre só no worker.
         ups = [_private(i, 111, 111, "msg%d" % i) for i in range(1, 6)]
@@ -532,11 +565,11 @@ class TestWorkerResilience:
                 super().__init__()
                 self._calls = 0
 
-            def process(self, text):
+            def process(self, text, sender_id=None):
                 self._calls += 1
                 if self._calls == 1:
                     raise RuntimeError("falha interna")
-                return super().process(text)
+                return super().process(text, sender_id=sender_id)
 
         client = FakeClient(
             script=[
@@ -559,7 +592,7 @@ class TestWorkerResilience:
 
     def test_should_exit_does_not_stop_channel(self, channel_factory):
         class ExitEngine(FakeEngine):
-            def process(self, text):
+            def process(self, text, sender_id=None):
                 # toca SQLite e marca should_exit=True
                 self._conn.execute("INSERT INTO t VALUES (1)")
                 self._conn.commit()
@@ -627,9 +660,9 @@ class TestPollerBehavior:
         import time as _time
 
         class SlowEngine(FakeEngine):
-            def process(self, text):
+            def process(self, text, sender_id=None):
                 _time.sleep(0.3)  # segura o worker
-                return super().process(text)
+                return super().process(text, sender_id=sender_id)
 
         # 3 mensagens de uma vez; fila=1 => o poller deve responder "ocupado".
         ups = [
@@ -1186,6 +1219,29 @@ class TestFailLogsReason:
         # não vaza a mensagem interna do erro.
         assert "nao deu para carregar o modelo" not in caplog.text
 
+    def test_fail_reason_exposto_quando_engine_factory_falha(self, channel_factory):
+        """fail_reason expoe o motivo (com o TIPO do erro) ao chamador.
+
+        run_telegram.py le ``channel.fail_reason`` para imprimir o
+        diagnostico em console quando o canal morre (em vez de virar zumbi).
+        """
+        def bad_factory():
+            raise RuntimeError("nao deu para carregar o modelo")
+
+        ch = channel_factory(
+            client=FakeClient(default_updates=[]), engine_factory=bad_factory
+        )
+        ch.start()
+        try:
+            assert _wait_for(lambda: ch.is_failed)
+        finally:
+            ch.join(2.0)
+        assert ch.fail_reason is not None
+        assert ch.fail_reason.startswith("engine_factory falhou")
+        # O TIPO ajuda a diagnosticar; a mensagem interna NAO vaza.
+        assert "RuntimeError" in ch.fail_reason
+        assert "nao deu para carregar o modelo" not in ch.fail_reason
+
 
 class TestUnauthorizedThrottleLimit:
     """Item 5: throttle com teto (256) e relógio injetável (expira em 10 min)."""
@@ -1296,9 +1352,9 @@ class TestReplySafeNeverSleeps:
         import time as _time
 
         class SlowEngine(FakeEngine):
-            def process(self, text):
+            def process(self, text, sender_id=None):
                 _time.sleep(0.3)
-                return super().process(text)
+                return super().process(text, sender_id=sender_id)
 
         ups = [_private(i, 111, 555, "m%d" % i) for i in range(1, 4)]
         client = RaisingSendClient(
@@ -1351,7 +1407,7 @@ class TestResetCommandGuarded:
 class TestNonStringResponse:
     def _result_engine(self, value):
         class _Engine(FakeEngine):
-            def process(self, text):
+            def process(self, text, sender_id=None):
                 self._conn.execute("INSERT INTO t VALUES (1)")
                 self._conn.commit()
                 self.processed.append(text)

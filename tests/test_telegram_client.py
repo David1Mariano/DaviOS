@@ -10,6 +10,8 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import os
+import tempfile
 import urllib.error
 
 import pytest
@@ -111,6 +113,48 @@ class TestTransportWiring:
         assert tr.calls[0]["url"].endswith("/bot%s/sendChatAction" % TOKEN)
         body = json.loads(tr.calls[0]["body"].decode("utf-8"))
         assert body == {"chat_id": 9, "action": "typing"}
+
+
+# --------------------------------------------------------------------------- #
+# Transporte padrão respeita Content-Type recebido
+# --------------------------------------------------------------------------- #
+class TestDefaultTransportContentType:
+    def test_default_transport_uses_given_content_type(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        monkeypatch.setattr(
+            tc.urllib.request, "urlopen", fake_urlopen
+        )
+        client = _client()
+        body = b"--boundary123\r\nexample\r\n"
+        content_type = "multipart/form-data; boundary=boundary123"
+        result = client._default_transport(
+            "https://example.invalid/test",
+            body,
+            7,
+            content_type=content_type,
+        )
+        request = captured["request"]
+        assert request.get_method() == "POST"
+        assert request.get_header("Content-type") == content_type
+        assert request.data == body
+        assert captured["timeout"] == 7
+        assert result == b'{"ok": true}'
 
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +288,96 @@ class TestTokenSecrecy:
         # A URL contém o token; garantir que ela (e o token) não vazaram.
         assert ("bot" + TOKEN) not in caplog.text
 
+
+
+# --------------------------------------------------------------------------- #
+# sendVoice (mensagens de voz)
+# --------------------------------------------------------------------------- #
+class TestSendVoice:
+    def _make_ogg_file(self):
+        fd, path = tempfile.mkstemp(suffix=".ogg")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"fake-ogg-opus-content")
+        return path
+
+    def test_send_voice_url_is_sendvoice(self):
+        tr = _RecordingTransport(b'{"ok": true, "result": {}}')
+        path = self._make_ogg_file()
+        try:
+            _client(tr).send_voice(chat_id=555, voice_path=path)
+        finally:
+            os.unlink(path)
+        call = tr.calls[0]
+        assert call["url"].endswith("/bot%s/sendVoice" % TOKEN)
+        assert TOKEN in call["url"]
+
+    def test_send_voice_multipart_contains_chat_and_voice(self):
+        tr = _RecordingTransport(b'{"ok": true, "result": {}}')
+        path = self._make_ogg_file()
+        try:
+            _client(tr).send_voice(chat_id=777, voice_path=path)
+        finally:
+            os.unlink(path)
+        call = tr.calls[0]
+        body = call["body"].decode("utf-8", errors="replace")
+        boundary = None
+        for line in body.split("\r\n"):
+            if line.startswith("--"):
+                boundary = line[2:]
+                break
+        assert boundary is not None
+        assert boundary in body
+        assert 'name="chat_id"' in body
+        assert "777" in body
+        assert 'name="voice"; filename="voice.ogg"' in body
+        assert "Content-Type: audio/ogg" in body
+        assert b"fake-ogg-opus-content" in call["body"]
+
+    def test_send_voice_boundary_matches_content_type(self, monkeypatch):
+        client = _client()
+        captured = {}
+
+        def fake_call_raw(method, body_bytes, content_type, timeout=None):
+            captured["method"] = method
+            captured["body"] = body_bytes
+            captured["content_type"] = content_type
+            captured["timeout"] = timeout
+            return {}
+
+        monkeypatch.setattr(client, "_call_raw", fake_call_raw)
+        path = self._make_ogg_file()
+        try:
+            client.send_voice(chat_id=777, voice_path=path)
+        finally:
+            os.unlink(path)
+        content_type = captured["content_type"]
+        assert captured["method"] == "sendVoice"
+        assert content_type.startswith("multipart/form-data; boundary=")
+        boundary = content_type.split("boundary=", 1)[1].encode("ascii")
+        body = captured["body"]
+        assert body.startswith(b"--" + boundary + b"\r\n")
+        assert b"\r\n--" + boundary + b"--\r\n" in body
+
+    def test_send_voice_uses_send_timeout(self):
+        tr = _RecordingTransport(b'{"ok": true, "result": {}}')
+        path = self._make_ogg_file()
+        try:
+            _client(tr).send_voice(chat_id=1, voice_path=path)
+        finally:
+            os.unlink(path)
+        assert tr.calls[0]["timeout"] == 30
+
+    def test_send_voice_transport_error_raises_telegramapierror(self):
+        class _FailingTransport:
+            def __call__(self, url, body_bytes, timeout):
+                raise OSError("rede indisponivel")
+
+        path = self._make_ogg_file()
+        try:
+            with pytest.raises(TelegramAPIError):
+                _client(_FailingTransport()).send_voice(chat_id=1, voice_path=path)
+        finally:
+            os.unlink(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -497,6 +631,54 @@ class TestTokenValidation:
             TelegramClient(invalid)
         assert invalid not in str(exc.value)
         assert "unique-marker-xyz" not in str(exc.value)
+
+    def test_token_valido_bot_id_minimo_5_digitos(self):
+        # Limite inferior: bot_id com exatamente 5 dígitos é aceito.
+        client = TelegramClient("12345:" + "A" * 20)
+        assert client._token == "12345:" + "A" * 20
+
+    def test_token_valido_segredo_minimo_20_chars(self):
+        # Limite inferior: segredo com exatamente 20 caracteres é aceito.
+        client = TelegramClient("123456:" + "B" * 20)
+        assert client._token == "123456:" + "B" * 20
+
+    def test_token_valido_com_underline_e_hifen(self):
+        # O segredo pode conter underline e hífen além de alfanuméricos.
+        client = TelegramClient("123456:" + "A_b-C_d-E_f-G_h-I_j-K_l-M_n")
+        assert client._token == "123456:" + "A_b-C_d-E_f-G_h-I_j-K_l-M_n"
+
+    def test_token_invalido_bot_id_4_digitos_rejeitado(self):
+        # Menos de 5 dígitos no bot_id é rejeitado pelo regex.
+        with pytest.raises(ValueError):
+            TelegramClient("1234:" + "A" * 20)
+
+    def test_token_invalido_segredo_19_chars_rejeitado(self):
+        # Menos de 20 caracteres no segredo é rejeitado pelo regex.
+        with pytest.raises(ValueError):
+            TelegramClient("123456:" + "A" * 19)
+
+    def test_token_invalido_bot_id_nao_numerico_rejeitado(self):
+        # bot_id com letras é rejeitado (só [0-9] permitido).
+        with pytest.raises(ValueError):
+            TelegramClient("abcde:" + "A" * 20)
+
+    def test_token_invalido_caractere_ponto_no_segredo_rejeitado(self):
+        # '.' não é permitido no segredo (só [A-Za-z0-9_-]).
+        with pytest.raises(ValueError):
+            TelegramClient("123456:" + "A" * 19 + ".")
+
+    def test_token_invalido_espaco_no_meio_rejeitado(self):
+        # Espaço no meio do token não é tolerado (fullmatch ancorra tudo).
+        with pytest.raises(ValueError):
+            TelegramClient("123456:ABCDEF ghij-KLMNOP_qrst")
+
+    def test_token_com_varios_whitespace_bordas_aceito_apos_strip(self):
+        # strip() remove \r, \n, \r\n, tab e espaços nas bordas.
+        for raw in ["\r\n123456:ABCDEFghij-KLMNOP_qrstuvw01\r\n",
+                    "\t123456:ABCDEFghij-KLMNOP_qrstuvw01\t",
+                    "  \r\n\t 123456:ABCDEFghij-KLMNOP_qrstuvw01  \t\n"]:
+            client = TelegramClient(raw)
+            assert client._token == "123456:ABCDEFghij-KLMNOP_qrstuvw01"
 
 
 # --------------------------------------------------------------------------- #

@@ -245,3 +245,15 @@ class TestTelegramConfigLoadFromJson:
         path = self._write(tmp_path, {"campo_inexistente": 1})
         cfg = DaviosConfig.load(str(path))
         assert not hasattr(cfg, "campo_inexistente")
+
+    def test_load_reads_llama_server_exe(self, tmp_path):
+        # Regressao da causa raiz: a chave "llama_server_exe" existia no JSON,
+        # mas era filtrada porque faltava na dataclass -> AttributeError em
+        # LocalLlamaCppProvider._find_server_exe derrubava o boot do bot.
+        path = self._write(tmp_path, {"llama_server_exe": "C:/x/llama-server.exe"})
+        cfg = DaviosConfig.load(str(path))
+        assert cfg.llama_server_exe == "C:/x/llama-server.exe"
+
+    def test_default_llama_server_exe_e_none(self):
+        cfg = DaviosConfig()
+        assert cfg.llama_server_exe is None

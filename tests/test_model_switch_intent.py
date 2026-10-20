@@ -103,9 +103,9 @@ def _catalog_payload() -> dict:
 
 
 def _write_bytes(path: Path, size: int = 1024) -> None:
-    """Cria o .gguf: arquivo com conteudo (tamanho 0 nao conta como instalado)."""
+    """Cria o .gguf com cabecalho valido (tamanho 0 nao conta como instalado)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\0" * size)
+    path.write_bytes(b"GGUF" + b"\0" * max(0, size - 4))
 
 
 def _hardware(

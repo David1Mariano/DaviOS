@@ -113,10 +113,18 @@ def _catalog_payload() -> dict:
 # --------------------------------------------------------------------- #
 
 def _write_bytes(path: Path, size_bytes: int = 64 * 1024) -> Path:
-    """Cria um arquivo do tamanho pedido, sem alocar tudo em memória."""
+    """Cria um arquivo do tamanho pedido, sem alocar tudo em memória.
+
+    Inclui a assinatura "GGUF" (quando há espaço) para que o arquivo passe
+    na validação de cabeçalho do ModelManager.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as handle:
-        handle.write(b"\0" * size_bytes)
+        if size_bytes >= 4:
+            handle.write(b"GGUF")
+            handle.write(b"\0" * (size_bytes - 4))
+        else:
+            handle.write(b"\0" * size_bytes)
     return path
 
 

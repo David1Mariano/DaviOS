@@ -39,6 +39,12 @@ class VoiceConfig:
     skip_empty_text: bool = True
     log_synthesis_errors: bool = True
 
+    # Telegram: envio ocasional de mensagens de voz (sendVoice)
+    telegram_voice_enabled: bool = False          # opt-in: desligado por padrão
+    telegram_voice_probability: float = 0.35      # chance por resposta elegível
+    telegram_voice_min_chars: int = 3             # tamanho mínimo do texto (caracteres)
+    telegram_voice_max_chars: int = 300           # tamanho máximo do texto (caracteres)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
@@ -60,6 +66,10 @@ class VoiceConfig:
             "block_on_playback": self.block_on_playback,
             "skip_empty_text": self.skip_empty_text,
             "log_synthesis_errors": self.log_synthesis_errors,
+            "telegram_voice_enabled": self.telegram_voice_enabled,
+            "telegram_voice_probability": self.telegram_voice_probability,
+            "telegram_voice_min_chars": self.telegram_voice_min_chars,
+            "telegram_voice_max_chars": self.telegram_voice_max_chars,
         }
 
     @classmethod

@@ -553,6 +553,54 @@ O próximo grande marco é conectar o cérebro generativo local ao sistema atrav
 
 ---
 
+## 🔑 Configuracao do token do Telegram (DAVIOS_TELEGRAM_TOKEN)
+
+O canal Telegram requer o token do bot, obtido junto ao [@BotFather](https://t.me/botfather) no Telegram.
+
+### Opcao 1: variavel de ambiente do sistema (PowerShell)
+
+Defina a variavel apenas para a sessao atual:
+
+```powershell
+$env:DAVIOS_TELEGRAM_TOKEN = "SEU_TOKEN_AQUI"
+```
+
+Ou defina de forma persistente (usuario):
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("DAVIOS_TELEGRAM_TOKEN", "SEU_TOKEN_AQUI", "User")
+```
+
+### Opcao 2: arquivo `.env` (recomendado para uso local)
+
+Crie um arquivo `.env` na raiz do projeto (ao lado de `run_telegram.py`):
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Edite o arquivo `.env` e substitua o marcador pelo seu token real:
+
+```
+DAVIOS_TELEGRAM_TOKEN=SEU_TOKEN_DO_BOT_AQUI
+```
+
+O arquivo `.env` ja esta ignorado pelo Git (veja `.gitignore`) e nunca deve ser commitado.
+
+### Prioridade
+
+Se a variavel de ambiente `DAVIOS_TELEGRAM_TOKEN` ja estiver definida, ela tem prioridade sobre o valor do `.env`.
+
+### Validacao (sem iniciar o bot)
+
+Para validar o token sem iniciar o bot:
+
+```powershell
+python run_telegram.py --check
+```
+
+Nunca compartilhe seu token real nem o cole em chats, issues ou logs.
+
 ## 👨‍💻 Desenvolvimento
 
 Projeto pessoal desenvolvido por **Davi** com foco em aprendizado, experimentação e construção de um assistente de IA local.

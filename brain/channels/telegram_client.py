@@ -97,11 +97,17 @@ class TelegramClient:
         # Contém o token: NUNCA passe para logging.
         return "%s%s/%s" % (API_BASE, self._token, method)
 
-    def _default_transport(self, url: str, body_bytes: bytes, timeout: float) -> bytes:
+    def _default_transport(
+        self,
+        url: str,
+        body_bytes: bytes,
+        timeout: float,
+        content_type: str = "application/json",
+    ) -> bytes:
         request = urllib.request.Request(
             url,
             data=body_bytes,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": content_type},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -226,6 +232,79 @@ class TelegramClient:
     def send_chat_action(self, chat_id: int, action: str = "typing") -> Any:
         payload = {"chat_id": chat_id, "action": action}
         return self._call("sendChatAction", payload, SEND_TIMEOUT_SECONDS)
+
+    def send_voice(self, chat_id: int, voice_path: str, timeout: float = SEND_TIMEOUT_SECONDS) -> Any:
+        """Envia um arquivo de áudio como mensagem de voz (``sendVoice``).
+
+        O Telegram espera ``sendVoice`` via ``multipart/form-data`` com os
+        campos ``chat_id`` e ``voice`` (arquivo). O arquivo deve ser um áudio
+        válido (recomendado OGG Opus). Não exibe o token nem a URL em lugar
+        nenhum — ela só trafega no transporte injetado.
+        """
+        boundary = "----DaviOSVoiceBoundary----"
+        with open(voice_path, "rb") as f:
+            voice_bytes = f.read()
+
+        parts: list[bytes] = [
+            f"--{boundary}\r\n".encode("utf-8"),
+            b'Content-Disposition: form-data; name="chat_id"\r\n\r\n',
+            str(chat_id).encode("utf-8"),
+            b"\r\n",
+            f"--{boundary}\r\n".encode("utf-8"),
+            b'Content-Disposition: form-data; name="voice"; filename="voice.ogg"\r\n',
+            b"Content-Type: audio/ogg\r\n\r\n",
+            voice_bytes,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+        body = b"".join(parts)
+        content_type = "multipart/form-data; boundary=%s" % boundary
+        return self._call_raw("sendVoice", body, content_type, timeout)
+
+    def _call_raw(
+        self,
+        method: str,
+        body_bytes: bytes,
+        content_type: str,
+        timeout: float,
+    ) -> Any:
+        """Chama um método da API com corpo bytes bruto (ex.: multipart).
+        A URL (que contém o token) nunca é registrada; erros vêm redigidos.
+        """
+        url = self._url(method)
+        try:
+            if self._transport is None:
+                raw = self._default_transport(
+                    url, body_bytes, timeout, content_type=content_type
+                )
+            else:
+                raw = self._transport(url, body_bytes, timeout)
+        except urllib.error.HTTPError as exc:
+            error = self._error_from_http(exc)
+            logger.warning(
+                "[TG] %s http_error error_code=%s",
+                method,
+                error.error_code,
+            )
+            raise error from None
+        except urllib.error.URLError as exc:
+            reason = redact(str(exc.reason), self._token)
+            logger.warning(
+                "[TG] %s falha de rede error_type=%s",
+                method,
+                type(exc).__name__,
+            )
+            raise TelegramAPIError(
+                "Falha de rede ao chamar o Telegram: %s" % reason
+            ) from None
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            detail = redact(str(exc), self._token)
+            logger.warning("[TG] %s erro de transporte %s", method, type(exc).__name__)
+            raise TelegramAPIError(
+                "%s: %s" % (type(exc).__name__, detail)
+            ) from None
+        logger.log(logging.INFO, "[TG] %s ok", method)
+        return self._decode(raw)
 
     def get_me(self) -> Any:
         """Valida o token contra ``getMe`` (usado por ``run_telegram --check``).

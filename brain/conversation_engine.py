@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -10,8 +11,10 @@ from memory.memory import Memory
 from memory.memory_interpreter import MemoryInterpreter
 from memory.memory_manager import MemoryManager
 
-from brain.intent_classifier import Intent, IntentClassifier, extract_model_info_query
+from brain.intent_classifier import Intent, IntentClassifier, extract_model_info_query, _fold
 from brain.response_generator import ResponseGenerator
+from brain.tool_execution_flow import ToolExecutionOrchestrator
+from brain.tool_registry import ToolRouter
 
 
 @dataclass
@@ -180,6 +183,8 @@ class ConversationEngine:
         response_generator: Optional[ResponseGenerator] = None,
         cognitive_core=None,
         model_manager=None,
+        config=None,
+        tool_router=None,
     ):
         self.memory_manager = memory_manager or MemoryManager()
         self.reasoning = ReasoningEngine()
@@ -189,7 +194,11 @@ class ConversationEngine:
         # pedido estruturado ao ModelManager, que resolve no catalogo, valida,
         # persiste e coordena o provider — nada de llama.cpp aqui.
         self.model_manager = model_manager
+        self.config = config
         self.classifier = IntentClassifier()
+        self.tool_flow = ToolExecutionOrchestrator(
+            self.config, tool_router=tool_router or ToolRouter(None)
+        )
         self.context = ConversationContext()
         # Garante que o nucleo cognitivo compartilhe o mesmo sistema de
         # memoria: sem isso o CognitiveCore nunca recupera fatos.
@@ -199,7 +208,7 @@ class ConversationEngine:
         ):
             self.cognitive_core.memory_manager = self.memory_manager
 
-    def process(self, user_input: str) -> ConversationResult:
+    def process(self, user_input: str, sender_id=None) -> ConversationResult:
         """Processa uma mensagem do usuario."""
         text = (user_input or "").strip()
         if not text:
@@ -248,6 +257,11 @@ class ConversationEngine:
         ):
             return self._handle_model_query(intent, text)
 
+        # Telefone: roteia para ferramentas registradas (phone_battery,
+        # phone_location, phone_device_info, phone_speak, phone_vibrate).
+        if intent == Intent.PHONE_READ or intent == Intent.PHONE_ACT:
+            return self._handle_phone(text, intent, sender_id=sender_id)
+
         if intent == Intent.COMMAND:
             response = (
                 "Essa funcao ainda nao esta disponible. Por enquanto eu "
@@ -261,7 +275,7 @@ class ConversationEngine:
             )
 
         if intent == Intent.MEMORY_QUERY:
-            return self._handle_question(text)
+            return self._handle_question(text, sender_id=sender_id)
 
         if intent in (
             Intent.GENERAL_QUESTION,
@@ -272,13 +286,13 @@ class ConversationEngine:
             Intent.FILE_REQUEST,
             Intent.TIME_REQUEST,
         ):
-            return self._handle_llm_question(text, intent)
+            return self._handle_llm_question(text, intent, sender_id=sender_id)
 
         if intent == Intent.MEMORY_STATEMENT:
-            return self._handle_statement(text)
+            return self._handle_statement(text, sender_id=sender_id)
 
         # CONVERSATION/UNKNOWN: statement com possiveis fatos ou papo aberto
-        return self._handle_statement(text)
+        return self._handle_statement(text, sender_id=sender_id)
 
     def reset_context(self) -> None:
         self.context = ConversationContext()
@@ -711,11 +725,169 @@ class ConversationEngine:
             r = f'Sobre o {resolved.name} ({rid}): ' + ('instalado' if ii else 'nao instalado') + ', ' + ('ativo' if ia else 'nao ativo') + '.'
         self.context.add_message(text, r, 'model_info')
         return ConversationResult(response=r, intent='model_info', memory_action='model_info', context=self.context.to_dict(), model_info=ModelInfoResult(question=request.question, target=target, resolved_id=rid, resolved=rd, installed=ii, is_active=ia, is_loaded=il, error=None))
-    def _handle_question(self, text: str) -> ConversationResult:
+    # ------------------------------------------------------------------ #
+    # Telefone (servidor Termux Android)
+    # ------------------------------------------------------------------ #
+
+    def _handle_phone(self, text: str, intent: Intent, sender_id=None) -> ConversationResult:
+        tool_name = self._resolve_phone_tool(text, intent)
+        if tool_name is None:
+            response = (
+                "Nao entendi qual operacao de celular voce quer. "
+                "Posso consultar bateria/localizacao/dispositivo ou "
+                "fazer o celular vibrar/falar um texto."
+            )
+            self.context.add_message(text, response, "phone_unknown")
+            return ConversationResult(
+                response=response,
+                intent="phone_unknown",
+                memory_action="none",
+                context=self.context.to_dict(),
+            )
+
+        args = self._extract_phone_args(text, tool_name)
+        if args is None:
+            response = (
+                "Preciso de mais informacoes para executar essa operacao "
+                "no celular."
+            )
+            self.context.add_message(text, response, "phone_needs_args")
+            return ConversationResult(
+                response=response,
+                intent="phone_needs_args",
+                memory_action="none",
+                context=self.context.to_dict(),
+            )
+
+        tool = self.tool_flow.router.find(tool_name)
+        if tool is None:
+            response = (
+                "Nao tenho essa ferramenta de celular registrada. "
+                "Verifique se o DaviOS foi configurado para usar o celular."
+            )
+            self.context.add_message(text, response, "phone_not_registered")
+            return ConversationResult(
+                response=response,
+                intent="phone_not_registered",
+                memory_action="none",
+                context=self.context.to_dict(),
+            )
+
+        allowed, internal_reason = self.tool_flow._category_allowed(tool)
+        if not allowed:
+            response = self._phone_disabled_response(tool_name)
+            self.context.add_message(text, response, "phone_disabled")
+            return ConversationResult(
+                response=response,
+                intent="phone_disabled",
+                memory_action="none",
+                context=self.context.to_dict(),
+            )
+
+        exec_result = self.tool_flow.router.execute(tool_name, args)
+        if not exec_result.success:
+            response = (
+                "Nao consegui executar essa operacao no celular agora. "
+                f"{exec_result.error or ''}".strip()
+            )
+            self.context.add_message(text, response, "phone_error")
+            return ConversationResult(
+                response=response,
+                intent="phone_error",
+                memory_action="none",
+                context=self.context.to_dict(),
+            )
+
+        result = exec_result.output
+        response = self._phone_success_response(tool_name, result)
+        self.context.add_message(text, response, intent.value)
+        return ConversationResult(
+            response=response,
+            intent=intent.value,
+            memory_action="none",
+            context=self.context.to_dict(),
+        )
+
+    def _resolve_phone_tool(self, text: str, intent: Intent) -> Optional[str]:
+        folded = _fold(text)
+        if intent == Intent.PHONE_READ:
+            if any(m in folded for m in ("bateria", "nivel de bateria", "nivel de bateria", "carga")):
+                return "phone_battery"
+            if any(m in folded for m in ("localizacao", "onde esta o celular", "onde esta o celular", "gps")):
+                return "phone_location"
+            if any(m in folded for m in ("informacoes do dispositivo", "informacoes do dispositivo", "modelo do celular", "versao do android", "status do celular", "estado do celular")):
+                return "phone_device_info"
+            return None
+        if intent == Intent.PHONE_ACT:
+            if any(m in folded for m in ("vibrar", "vibre", "vibrar o celular")):
+                return "phone_vibrate"
+            if self.classifier.is_phone_speak_request(text):
+                return "phone_speak"
+            return None
+        return None
+
+    def _extract_phone_args(self, text: str, tool_name: str) -> Optional[dict[str, Any]]:
+        folded = _fold(text)
+        if tool_name == "phone_vibrate":
+            match = re.search(r"(\d+)\s*ms", folded)
+            if match:
+                return {"duration_ms": int(match.group(1))}
+            return {"duration_ms": 200}
+        if tool_name == "phone_speak":
+            for marker in ("diga ", "fale ", "falar ", "dizer ", "disser "):
+                idx = folded.find(marker)
+                if idx != -1:
+                    remainder = folded[idx + len(marker):].strip(" .,!?")
+                    if remainder:
+                        return {"text": remainder}
+            return None
+        return {}
+
+    def _phone_disabled_response(self, tool_name: str) -> str:
+        if tool_name in ("phone_battery", "phone_location", "phone_device_info"):
+            return (
+                "Consulta de celular esta desabilitada. "
+                "Ative a leitura de celular nas configuracoes para consultar "
+                "bateria, localizacao ou informacoes do dispositivo."
+            )
+        if tool_name in ("phone_speak", "phone_vibrate"):
+            return (
+                "Acao de celular esta desabilitada. "
+                "Ative a acao de celular nas configuracoes para fazer o "
+                "celular vibrar ou falar."
+            )
+        return "Operacao de celular nao autorizada."
+
+    def _phone_success_response(self, tool_name: str, result: dict[str, Any]) -> str:
+        if not result.get("ok", False):
+            error = result.get("error", "Erro desconhecido.")
+            return f"Nao consegui executar essa operacao no celular: {error}"
+        if tool_name == "phone_battery":
+            level = result.get("level", 0)
+            charging = result.get("charging", False)
+            status = "carregando" if charging else "nao esta carregando"
+            return f"A bateria esta em {level}% e {status}."
+        if tool_name == "phone_location":
+            lat = result.get("lat", 0)
+            lon = result.get("lon", 0)
+            acc = result.get("accuracy", 0)
+            return f"Localizacao: latitude {lat}, longitude {lon} (precisao de {acc} metros)."
+        if tool_name == "phone_device_info":
+            model = result.get("model", "desconhecido")
+            android = result.get("android_version", "desconhecida")
+            return f"Dispositivo: {model}, Android {android}."
+        if tool_name == "phone_speak":
+            return "O celular falou o texto solicitado."
+        if tool_name == "phone_vibrate":
+            return "O celular vibrou."
+        return "Operacao concluida com sucesso."
+
+    def _handle_question(self, text: str, sender_id=None) -> ConversationResult:
         if self.cognitive_core is not None and self._llm_ready():
             try:
                 outcome = self.cognitive_core.generate_response(
-                    text, context=self.context, intent=Intent.MEMORY_QUERY
+                    text, context=self.context, intent=Intent.MEMORY_QUERY,
+                    sender_id=sender_id,
                 )
                 response = self._apply_style(outcome["text"])
                 self.context.add_message(text, response, "question")
@@ -735,7 +907,7 @@ class ConversationEngine:
                     type(exc).__name__,
                 )
         response, memories_used = self.response_generator.answer_question(
-            text, self.memory_manager, self.context
+            text, self.memory_manager, self.context, user_id=sender_id
         )
         self.context.add_message(text, response, "question")
         return ConversationResult(
@@ -746,12 +918,13 @@ class ConversationEngine:
             context=self.context.to_dict(),
         )
 
-    def _handle_llm_question(self, text: str, intent: Intent) -> ConversationResult:
+    def _handle_llm_question(self, text: str, intent: Intent, sender_id=None) -> ConversationResult:
         """Perguntas abertas/opiniao: LLM quando disponivel, regras caso contrario."""
         if self.cognitive_core is not None and self._llm_ready():
             try:
                 outcome = self.cognitive_core.generate_response(
-                    text, context=self.context, intent=intent
+                    text, context=self.context, intent=intent,
+                    sender_id=sender_id,
                 )
                 response = self._apply_style(outcome["text"])
                 memories_used = outcome.get("memories_used", [])
@@ -794,7 +967,7 @@ class ConversationEngine:
                 memory_action="llm_unavailable",
                 context=self.context.to_dict(),
             )
-        return self._handle_question(text)
+        return self._handle_question(text, sender_id=sender_id)
 
     def _llm_ready(self) -> bool:
         try:
@@ -823,7 +996,7 @@ class ConversationEngine:
             pass
 
 
-    def _handle_statement(self, text: str) -> ConversationResult:
+    def _handle_statement(self, text: str, sender_id=None) -> ConversationResult:
         intent = self.classifier.classify(text, context=self.context)
         context = self.memory_manager.context_analyzer.analyze(text)
         emotions = self._build_emotions(context)
@@ -834,7 +1007,8 @@ class ConversationEngine:
             if self.cognitive_core is not None and self._llm_ready():
                 try:
                     outcome = self.cognitive_core.generate_response(
-                        text, context=self.context, intent=intent
+                        text, context=self.context, intent=intent,
+                        sender_id=sender_id,
                     )
                     response = self._apply_style(outcome["text"])
                     self.context.add_message(text, response, intent.value)
@@ -865,9 +1039,10 @@ class ConversationEngine:
             emotion="neutral",
             emotional_intensity=0.0,
             facts=interpretation["facts"],
+            user_id=sender_id,
         )
 
-        match = self.memory_manager.match_memory_for_facts(memory.facts)
+        match = self.memory_manager.match_memory_for_facts(memory.facts, user_id=sender_id)
         decision = self.reasoning.evaluate_input(
             user_input=text,
             memory_context=context,
@@ -893,6 +1068,7 @@ class ConversationEngine:
                     context=self.context,
                     intent=decision.intent,
                     new_facts=memory.facts,
+                    sender_id=sender_id,
                 )
                 response = self._apply_style(outcome["text"])
                 self.context.add_message(text, response, decision.intent)

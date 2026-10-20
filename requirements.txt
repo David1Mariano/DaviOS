@@ -1,6 +1,7 @@
 # Dependências principais do DaviOS
 # (instalar: .\.venv\Scripts\pip.exe install -r requirements.txt)
 psutil>=5.9            # RAM total/disponivel na deteccao de hardware
+python-dotenv>=1.0.0   # Carrega variaveis de ambiente de arquivo .env (credenciais locais)
 
 # ---- OPCIONAL: cerebro local (LLM offline) --------------------------
 # O DaviOS funciona sem estes itens (modo regras).

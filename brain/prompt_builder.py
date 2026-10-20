@@ -113,6 +113,7 @@ class PromptBuilder:
         new_facts: Optional[list[Any]] = None,
         style_profile: Optional[Any] = None,
         tools_registry: Optional[ToolRegistry] = None,
+        personality: Optional[Personality] = None,
     ) -> BuiltPrompt:
         """Monta o prompt final com memórias relevantes e histórico recente.
 
@@ -174,6 +175,9 @@ class PromptBuilder:
 
         prompt = "\n\n".join(sections)
 
+        # Usa a personalidade fornecida na chamada (se houver) ou a default
+        selected_personality = personality or self.personality
+
         metadata: dict[str, Any] = {
             "intent": intent,
             "memories_count": len(memories or []),
@@ -187,12 +191,12 @@ class PromptBuilder:
             metadata["tools_count"] = len(tools_registry.list_tools())
 
         return BuiltPrompt(
-            system=self._system_text(style_text),
+            system=self._system_text(style_text, selected_personality),
             prompt=prompt,
             metadata=metadata,
         )
 
-    def _system_text(self, style_text: str = "") -> str:
+    def _system_text(self, style_text: str = "", personality: Optional[Personality] = None) -> str:
         # system_prompt condicional: quando tools_visible_to_llm=True, usa
         # a versão SEM a frase de negação de capacidades (que conflitaria
         # com a seção de ferramentas). Com a flag off, usa o system_prompt
@@ -204,9 +208,10 @@ class PromptBuilder:
         else:
             config_system = (self.config.system_prompt or "").strip()
 
+        active_personality = personality or self.personality
         parts = [
             config_system,
-            self.personality.to_system_text(),
+            active_personality.to_system_text(),
             (style_text or "").strip(),
         ]
 

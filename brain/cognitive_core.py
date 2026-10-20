@@ -23,7 +23,7 @@ from brain.tool_execution_flow import ToolExecutionOrchestrator
 from brain.tool_registry import ToolRouter
 from brain.tool_request_parser import sanitize_response_text
 from config.davios_config import DaviosConfig
-from personality.personality import DEFAULT_PERSONALITY
+from personality.personality import DEFAULT_PERSONALITY, OWNER_PERSONALITY
 
 logger = logging.getLogger("davios.cognitive")
 
@@ -73,6 +73,7 @@ class CognitiveCore:
         context=None,
         intent: Optional[Intent] = None,
         new_facts: Optional[list[Any]] = None,
+        sender_id: Optional[int] = None,
     ) -> dict[str, Any]:
         """Produz resposta via LLM. Lança LLMUnavailableError se indisponível.
 
@@ -90,9 +91,10 @@ class CognitiveCore:
         else:
             resolved_intent = intent
             intent_value = intent.value
+        selected_personality = self._select_personality(sender_id)
         resolved_context = self._resolve_context_reference(user_message, context)
         memories = self.retrieve_relevant_memories(
-            user_message, context, intent=resolved_intent
+            user_message, context, intent=resolved_intent, sender_id=sender_id
         )
         logger.info(
             "[MEMORY] retrieved=%d relevant=%d",
@@ -108,6 +110,7 @@ class CognitiveCore:
             new_facts=new_facts,
             style_profile=self._current_style_profile(),
             tools_registry=self.tools_registry,
+            personality=selected_personality,
         )
         logger.info(
             "[LLM] prompt_has_tools_section=%s prompt_len=%d",
@@ -157,6 +160,7 @@ class CognitiveCore:
                     new_facts=new_facts,
                     style_profile=self._current_style_profile(),
                     tools_registry=self.tools_registry,
+                    personality=selected_personality,
                 )
                 retry_request = LLMRequest(
                     prompt=retry_built.prompt,
@@ -549,7 +553,27 @@ class CognitiveCore:
         except Exception:
             return None
 
-    def retrieve_relevant_memories(self, text: str, context=None, memory_manager=None, intent=None) -> list[Any]:
+    def _select_personality(self, sender_id):
+        # Select personality: owner match -> OWNER_PERSONALITY, else DEFAULT.
+        # Never raises. sender_id is int or None.
+        from personality.personality import OWNER_PERSONALITY, DEFAULT_PERSONALITY
+        try:
+            owner_id = getattr(self.config, "owner_user_id", None)
+            if owner_id is not None and sender_id is not None:
+                if type(sender_id) is int and sender_id == owner_id:
+                    return OWNER_PERSONALITY
+        except Exception:
+            pass
+        return DEFAULT_PERSONALITY
+
+    def retrieve_relevant_memories(
+        self,
+        text: str,
+        context=None,
+        memory_manager=None,
+        intent=None,
+        sender_id: Optional[int] = None,
+    ) -> list[Any]:
         """Seleciona memórias relevantes para a mensagem atual.
 
         Estrategia (sem embeddings):
@@ -604,6 +628,7 @@ class CognitiveCore:
                     keyword,
                     include_inactive=False,
                     limit=remaining,
+                    user_id=sender_id,
                 )
             except Exception:
                 facts = []
@@ -617,7 +642,9 @@ class CognitiveCore:
         if not _cap():
             for family in ("identity", "working_on", "studies"):
                 try:
-                    facts = manager.database.find_active_preferences(relation_family=family)
+                    facts = manager.database.find_active_preferences(
+                        relation_family=family, user_id=sender_id
+                    )
                 except Exception:
                     facts = []
                 for fact in facts:
@@ -628,7 +655,9 @@ class CognitiveCore:
         # 4. Preferencias sob consulta explicita sobre o usuario
         if is_memory_query and not _cap():
             try:
-                preferences = manager.database.find_active_preferences()
+                preferences = manager.database.find_active_preferences(
+                    user_id=sender_id
+                )
             except Exception:
                 preferences = []
             for fact in preferences:

@@ -101,6 +101,8 @@ class TelegramChannel(Channel):
         logger: Optional[logging.Logger] = None,
         now: Optional[Callable[[], float]] = None,
         engine_cleanup: Optional[Callable[[Any], None]] = None,
+        voice_manager: Any = None,
+        voice_config: Any = None,
     ) -> None:
         self._client = client
         self._engine_factory = engine_factory
@@ -108,6 +110,8 @@ class TelegramChannel(Channel):
         self._poll_timeout = poll_timeout
         self._chunk_limit = chunk_limit
         self._log = logger or logging.getLogger("davios.channels.telegram")
+        self._voice_manager = voice_manager
+        self._voice_config = voice_config
 
         self._queue: "queue.Queue[Optional[IncomingMessage]]" = queue.Queue(
             maxsize=queue_max
@@ -115,6 +119,8 @@ class TelegramChannel(Channel):
         self._stop_event = threading.Event()
         self._started = False
         self._failed = False
+        # Motivo da falha (lido por run_telegram para diagnosticar em console).
+        self.fail_reason: Optional[str] = None
         self._engine: Any = None
         self._threads: list[threading.Thread] = []
 
@@ -343,6 +349,7 @@ class TelegramChannel(Channel):
         """Coloca o canal em estado de falha (sem travar threads) e registra o motivo."""
         self._log.error("[TG] canal falhou: %s", reason)
         self._failed = True
+        self.fail_reason = reason
         self._stop_event.set()
 
     # ------------------------------------------------------------------ #
@@ -357,7 +364,7 @@ class TelegramChannel(Channel):
             self._log.error(
                 "[TG] falha ao construir o engine error_type=%s", type(exc).__name__
             )
-            self._fail("engine_factory falhou")
+            self._fail(f"engine_factory falhou ({type(exc).__name__})")
             return
 
         try:
@@ -406,7 +413,7 @@ class TelegramChannel(Channel):
 
         # 4) texto normal -> engine.process (D4: should_exit NUNCA para o canal).
         try:
-            result = self._engine.process(text)
+            result = self._engine.process(text, sender_id=msg.sender_id)
         except Exception as exc:  # noqa: BLE001
             self._log.error(
                 "[TG] erro ao processar error_type=%s", type(exc).__name__
@@ -420,6 +427,16 @@ class TelegramChannel(Channel):
             self._reply(msg.chat_id, NO_RESPONSE_MESSAGE)
             return
         self._send_chunks(msg.chat_id, response)
+
+        # 5) áudio ocasional (fire-and-forget em thread própria: não atrasa
+        #    o texto nem bloqueia o worker serial para outras mensagens).
+        if self._voice_manager is not None:
+            threading.Thread(
+                target=self._send_occasional_voice,
+                args=(msg.chat_id, response),
+                daemon=True,
+                name="davios-tg-voice",
+            ).start()
 
     def _handle_command(self, chat_id: int, text: str) -> None:
         # Normaliza "/cmd@nomedobot" e caixa: pega o primeiro token, minúsculo.
@@ -490,5 +507,33 @@ class TelegramChannel(Channel):
             self._client.send_chat_action(chat_id, action="typing")
         except Exception:  # noqa: BLE001
             pass
+
+    def _send_occasional_voice(self, chat_id: int, text: str) -> None:
+        """Envia mensagem de voz ocasional (executado em thread própria).
+
+        Nunca bloqueia o worker serial. Falhas são logadas sem segredos e não
+        afetam a resposta textual já enviada.
+        """
+        try:
+            from voice.telegram_voice import (
+                should_send_voice,
+                synthesize_and_send_voice,
+            )
+
+            if not should_send_voice(text, self._voice_config):
+                return
+
+            synthesize_and_send_voice(
+                text,
+                self._client,
+                chat_id,
+                self._voice_manager,
+                self._voice_config,
+            )
+        except Exception as exc:  # noqa: BLE001 - áudio nunca derruba o canal
+            self._log.warning(
+                "[TG] falha ao enviar voz ocasional error_type=%s",
+                type(exc).__name__,
+            )
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from core.reasoning import ReasoningResult
 from memory.memory_manager import MemoryManager
@@ -130,29 +130,31 @@ class ResponseGenerator:
         text: str,
         memory_manager: MemoryManager,
         context: Any,
+        *,
+        user_id: Optional[int] = None,
     ) -> tuple[str, list[Any]]:
         """Responde perguntas consultando a memoria."""
         text_lower = text.lower()
 
         if "nome" in text_lower and ("meu" in text_lower or "minha" in text_lower):
-            return self._answer_about_name(memory_manager, text_lower)
+            return self._answer_about_name(memory_manager, text_lower, user_id=user_id)
 
         if "gosto" in text_lower and any(
             w in text_lower for w in ("do que", "o que", "que", "de que")
         ):
-            return self._answer_about_preferences(memory_manager)
+            return self._answer_about_preferences(memory_manager, user_id=user_id)
 
         match = re.search(r"eu gosto de (\w+)", text_lower)
         if match:
             target = match.group(1)
-            return self._answer_confirm_preference(memory_manager, target)
+            return self._answer_confirm_preference(memory_manager, target, user_id=user_id)
 
         return "Nao tenho essa informacao ainda.", []
 
     def _answer_about_name(
-        self, memory_manager: MemoryManager, text_lower: str
+        self, memory_manager: MemoryManager, text_lower: str, *, user_id: Optional[int] = None
     ) -> tuple[str, list[Any]]:
-        facts = memory_manager.database.find_facts_by_target("nome")
+        facts = memory_manager.database.find_facts_by_target("nome", user_id=user_id)
         if facts:
             fact = facts[0]
             if fact.value:
@@ -167,11 +169,13 @@ class ResponseGenerator:
         return "Ainda nao sei seu nome. Pode me dizer?", []
 
     def _answer_about_preferences(
-        self, memory_manager: MemoryManager
+        self, memory_manager: MemoryManager, *, user_id: Optional[int] = None
     ) -> tuple[str, list[Any]]:
         likes = [
             f
-            for f in memory_manager.database.find_active_preferences("user", "preference")
+            for f in memory_manager.database.find_active_preferences(
+                "user", "preference", user_id=user_id
+            )
             if f.relation == "like"
         ]
         if likes:
@@ -180,10 +184,10 @@ class ResponseGenerator:
         return "Ainda nao sei do que voce gosta.", []
 
     def _answer_confirm_preference(
-        self, memory_manager: MemoryManager, target: str
+        self, memory_manager: MemoryManager, target: str, *, user_id: Optional[int] = None
     ) -> tuple[str, list[Any]]:
         facts = memory_manager.database.find_facts_for_semantic_key(
-            "user", target, "preference", include_inactive=False
+            "user", target, "preference", include_inactive=False, user_id=user_id
         )
         if facts:
             fact = facts[0]

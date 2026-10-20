@@ -31,6 +31,20 @@ class MemoryInterpreter:
         "mas", "porem", "entao", "muito", "bem", "nao", "não",
     }
 
+    # Marcadores de correção explícita do usuário. Quando presentes, o fato
+    # extraído recebe confiança máxima (0.95) para superar fatos anteriores.
+    CORRECTION_MARKERS = (
+        "correcao", "correção", "corrigindo", "corrija", "corrigir",
+        "na verdade", "errado", "engano", "me equivoquei", "falei errado",
+        "nao é isso", "não é isso", "deixa eu explicar melhor",
+        "quero dizer", "quis dizer", "era para ser",
+    )
+
+    @classmethod
+    def is_correction(cls, text_lower: str) -> bool:
+        """Detecta correções explícitas do usuário."""
+        return any(marker in text_lower for marker in cls.CORRECTION_MARKERS)
+
     def interpret(self, text, context, emotions):
 
         personal_markers = [
@@ -47,6 +61,9 @@ class MemoryInterpreter:
         ]
 
         text_lower = text.lower()
+
+        # Detecta correções explícitas para dar confiança máxima aos fatos
+        is_correction = self.is_correction(text_lower)
 
         personal_relevance = 0.0
 
@@ -73,11 +90,15 @@ class MemoryInterpreter:
         # Detect "meu nome e X" / "me chamo X" patterns
         name_fact = self._extract_name_fact(text_lower)
         if name_fact:
+            if is_correction:
+                name_fact.confidence = 0.95
             facts.append(name_fact)
             personal_relevance = max(personal_relevance, 0.6)
 
         # Fatos estruturados declarativos (trabalho, estudo, residencia, posse)
         for statement_fact in self._extract_statement_facts(text_lower):
+            if is_correction:
+                statement_fact.confidence = 0.95
             facts.append(statement_fact)
             personal_relevance = max(personal_relevance, 0.6)
 
@@ -106,6 +127,15 @@ class MemoryInterpreter:
             negation = emotion_data["context"].get("negation_applies", False)
             uncertain = emotion_data["context"].get("uncertain", False)
 
+            # Correções explícitas recebem confiança máxima (0.95) para
+            # superar fatos anteriores no mecanismo de resolução de conflitos.
+            if is_correction:
+                confidence = 0.95
+            elif uncertain:
+                confidence = 0.65
+            else:
+                confidence = 0.7
+
             facts.append(
                 MemoryFact(
                     target=target,
@@ -114,13 +144,13 @@ class MemoryInterpreter:
                     emotional_intensity=emotion_data["emotional_intensity"],
                     temporal_context=temporal_context,
                     negation=negation,
-                    confidence=0.65 if uncertain else 0.7,
+                    confidence=confidence,
                     subject="user",
-                    source="user_statement",
+                    source="user_correction" if is_correction else "user_statement",
                 )
             )
 
-        logger.debug("[MEMORY] interpreted facts=%d", len(facts))
+        logger.debug("[MEMORY] interpreted facts=%d correction=%s", len(facts), is_correction)
 
         return {
             "memory_candidate": personal_relevance >= 0.4,

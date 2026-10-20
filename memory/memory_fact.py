@@ -35,6 +35,7 @@ class MemoryFact:
     fact_type: Optional[str] = None
     id: Optional[int] = None
     memory_id: Optional[int] = None
+    user_id: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     last_accessed_at: Optional[str] = None

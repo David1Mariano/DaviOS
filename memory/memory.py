@@ -31,6 +31,7 @@ class Memory:
         last_accessed_at: Optional[str] = None,
         access_count: int = 0,
         metadata: Optional[dict[str, Any]] = None,
+        user_id: Optional[int] = None,
     ):
         self.id = id
         self.content = content
@@ -50,6 +51,7 @@ class Memory:
         self.last_accessed_at = last_accessed_at
         self.access_count = int(access_count or 0)
         self.metadata = metadata or {}
+        self.user_id = user_id
         self.facts = facts if facts is not None else []
 
     @property
